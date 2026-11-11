@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="bridge-nonce" content="__DSH_BRIDGE_NONCE__">
+  <title>Agent 接续</title>
+  <link rel="stylesheet" href="./panel.css">
+  <script type="module" src="./panel.js"></script>
+</head>
+<body>
+  <svg class="icon-defs" width="0" height="0" aria-hidden="true" focusable="false">
+    <symbol id="icon-bridge" viewBox="0 0 24 24"><path d="M4 8V5h5m-5 7v7h5m6-14h5v7m-5 7h5v-3M9 12h7m-3-3 3 3-3 3"/></symbol>
+    <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 17.5V6a2 2 0 0 1 2-2h4.5l2 2H19a2 2 0 0 1 2 2v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 9h18"/></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></symbol>
+    <symbol id="icon-filter" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10m-7 6h4"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M5.7 8a7 7 0 0 1 11.7-2l2.6 4M4 14l2.6 4A7 7 0 0 0 18.3 16"/></symbol>
+    <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></symbol>
+    <symbol id="icon-memory" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6m-6 4h6m-6 4h3"/></symbol>
+    <symbol id="icon-skill" viewBox="0 0 24 24"><path d="m13 2-8 12h6l-1 8 9-12h-6l1-8Z"/></symbol>
+    <symbol id="icon-history" viewBox="0 0 24 24"><path d="M3 10a9 9 0 1 1 2 8m-2-8V5m0 5h5m4-3v5l3 2"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 4H6a2 2 0 0 0-2 2v10"/></symbol>
+    <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="icon-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="icon-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5m-18 4 9 5 9-5"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  </svg>
+
+  <main class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#icon-bridge"/></svg></span>
+        <h1>Agent 接续</h1>
+      </div>
+      <div class="toolbar">
+        <p class="live-status"><span id="live-state" data-state="loading">正在连接实时扫描</span><time id="last-scan" hidden></time></p>
+        <div class="toolbar-actions">
+          <button class="secondary" id="native-export" type="button"><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出 DSH 会话</button>
+          <button class="secondary icon-button" id="refresh" type="button" aria-label="刷新来源" title="刷新来源"><svg class="icon button-icon" aria-hidden="true"><use href="#icon-refresh"/></svg></button>
+        </div>
+      </div>
+    </header>
+    <p id="status" class="status" role="status"></p>
+
+    <div class="workspace">
+      <aside class="projects" aria-label="项目">
+        <div class="list-heading">
+          <h2>项目</h2>
+          <span id="project-count"></span>
+        </div>
+        <div class="project-controls">
+          <div class="field">
+            <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
+            <label class="sr-only" for="project-search">搜索项目</label>
+            <input id="project-search" type="search" placeholder="搜索项目或路径" autocomplete="off">
+            <kbd class="key-hint" aria-hidden="true">/</kbd>
+            <button class="clear-search icon-button" id="clear-project-search" type="button" aria-label="清除项目搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+          </div>
+          <div class="field select-field">
+            <svg class="icon field-icon" aria-hidden="true"><use href="#icon-filter"/></svg>
+            <label class="sr-only" for="agent-filter">筛选 Agent 来源</label>
+            <select id="agent-filter"><option value="">全部 Agent</option></select>
+            <svg class="icon select-chevron" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
+          </div>
+          <div class="project-filters" aria-label="项目状态">
+            <button class="filter-button" data-project-state="all" type="button" aria-pressed="true">全部</button>
+            <button class="filter-button" data-project-state="online" type="button" aria-pressed="false">可接续</button>
+            <button class="filter-button" data-project-state="offline" type="button" aria-pressed="false">离线</button>
+          </div>
+        </div>
+        <div id="project-list" class="project-list"></div>
+        <details class="sources">
+          <summary><svg class="icon" aria-hidden="true"><use href="#icon-layers"/></svg><span id="sources-heading">本机来源</span><svg class="icon source-chevron" aria-hidden="true"><use href="#icon-chevron"/></svg></summary>
+          <div id="sources-list"></div>
+        </details>
+      </aside>
+
+      <section class="detail" aria-label="项目资料">
+        <div id="empty" class="empty" role="status">正在读取本机项目…</div>
+        <div id="project-detail" hidden>
+          <header class="project-heading">
+            <div class="project-identity">
+              <span class="project-mark"><svg class="icon" aria-hidden="true"><use href="#icon-folder"/></svg></span>
+              <div class="project-title-block">
+                <h2 id="project-name" tabindex="-1"></h2>
+                <div id="project-meta" class="chips"></div>
+              </div>
+            </div>
+            <div class="project-location">
+              <code id="project-path"></code>
+              <button id="copy-path" class="path-copy icon-button" type="button" aria-label="复制工作目录" title="复制工作目录"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg></button>
+            </div>
+          </header>
+          <div class="library-toolbar">
+            <div class="tabs" role="tablist" aria-label="项目资料">
+              <button id="tab-memory" type="button" role="tab" aria-selected="true" aria-controls="library-panel"><svg class="icon" aria-hidden="true"><use href="#icon-memory"/></svg><span class="tab-label">记忆</span><span class="tab-count" aria-hidden="true"></span></button>
+              <button id="tab-skill" type="button" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#icon-skill"/></svg><span class="tab-label">Skills</span><span class="tab-count" aria-hidden="true"></span></button>
+            </div>
+            <div class="field asset-search-field">
+              <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
+              <label class="sr-only" for="asset-search">搜索资料</label>
+              <input id="asset-search" type="search" placeholder="搜索资料" autocomplete="off">
+              <button class="clear-search icon-button" id="clear-asset-search" type="button" aria-label="清除资料搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+            </div>
+          </div>
+          <div id="library-panel" role="tabpanel" aria-labelledby="tab-memory">
+            <p id="asset-note" class="asset-note"></p>
+            <div id="asset-list" class="asset-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <aside id="handoff" class="handoff" aria-label="接续清单" hidden>
+        <header class="handoff-heading">
+          <span class="handoff-mark"><svg class="icon" aria-hidden="true"><use href="#icon-bridge"/></svg></span>
+          <h2>接续清单</h2>
+          <span id="selection-count" class="queue-count" aria-live="polite"></span>
+        </header>
+        <div id="queue-list" class="queue-list"></div>
+        <label id="history-option" class="history">
+          <svg class="icon" aria-hidden="true"><use href="#icon-history"/></svg>
+          <span id="history-label">带入近期会话摘录</span>
+          <input type="checkbox" id="history">
+        </label>
+        <div class="actionbar">
+          <span id="compact-selection" class="compact-selection"></span>
+          <button id="preview" class="primary" type="button">预览交接<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <dialog id="dialog" aria-labelledby="dialog-title">
+    <div class="dialog-inner">
+      <header class="dialog-heading">
+        <span id="dialog-mark" class="project-mark"><svg class="icon" aria-hidden="true"><use href="#icon-bridge"/></svg></span>
+        <div>
+          <h2 id="dialog-title"></h2>
+          <p id="dialog-note" class="muted"></p>
+        </div>
+        <button id="dialog-close" class="secondary icon-button" type="button" aria-label="关闭" title="关闭"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+      </header>
+      <div class="dialog-content">
+        <div id="dialog-text" class="dialog-text" tabindex="0"></div>
+        <div id="session-choice" class="session-choice" hidden>
+          <label for="session-select">选择要导出的 DSH 会话</label>
+          <select id="session-select"></select>
+          <p id="session-path" class="muted"></p>
+        </div>
+        <p id="dialog-status" role="status"></p>
+        <details id="export-output" class="export-output" hidden>
+          <summary>查看或复制 Markdown</summary>
+          <pre id="export-text" tabindex="0"></pre>
+        </details>
+      </div>
+      <footer class="dialog-actions">
+        <a id="export-download" class="secondary" download hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>下载 Markdown</a>
+        <button id="export" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出 Markdown</button>
+        <button id="import" class="primary" type="button" hidden>导入并接续<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+      </footer>
+    </div>
+  </dialog>
+</body>
+</html>

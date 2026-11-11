@@ -1,0 +1,4 @@
+- insert:
+    - id: agent-bridge
+      name: dsh-agent-bridge
+      config: {}
