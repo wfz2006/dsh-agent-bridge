@@ -6,12 +6,12 @@
 
 ## 安装
 
-获取安装包 `dsh-agent-bridge-0.5.0.tgz`，在 **DSH Desktop → 插件 → 安装插件** 填入该文件在你电脑上的完整路径。若插件管理器显示需要重启，退出并重新打开 DSH。安装完成后，侧栏会出现 **Agent 工作接续**。公开安装包见 [GitHub Releases](https://github.com/wfz2006/dsh-agent-bridge/releases)。
+获取安装包 `dsh-agent-bridge-0.5.1.tgz`，在 **DSH Desktop → 插件 → 安装插件** 填入该文件在你电脑上的完整路径。安装或更新后，从 **应用 → 退出** 完全退出 DSH，再打开以加载新版插件。侧栏会出现 **Agent 工作接续**。公开安装包见 [GitHub Releases](https://github.com/wfz2006/dsh-agent-bridge/releases)。
 
 使用 DSH Web 时，在包含安装包的目录运行以下命令。
 
 ```sh
-dsh plugin --profile web add ./dsh-agent-bridge-0.5.0.tgz
+dsh plugin --profile web add ./dsh-agent-bridge-0.5.1.tgz
 dsh web
 ```
 
@@ -23,7 +23,7 @@ dsh web
 2. 在资料区勾选记忆与 Skills。接续清单会汇总两类资料，可以移除单项或勾选近期会话。Skills 页会标记会话中记录过的使用。
 3. 从接续清单打开 **预览交接**，在侧栏中核对内容，选择导入或导出。导入会在原工作目录创建 DSH 会话并填入可编辑的草稿。
 
-右上角可以选择蓝色、白色或黑色，插件会记住选择。Agent 筛选菜单支持方向键、回车和按字母查找。Agent 名称旁显示可随插件分发的品牌图标，其余使用缩写。[图标来源](web/agent-icons/NOTICE.md)
+右上角可以选择蓝色、白色或黑色，插件会记住选择。Agent 筛选菜单支持方向键、回车和按字母查找。已适配的 Agent 名称旁显示随包提供的官方图标。[图标来源](web/agent-icons/NOTICE.md)
 
 面板打开时自动监听 Agent 索引、会话和当前项目资料的文件变化，并在后台定时复扫。正在查看或导出资料时，列表会在关闭预览后更新。**刷新来源** 可立即复扫。
 

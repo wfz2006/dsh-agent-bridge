@@ -42,12 +42,23 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     headers['X-DSH-Agent-Bridge'] = nonce
     const api = body => fetch(base + 'api', { method: 'POST', headers, body: JSON.stringify(body) })
     const listing = await (await api({ action: 'catalog' })).json()
-    assert.equal(listing.agentIcons.copilot, 'agent-icons/copilot.svg')
+    assert.deepEqual(Object.keys(listing.agentIcons).sort(), [
+      'antigravity', 'claude', 'codex', 'copilot', 'dsh', 'gemini',
+      'opencode', 'qoder', 'qwen', 'trae', 'workbuddy',
+    ])
     assert.equal((await fetch(base + listing.agentIcons.copilot)).status, 403)
-    const copilotIcon = await fetch(base + listing.agentIcons.copilot, { headers })
-    assert.equal(copilotIcon.status, 200)
-    assert.equal(copilotIcon.headers.get('content-type'), 'image/svg+xml')
-    assert.match(await copilotIcon.text(), /<svg/)
+    for (const path of Object.values(listing.agentIcons)) {
+      const icon = await fetch(base + path, { headers })
+      assert.equal(icon.status, 200, path)
+      if (path.endsWith('.svg')) {
+        assert.equal(icon.headers.get('content-type'), 'image/svg+xml', path)
+        assert.match(await icon.text(), /<svg/, path)
+      } else {
+        assert.equal(icon.headers.get('content-type'), 'image/png', path)
+        const bytes = Buffer.from(await icon.arrayBuffer())
+        assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', path)
+      }
+    }
     const project = listing.projects.find(entry => entry.cwd === directory)
     assert.ok(project)
     assert.equal(project.online, true)
