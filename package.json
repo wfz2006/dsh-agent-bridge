@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-bridge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Standalone DeepSeek Harness plugin for live local agent discovery, context import, and Markdown handoff export.",
   "keywords": ["dsh", "deepseek-harness", "agent", "handoff", "skills"],
   "type": "module",

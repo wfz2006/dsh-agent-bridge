@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { existsSync, readdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { createCatalog } from './catalog.js'
 import { loadConfig } from './config.js'
@@ -11,7 +12,7 @@ const pageHeaders = {
   'Cache-Control': 'no-store',
   'Referrer-Policy': 'no-referrer',
   'X-Content-Type-Options': 'nosniff',
-  'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'",
+  'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'",
 }
 
 function respond(res, status, type, value) {
@@ -62,6 +63,18 @@ export function apply(ctx) {
     ['/panel.js', 'panel.js', 'text/javascript; charset=utf-8'],
     ['/geist-latin-wght-normal.woff2', 'geist-latin-wght-normal.woff2', 'font/woff2'],
   ]
+  const agentIcons = Object.create(null)
+  const iconsDirectory = new URL('../web/agent-icons/', import.meta.url)
+  if (existsSync(iconsDirectory)) {
+    for (const entry of readdirSync(iconsDirectory, { withFileTypes: true })) {
+      const match = /^([a-z][a-z0-9-]*)\.(svg|png)$/.exec(entry.name)
+      if (!entry.isFile() || !match) continue
+      const [, agent, extension] = match
+      const file = `agent-icons/${entry.name}`
+      agentIcons[agent] = file
+      staticRoutes.push([`/${file}`, file, extension === 'svg' ? 'image/svg+xml' : 'image/png'])
+    }
+  }
   function register(path, method, action) {
     ctx.effect(() => ctx.webServer.register({
       kind: 'exact', path: prefix + path,
@@ -99,6 +112,6 @@ export function apply(ctx) {
     }
     const input = await readBody(req)
     const result = await catalog.execute(input.action, input)
-    json(res, 200, result)
+    json(res, 200, input.action === 'catalog' ? { ...result, agentIcons } : result)
   })
 }

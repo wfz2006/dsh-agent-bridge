@@ -34,6 +34,7 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     const panel = await fetch(base + 'panel', { headers })
     assert.equal(panel.status, 200)
     assert.equal(panel.headers.get('cache-control'), 'no-store')
+    assert.match(panel.headers.get('content-security-policy'), /img-src 'self'/)
     const page = await panel.text()
     const nonce = page.match(/name="bridge-nonce" content="([a-f0-9]+)"/)?.[1]
     assert.ok(nonce)
@@ -41,6 +42,12 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     headers['X-DSH-Agent-Bridge'] = nonce
     const api = body => fetch(base + 'api', { method: 'POST', headers, body: JSON.stringify(body) })
     const listing = await (await api({ action: 'catalog' })).json()
+    assert.equal(listing.agentIcons.copilot, 'agent-icons/copilot.svg')
+    assert.equal((await fetch(base + listing.agentIcons.copilot)).status, 403)
+    const copilotIcon = await fetch(base + listing.agentIcons.copilot, { headers })
+    assert.equal(copilotIcon.status, 200)
+    assert.equal(copilotIcon.headers.get('content-type'), 'image/svg+xml')
+    assert.match(await copilotIcon.text(), /<svg/)
     const project = listing.projects.find(entry => entry.cwd === directory)
     assert.ok(project)
     assert.equal(project.online, true)

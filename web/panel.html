@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="blue">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -37,6 +37,11 @@
       <div class="toolbar">
         <p class="live-status"><span id="live-state" data-state="loading">正在连接实时扫描</span><time id="last-scan" hidden></time></p>
         <div class="toolbar-actions">
+          <div class="theme-picker" role="group" aria-label="主题">
+            <button class="theme-option" data-theme-choice="blue" type="button" aria-pressed="true" title="蓝色主题"><span class="theme-swatch" aria-hidden="true"></span><span class="sr-only">蓝色</span></button>
+            <button class="theme-option" data-theme-choice="white" type="button" aria-pressed="false" title="白色主题"><span class="theme-swatch" aria-hidden="true"></span><span class="sr-only">白色</span></button>
+            <button class="theme-option" data-theme-choice="black" type="button" aria-pressed="false" title="黑色主题"><span class="theme-swatch" aria-hidden="true"></span><span class="sr-only">黑色</span></button>
+          </div>
           <button class="secondary" id="native-export" type="button"><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出 DSH 会话</button>
           <button class="secondary icon-button" id="refresh" type="button" aria-label="刷新来源" title="刷新来源"><svg class="icon button-icon" aria-hidden="true"><use href="#icon-refresh"/></svg></button>
         </div>
@@ -58,11 +63,15 @@
             <kbd class="key-hint" aria-hidden="true">/</kbd>
             <button class="clear-search icon-button" id="clear-project-search" type="button" aria-label="清除项目搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
           </div>
-          <div class="field select-field">
-            <svg class="icon field-icon" aria-hidden="true"><use href="#icon-filter"/></svg>
-            <label class="sr-only" for="agent-filter">筛选 Agent 来源</label>
-            <select id="agent-filter"><option value="">全部 Agent</option></select>
-            <svg class="icon select-chevron" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
+          <div id="agent-picker" class="agent-picker">
+            <button id="agent-filter" class="agent-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options" aria-label="筛选 Agent，当前为全部 Agent">
+              <span id="agent-trigger-mark" class="agent-trigger-mark"><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg></span>
+              <span id="agent-trigger-label" class="agent-trigger-label">全部 Agent</span>
+              <svg class="icon select-chevron" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
+            </button>
+            <div id="agent-popover" class="agent-popover" hidden>
+              <div id="agent-options" class="agent-options" role="listbox" aria-label="Agent 来源" tabindex="-1"></div>
+            </div>
           </div>
           <div class="project-filters" aria-label="项目状态">
             <button class="filter-button" data-project-state="all" type="button" aria-pressed="true">全部</button>

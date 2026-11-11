@@ -9,6 +9,11 @@ const dialogText = byId('dialog-text')
 const sessionSelect = byId('session-select')
 const refreshButton = byId('refresh')
 const agentFilter = byId('agent-filter')
+const agentPicker = byId('agent-picker')
+const agentPopover = byId('agent-popover')
+const agentOptions = byId('agent-options')
+const themeOptions = [...document.querySelectorAll('[data-theme-choice]')]
+const themeKey = 'dsh-agent-bridge.theme'
 const projectSearch = byId('project-search')
 const assetSearch = byId('asset-search')
 const historyOption = byId('history')
@@ -23,12 +28,19 @@ const parentOrigin = window.origin === 'null' ? '*' : window.origin
 const agentNames = {
   codex: 'Codex', claude: 'Claude Code', opencode: 'OpenCode', qoder: 'Qoder',
   workbuddy: 'WorkBuddy', trae: 'TRAE', gemini: 'Gemini', antigravity: 'Antigravity',
-  copilot: 'Copilot', qwen: 'Qwen', dsh: 'DSH', workspacehub: '项目总账',
+  copilot: 'Copilot', qwen: 'Qwen Code', dsh: 'DSH', workspacehub: '项目总账',
   local: '手动目录', manual: '手动目录', export: '记忆导出', shared: '共享',
 }
+const agentInitials = { claude: 'CC', codex: 'CX', workbuddy: 'WB', trae: 'TR', antigravity: 'AG' }
 const sourceStates = { ready: '可读取', partial: '部分可读', unavailable: '未找到', error: '读取失败' }
 const scopeNames = { project: '项目', agent: 'Agent 全局', shared: '共享' }
 let catalog = []
+let agentIcons = {}
+let availableAgents = ['']
+let selectedAgent = ''
+let activeAgentIndex = 0
+let agentQuery = ''
+let agentQueryAt = 0
 let current
 let detail
 let detailRevision = 0
@@ -52,7 +64,7 @@ let requestNumber = 0
 
 const clockFormat = new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium', hourCycle: 'h23' })
 
-const agentName = value => agentNames[value] ?? value
+const agentName = value => Object.hasOwn(agentNames, value) ? agentNames[value] : String(value ?? '')
 const text = (tag, content, className) => {
   const element = document.createElement(tag)
   element.textContent = content
@@ -68,6 +80,148 @@ function icon(name, className = '') {
   use.setAttribute('href', `#icon-${name}`)
   svg.append(use)
   return svg
+}
+
+function agentMark(agent, label = agentName(agent)) {
+  const mark = text('span', '', 'agent-brand-mark')
+  mark.dataset.agent = agent
+  mark.setAttribute('aria-hidden', 'true')
+  const initial = () => {
+    mark.classList.remove('has-image')
+    mark.textContent = Object.hasOwn(agentInitials, agent) ? agentInitials[agent] : (Array.from(label)[0]?.toUpperCase() || '?')
+  }
+  const file = Object.hasOwn(agentIcons, agent) ? agentIcons[agent] : ''
+  if (!/^agent-icons\/[a-z][a-z0-9-]*\.(?:svg|png)$/.test(file)) {
+    initial()
+    return mark
+  }
+  const image = document.createElement('img')
+  image.alt = ''
+  image.decoding = 'async'
+  image.addEventListener('error', initial, { once: true })
+  image.src = `./${file}`
+  mark.classList.add('has-image')
+  mark.append(image)
+  return mark
+}
+
+function agentLabel(agent, className = '', label = agentName(agent)) {
+  const span = text('span', '', ['agent-label', className].filter(Boolean).join(' '))
+  span.append(agentMark(agent, label), text('span', label, 'agent-label-name'))
+  return span
+}
+
+function setTheme(value, remember = true) {
+  const theme = ['blue', 'white', 'black'].includes(value) ? value : 'blue'
+  document.documentElement.dataset.theme = theme
+  for (const button of themeOptions) {
+    button.setAttribute('aria-pressed', String(button.dataset.themeChoice === theme))
+  }
+  if (remember) {
+    try { localStorage.setItem(themeKey, theme) } catch { /* Theme is still applied to this panel. */ }
+  }
+}
+
+function renderAgentPicker(activeAgent = selectedAgent) {
+  const label = selectedAgent ? agentName(selectedAgent) : '全部 Agent'
+  byId('agent-trigger-mark').replaceChildren(selectedAgent ? agentMark(selectedAgent) : icon('filter'))
+  byId('agent-trigger-label').textContent = label
+  agentFilter.setAttribute('aria-label', `筛选 Agent，当前为${label}`)
+  agentOptions.replaceChildren(...availableAgents.map((agent, index) => {
+    const option = text('div', '', 'agent-option')
+    option.id = `agent-option-${index}`
+    option.dataset.agent = agent
+    option.setAttribute('role', 'option')
+    option.setAttribute('aria-selected', String(agent === selectedAgent))
+    option.append(agent ? agentMark(agent) : icon('layers', 'agent-option-mark'),
+      text('span', agent ? agentName(agent) : '全部 Agent', 'agent-option-label'), icon('check', 'agent-option-check'))
+    return option
+  }))
+  if (!agentPopover.hidden) {
+    positionAgentPicker()
+    activateAgentOption(availableAgents.indexOf(availableAgents.includes(activeAgent) ? activeAgent : selectedAgent))
+  }
+}
+
+function positionAgentPicker() {
+  if (agentPopover.hidden) return
+  const bounds = agentFilter.getBoundingClientRect()
+  const below = window.innerHeight - bounds.bottom
+  const above = bounds.top
+  agentPopover.dataset.placement = below < agentPopover.getBoundingClientRect().height + 6 && above > below ? 'above' : 'below'
+}
+
+function activateAgentOption(index, scroll = true) {
+  const previous = agentOptions.children[activeAgentIndex]
+  if (previous) delete previous.dataset.active
+  activeAgentIndex = Math.max(0, Math.min(index, availableAgents.length - 1))
+  const active = agentOptions.children[activeAgentIndex]
+  if (!active) return
+  active.dataset.active = 'true'
+  agentOptions.setAttribute('aria-activedescendant', active.id)
+  if (!scroll) return
+  const optionBounds = active.getBoundingClientRect()
+  const listBounds = agentOptions.getBoundingClientRect()
+  if (optionBounds.bottom > listBounds.bottom) agentOptions.scrollTop += optionBounds.bottom - listBounds.bottom
+  if (optionBounds.top < listBounds.top) agentOptions.scrollTop -= listBounds.top - optionBounds.top
+}
+
+function openAgentPicker() {
+  if (!agentPopover.hidden) return
+  agentPopover.hidden = false
+  agentFilter.setAttribute('aria-expanded', 'true')
+  agentQuery = ''
+  positionAgentPicker()
+  activateAgentOption(availableAgents.indexOf(selectedAgent))
+  agentOptions.focus({ preventScroll: true })
+  clearTimeout(pollTimer)
+}
+
+function closeAgentPicker(restoreFocus = false) {
+  if (agentPopover.hidden) return
+  agentPopover.hidden = true
+  agentOptions.removeAttribute('aria-activedescendant')
+  agentFilter.setAttribute('aria-expanded', 'false')
+  if (restoreFocus) agentFilter.focus({ preventScroll: true })
+  schedulePoll(0)
+}
+
+function chooseAgent(index) {
+  selectedAgent = availableAgents[index] ?? ''
+  closeAgentPicker(true)
+  renderAgentPicker()
+  projectList.scrollTop = 0
+  renderProjects()
+}
+
+function navigateAgents(event) {
+  const { key } = event
+  if (key === 'Escape' || key === 'Tab') {
+    if (key === 'Escape') event.preventDefault()
+    closeAgentPicker(true)
+    return
+  }
+  if (key === 'Enter' || key === ' ') {
+    event.preventDefault()
+    chooseAgent(activeAgentIndex)
+    return
+  }
+  const destinations = { ArrowDown: activeAgentIndex + 1, ArrowUp: activeAgentIndex - 1,
+    Home: 0, End: availableAgents.length - 1 }
+  if (Object.hasOwn(destinations, key)) {
+    event.preventDefault()
+    activateAgentOption(destinations[key])
+    return
+  }
+  if (key.length !== 1 || event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return
+  const now = Date.now()
+  agentQuery = (now - agentQueryAt < 650 ? agentQuery : '') + key.toLowerCase()
+  agentQueryAt = now
+  const match = availableAgents.findIndex(agent => agentName(agent).toLowerCase().startsWith(agentQuery))
+  if (match > 0) {
+    event.preventDefault()
+    activateAgentOption(match)
+  }
 }
 
 function shortPath(value) {
@@ -107,7 +261,9 @@ function renderSources(sources) {
     row.className = 'source-row'
     const state = text('span', sourceStates[source.status] ?? source.status, 'chip source-state')
     state.dataset.state = source.status
-    row.append(text('strong', source.label), state)
+    const name = text('strong', '', 'source-name')
+    name.append(agentLabel(source.id, '', source.label))
+    row.append(name, state)
     if (source.detail) row.append(text('span', source.detail, 'source-detail'))
     return row
   }))
@@ -115,7 +271,7 @@ function renderSources(sources) {
 
 function projectMatches() {
   const query = projectSearch.value.trim().toLowerCase()
-  return catalog.filter(project => (!agentFilter.value || project.agents.includes(agentFilter.value))
+  return catalog.filter(project => (!selectedAgent || project.agents.includes(selectedAgent))
     && [project.name, project.cwd, ...project.projectIds, ...project.agents.map(agentName)]
       .some(value => value.toLowerCase().includes(query)))
 }
@@ -150,7 +306,14 @@ function renderProjects() {
     mark.append(icon('folder'))
     const main = text('span', '', 'project-main')
     main.append(text('span', project.name, 'project-title'), text('span', shortPath(project.cwd), 'project-path'))
-    const source = text('span', project.agents.slice(0, 2).map(agentName).join(' · ') || '本地项目', 'project-source')
+    const source = text('span', '', 'project-source')
+    for (const agent of project.agents.slice(0, 2)) source.append(agentLabel(agent))
+    if (project.agents.length > 2) {
+      const rest = text('span', `+${project.agents.length - 2}`, 'project-more-agents')
+      rest.title = project.agents.slice(2).map(agentName).join('、')
+      source.append(rest)
+    }
+    if (!project.agents.length) source.textContent = '本地项目'
     const indicator = text('span', '', 'project-state')
     indicator.dataset.state = project.online ? 'online' : 'offline'
     indicator.setAttribute('aria-label', project.online ? '原目录可用' : '原目录不可访问')
@@ -177,6 +340,7 @@ function renderSelection() {
     ...detail.memories.map(item => [item, 'memory', '记忆']),
     ...detail.skills.map(item => [item, 'skill', 'Skill']),
   ].filter(([item]) => selected.has(item.id))
+  byId('handoff').dataset.empty = String(entries.length === 0)
   queueList.replaceChildren(...(entries.length ? entries.map(([item, kind, type]) => {
     const row = text('div', '', 'queue-item')
     const name = text('span', item.name, 'queue-title')
@@ -245,7 +409,9 @@ function renderAssets() {
     label.htmlFor = checkbox.id
     label.title = asset.file
     const title = text('span', asset.name, 'asset-title')
-    const meta = text('span', [agentName(asset.agent), scopeNames[asset.scope] ?? asset.scope].filter(Boolean).join(' · '), 'asset-meta')
+    const meta = text('span', '', 'asset-meta')
+    if (asset.agent) meta.append(agentLabel(asset.agent))
+    if (asset.scope) meta.append(text('span', scopeNames[asset.scope] ?? asset.scope, 'asset-scope'))
     if (asset.used) meta.append(text('span', '会话提及', 'chip used-skill'))
     label.append(title, meta)
     const button = text('button', '', 'asset-view')
@@ -292,8 +458,8 @@ function applyDetail(project, loaded, preserve) {
   byId('project-path').title = current.cwd
   const availability = text('span', current.online ? '原目录可用' : '原目录不可访问', 'chip availability')
   availability.dataset.state = current.online ? 'online' : 'offline'
-  byId('project-meta').replaceChildren(...[...current.projectIds, ...current.agents.map(agentName)]
-    .map(value => text('span', value, 'chip')), availability)
+  byId('project-meta').replaceChildren(...current.projectIds.map(value => text('span', value, 'chip')),
+    ...current.agents.map(agent => agentLabel(agent, 'chip')), availability)
   libraryTabs[0].querySelector('.tab-count').textContent = detail.memories.length
   libraryTabs[1].querySelector('.tab-count').textContent = detail.skills.length
   byId('empty').hidden = true
@@ -333,7 +499,7 @@ async function selectProject(project, reveal = false) {
 }
 
 function canAutoRefresh() {
-  return document.visibilityState === 'visible' && !dialog.open && !detailLoading
+  return document.visibilityState === 'visible' && !dialog.open && agentPopover.hidden && !detailLoading
 }
 
 function liveState(label, scannedAt, error) {
@@ -365,10 +531,12 @@ async function refresh(force, automatic = false) {
     const loaded = previous && detail ? await api('detail', { projectId: previous.id }) : undefined
     if (automatic && !canAutoRefresh()) return false
     catalog = result.projects
-    const agents = [...new Set(catalog.flatMap(project => project.agents))].sort()
-    const previousFilter = agentFilter.value
-    agentFilter.replaceChildren(new Option('全部 Agent', ''), ...agents.map(agent => new Option(agentName(agent), agent)))
-    if (agents.includes(previousFilter)) agentFilter.value = previousFilter
+    agentIcons = result.agentIcons ?? {}
+    const activeAgent = availableAgents[activeAgentIndex]
+    availableAgents = ['', ...[...new Set(catalog.flatMap(project => project.agents))]
+      .filter(Boolean).sort((left, right) => agentName(left).localeCompare(agentName(right), 'zh-CN'))]
+    if (!availableAgents.includes(selectedAgent)) selectedAgent = ''
+    renderAgentPicker(activeAgent)
     renderSources(result.sources)
     if (!automatic) status('')
     if (revision === detailRevision) {
@@ -406,7 +574,7 @@ async function refresh(force, automatic = false) {
 
 function schedulePoll(delay = 250) {
   clearTimeout(pollTimer)
-  if (document.visibilityState === 'visible' && !dialog.open) pollTimer = setTimeout(pollSources, delay)
+  if (document.visibilityState === 'visible' && !dialog.open && agentPopover.hidden) pollTimer = setTimeout(pollSources, delay)
 }
 
 async function pollSources() {
@@ -706,7 +874,32 @@ window.addEventListener('message', event => {
 })
 refreshButton.addEventListener('click', () => refresh(true))
 projectSearch.addEventListener('input', renderProjects)
-agentFilter.addEventListener('change', renderProjects)
+agentFilter.addEventListener('click', () => {
+  if (agentPopover.hidden) openAgentPicker()
+  else closeAgentPicker(true)
+})
+agentFilter.addEventListener('keydown', event => {
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+  event.preventDefault()
+  openAgentPicker()
+})
+agentOptions.addEventListener('keydown', navigateAgents)
+agentOptions.addEventListener('pointermove', event => {
+  const option = event.target.closest('.agent-option')
+  if (option) activateAgentOption(availableAgents.indexOf(option.dataset.agent), false)
+})
+agentOptions.addEventListener('click', event => {
+  const option = event.target.closest('.agent-option')
+  if (option) chooseAgent(availableAgents.indexOf(option.dataset.agent))
+})
+document.addEventListener('pointerdown', event => {
+  if (!agentPicker.contains(event.target)) closeAgentPicker()
+})
+document.addEventListener('focusin', event => {
+  if (!agentPicker.contains(event.target)) closeAgentPicker()
+})
+window.addEventListener('resize', positionAgentPicker)
+window.addEventListener('scroll', positionAgentPicker, { passive: true })
 assetSearch.addEventListener('input', renderAssets)
 wireClear(projectSearch, renderProjects)
 wireClear(assetSearch, renderAssets)
@@ -718,7 +911,7 @@ for (const button of projectFilters) {
   })
 }
 document.addEventListener('keydown', event => {
-  if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey || dialog.open
+  if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey || dialog.open || !agentPopover.hidden
     || event.target.matches?.('input, select, textarea, [contenteditable]')) return
   event.preventDefault()
   projectSearch.focus()
@@ -774,4 +967,9 @@ dialog.addEventListener('close', () => {
 importButton.addEventListener('click', importSession)
 exportButton.addEventListener('click', exportMarkdown)
 document.addEventListener('visibilitychange', () => schedulePoll(0))
+for (const button of themeOptions) button.addEventListener('click', () => setTheme(button.dataset.themeChoice))
+let savedTheme
+try { savedTheme = localStorage.getItem(themeKey) } catch { /* Use the default theme. */ }
+setTheme(savedTheme, false)
+renderAgentPicker()
 void refresh(false).finally(() => schedulePoll(0))
