@@ -6,12 +6,12 @@
 
 ## 安装
 
-获取安装包 `dsh-agent-bridge-0.5.1.tgz`，在 **DSH Desktop → 插件 → 安装插件** 填入该文件在你电脑上的完整路径。安装或更新后，从 **应用 → 退出** 完全退出 DSH，再打开以加载新版插件。侧栏会出现 **Agent 工作接续**。公开安装包见 [GitHub Releases](https://github.com/wfz2006/dsh-agent-bridge/releases)。
+获取安装包 `dsh-agent-bridge-0.6.0.tgz`，在 **DSH Desktop → 插件 → 安装插件** 填入该文件在你电脑上的完整路径。安装或更新后，从 **应用 → 退出** 完全退出 DSH，再打开以加载新版插件。侧栏会出现 **Agent 工作接续**。公开安装包见 [GitHub Releases](https://github.com/wfz2006/dsh-agent-bridge/releases)。
 
 使用 DSH Web 时，在包含安装包的目录运行以下命令。
 
 ```sh
-dsh plugin --profile web add ./dsh-agent-bridge-0.5.1.tgz
+dsh plugin --profile web add ./dsh-agent-bridge-0.6.0.tgz
 dsh web
 ```
 
@@ -26,6 +26,12 @@ dsh web
 右上角可以选择蓝色、白色或黑色，插件会记住选择。Agent 筛选菜单支持方向键、回车和按字母查找。已适配的 Agent 名称旁显示随包提供的官方图标。[图标来源](web/agent-icons/NOTICE.md)
 
 面板打开时自动监听 Agent 索引、会话和当前项目资料的文件变化，并在后台定时复扫。正在查看或导出资料时，列表会在关闭预览后更新。**刷新来源** 可立即复扫。
+
+### 整理项目
+
+项目详情右上角可归档单个项目。批量整理时，先按 Agent、项目名或「离线」缩小范围，再点「整理」，勾选项目或全选当前结果，点「归档所选」。归档的项目移入「已归档」，可以查看资料、恢复项目，或撤销刚才的操作。
+
+归档状态保存在 `agent-bridge.json` 所在目录的 `agent-bridge-archive.sqlite`。实时扫描和重启后仍会保留。原工作目录、记忆、Skills 和会话记录继续留在各自的来源中。
 
 项目原有的 `.agents/skills` 和 `.dsh/skills` 由 DSH 原生发现。其他 Agent 的 Skill 以 `SKILL.md` 正文摘录和原路径带入，DSH 可在需要时读取同目录资源。导入预览会标记截取内容。插件通过本机的已认证 DSH Host 读取资料，源文件与 Agent 数据库按只读方式访问。发送之后，当前会话所选的模型会收到草稿。
 

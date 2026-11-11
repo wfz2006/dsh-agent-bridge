@@ -7,6 +7,7 @@ import { listProjectAssets, readAsset } from './assets.js'
 import { readProjectHistory, scanProjects } from './projects.js'
 import { createSourceMonitor } from './watch.js'
 import { makeExport } from './export.js'
+import { ProjectArchiveError, readArchivedProjects, writeProjectArchive } from './project-archive.js'
 
 const run = promisify(execFile)
 const limit = 32_000
@@ -136,6 +137,32 @@ function sortProjects(a, b) {
     || a.name.localeCompare(b.name, 'zh-CN')
 }
 
+function applyProjectArchive(projects, archivedIds) {
+  const visibleArchive = []
+  for (const project of projects) {
+    project.archived = archivedIds.has(project.id)
+    if (project.archived) visibleArchive.push(project.id)
+  }
+  return keyFor(visibleArchive.sort())
+}
+
+function archiveFailure(operation, error) {
+  const sqliteCode = error.errcode & 0xff
+  let detail = '请检查 agent-bridge-archive.sqlite 及其所在目录。'
+  if (error instanceof ProjectArchiveError) detail = error.message
+  else if ([5, 6].includes(sqliteCode)) detail = '归档数据库正忙，请重试。'
+  else if ([11, 26].includes(sqliteCode)) detail = '归档文件已损坏或格式无效。'
+  else if ([3, 8, 14].includes(sqliteCode) || ['EACCES', 'EPERM', 'EROFS'].includes(error.code)) {
+    detail = '请检查归档文件和目录的访问权限。'
+  }
+  return new RequestError(`无法${operation}项目归档记录。${detail}`, 503)
+}
+
+async function loadProjectArchive(config) {
+  try { return await readArchivedProjects(config) }
+  catch (error) { throw archiveFailure('读取', error) }
+}
+
 export function createCatalog(loadConfig) {
   let snapshot
   let scanning
@@ -169,9 +196,25 @@ export function createCatalog(loadConfig) {
     })
   }
 
+  async function synchronizeProjectArchive() {
+    if (scanning) await scanning
+    const current = snapshot
+    const archivedIds = await loadProjectArchive(current.config)
+    if (scanning || snapshot !== current) return synchronizeProjectArchive()
+    const archiveFingerprint = applyProjectArchive(current.projects, archivedIds)
+    if (current.archiveFingerprint !== archiveFingerprint) {
+      current.archiveFingerprint = archiveFingerprint
+      revision++
+      wake()
+    }
+    return current
+  }
+
   async function scan(refresh = false) {
     if (scanning) return scanning
-    if (!refresh && snapshot?.epoch === epoch && Date.now() - snapshot.scannedAt < fallbackScanInterval) return snapshot
+    if (!refresh && snapshot?.epoch === epoch && Date.now() - snapshot.scannedAt < fallbackScanInterval) {
+      return synchronizeProjectArchive()
+    }
     scanning = (async () => {
       const scanEpoch = epoch
       const config = await loadConfig()
@@ -189,9 +232,11 @@ export function createCatalog(loadConfig) {
       }
       projects.sort(sortProjects)
       const fingerprint = keyFor(projects, result.sources)
+      const archiveFingerprint = applyProjectArchive(projects, await loadProjectArchive(config))
       const changed = refresh || snapshot?.epoch !== scanEpoch || snapshot?.fingerprint !== fingerprint
+        || snapshot?.archiveFingerprint !== archiveFingerprint
       details.clear()
-      snapshot = { config, projects, sources: result.sources, scannedAt: Date.now(), fingerprint, epoch: scanEpoch }
+      snapshot = { config, projects, sources: result.sources, scannedAt: Date.now(), fingerprint, archiveFingerprint, epoch: scanEpoch }
       await monitor.update(config, [...watched.values()])
       if (changed) {
         revision++
@@ -200,6 +245,22 @@ export function createCatalog(loadConfig) {
       return snapshot
     })().finally(() => { scanning = undefined })
     return scanning
+  }
+
+  async function setProjectArchive(input) {
+    if (typeof input.archived !== 'boolean' || !Array.isArray(input.projectIds) || !input.projectIds.length
+      || input.projectIds.some(id => typeof id !== 'string' || !/^[0-9a-f]{24}$/.test(id))) {
+      throw new RequestError('归档请求格式无效，请重新选择项目。')
+    }
+    const projectIds = [...new Set(input.projectIds)]
+    const current = await scan()
+    const known = new Set(current.projects.map(project => project.id))
+    if (projectIds.some(id => !known.has(id))) throw new RequestError('有项目已不在当前目录中，请刷新后重试。', 404)
+    let changedProjectIds
+    try { changedProjectIds = await writeProjectArchive(current.config, projectIds, input.archived) }
+    catch (error) { throw archiveFailure('保存', error) }
+    await synchronizeProjectArchive()
+    return { projectIds, changedProjectIds, archived: input.archived, revision }
   }
 
   async function detail(id) {
@@ -324,6 +385,7 @@ export function createCatalog(loadConfig) {
         const { projects, sources, scannedAt } = await scan(input.refresh === true)
         return { projects: projects.map(publicProject), sources, scannedAt, revision }
       }
+      if (action === 'set-project-archive') return setProjectArchive(input)
       if (action === 'changes') {
         const inspect = async () => {
           const current = await scan()

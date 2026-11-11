@@ -18,6 +18,11 @@ const projectSearch = byId('project-search')
 const assetSearch = byId('asset-search')
 const historyOption = byId('history')
 const projectList = byId('project-list')
+const projectManage = byId('project-manage')
+const selectVisible = byId('project-select-visible')
+const bulkArchive = byId('project-bulk-action')
+const archiveAction = byId('project-archive-action')
+const projectUndo = byId('project-undo')
 const assetList = byId('asset-list')
 const queueList = byId('queue-list')
 const projectFilters = [...document.querySelectorAll('[data-project-state]')]
@@ -47,6 +52,11 @@ let detailRevision = 0
 let detailLoading = false
 let tab = 'memory'
 let projectState = 'all'
+let archiveAvailable = false
+let managingProjects = false
+const selectedProjects = new Set()
+let archiveBusy = false
+let undoArchive
 let selected = new Set()
 let includeHistory = false
 let sourceRevision = null
@@ -277,23 +287,48 @@ function projectMatches() {
 }
 
 function filteredProjects(matches = projectMatches()) {
-  if (projectState === 'all') return matches
-  return matches.filter(project => project.online === (projectState === 'online'))
+  if (projectState === 'archived') return matches.filter(project => project.archived)
+  return matches.filter(project => !project.archived && (projectState === 'all' || project.online === (projectState === 'online')))
+}
+
+function renderArchiveControls(matches) {
+  const visibleIds = new Set(matches.map(project => project.id))
+  for (const id of selectedProjects) {
+    if (!visibleIds.has(id)) selectedProjects.delete(id)
+  }
+  const size = selectedProjects.size
+  const action = projectState === 'archived' ? '恢复所选' : '归档所选'
+  projectManage.setAttribute('aria-pressed', String(managingProjects))
+  projectManage.hidden = !archiveAvailable
+  projectManage.disabled = archiveBusy || catalog.length === 0
+  byId('project-bulk').hidden = !managingProjects
+  selectVisible.checked = size > 0 && size === matches.length
+  selectVisible.indeterminate = size > 0 && size < matches.length
+  selectVisible.disabled = archiveBusy || matches.length === 0
+  bulkArchive.textContent = size ? `${action} · ${size}` : action
+  bulkArchive.disabled = archiveBusy || size === 0
+  projectUndo.disabled = archiveBusy
+  archiveAction.hidden = !archiveAvailable
+  archiveAction.disabled = archiveBusy || detailLoading || !current
 }
 
 function renderProjects() {
   syncSearch(projectSearch)
   const base = projectMatches()
   const matches = filteredProjects(base)
-  const online = base.filter(project => project.online).length
-  const counts = { all: base.length, online, offline: base.length - online }
-  const labels = { all: '全部', online: '可接续', offline: '离线' }
+  const active = base.filter(project => !project.archived)
+  const online = active.filter(project => project.online).length
+  const counts = { all: active.length, online, offline: active.length - online, archived: base.length - active.length }
+  const labels = { all: '全部', online: '可接续', offline: '离线', archived: '已归档' }
   for (const button of projectFilters) {
     const state = button.dataset.projectState
+    button.hidden = state === 'archived' && !archiveAvailable
     button.setAttribute('aria-pressed', String(projectState === state))
     button.replaceChildren(document.createTextNode(labels[state]), text('span', counts[state], 'filter-count'))
   }
-  byId('project-count').textContent = matches.length === catalog.length ? `${catalog.length} 项` : `${matches.length} / ${catalog.length}`
+  const total = catalog.filter(project => Boolean(project.archived) === (projectState === 'archived')).length
+  byId('project-count').textContent = matches.length === total ? `${total} 项` : `${matches.length} / ${total}`
+  renderArchiveControls(matches)
   const items = matches.map(project => {
     const button = document.createElement('button')
     button.type = 'button'
@@ -320,13 +355,89 @@ function renderProjects() {
     main.append(source)
     button.append(mark, main, indicator)
     button.addEventListener('click', () => selectProject(project, true))
-    return button
+    if (!managingProjects) return button
+    const row = text('div', '', 'project-row')
+    const check = document.createElement('input')
+    check.id = `check-project-${project.id}`
+    check.className = 'project-check'
+    check.type = 'checkbox'
+    check.checked = selectedProjects.has(project.id)
+    check.disabled = archiveBusy
+    check.setAttribute('aria-label', `选择 ${project.name}`)
+    check.addEventListener('change', () => {
+      if (check.checked) selectedProjects.add(project.id)
+      else selectedProjects.delete(project.id)
+      renderArchiveControls(matches)
+    })
+    row.append(check, button)
+    return row
   })
   const focused = projectList.contains(document.activeElement) ? document.activeElement.id : ''
   const scroll = projectList.scrollTop
-  projectList.replaceChildren(...(items.length ? items : [text('p', '没有匹配的项目。', 'asset-empty')]))
+  const emptyMessage = projectState === 'archived' ? '没有匹配的归档项目。' : '没有匹配的项目。'
+  projectList.replaceChildren(...(items.length ? items : [text('p', emptyMessage, 'asset-empty')]))
   projectList.scrollTop = scroll
   if (focused) byId(focused)?.focus({ preventScroll: true })
+}
+
+function archiveFeedback(message, error = false) {
+  const feedback = byId('project-feedback')
+  feedback.hidden = !message
+  feedback.classList.toggle('error', error)
+  byId('project-feedback-text').textContent = message
+  projectUndo.hidden = !undoArchive
+}
+
+function emptyProjectDetail(message) {
+  current = undefined
+  detail = undefined
+  detailLoading = false
+  ++detailRevision
+  byId('empty').textContent = message
+  byId('empty').hidden = false
+  byId('project-detail').hidden = true
+  byId('handoff').hidden = true
+}
+
+function alignProjectWithArchiveView() {
+  if (current && Boolean(current.archived) === (projectState === 'archived')) return
+  const next = filteredProjects()[0]
+  if (next) void selectProject(next)
+  else emptyProjectDetail(projectState === 'archived' ? '暂无可查看的归档项目。' : '当前列表暂无项目。')
+}
+
+async function updateProjectArchive(projectIds, archived, undo = false) {
+  if (!projectIds.length || archiveBusy) return
+  if (refreshing) {
+    archiveFeedback('正在刷新项目，请稍后重试。', true)
+    return
+  }
+  const origin = document.activeElement
+  archiveBusy = true
+  renderProjects()
+  try {
+    const result = await api('set-project-archive', { projectIds, archived })
+    const updated = new Set(result.projectIds)
+    for (const project of catalog) {
+      if (updated.has(project.id)) project.archived = archived
+    }
+    if (updated.has(current?.id)) current.archived = archived
+    alignProjectWithArchiveView()
+    selectedProjects.clear()
+    const changed = result.changedProjectIds
+    undoArchive = !undo && changed.length ? { projectIds: changed, archived: !archived } : undefined
+    archiveFeedback(changed.length ? `已${archived ? '归档' : '恢复'} ${changed.length} 个项目` : '项目已处于所选状态。')
+  } catch (error) {
+    archiveFeedback(error.message, true)
+  } finally {
+    archiveBusy = false
+    renderProjects()
+    if (document.activeElement === document.body && [archiveAction, bulkArchive, projectUndo].includes(origin)) {
+      if (origin === bulkArchive && !selectVisible.disabled) selectVisible.focus({ preventScroll: true })
+      else projectFilters.find(button => button.dataset.projectState === projectState)?.focus({ preventScroll: true })
+    }
+    schedulePoll(0)
+  }
 }
 
 function renderSelection() {
@@ -437,7 +548,7 @@ function renderAssets() {
 }
 
 function applyDetail(project, loaded, preserve) {
-  current = loaded.project ?? project
+  current = { ...(loaded.project ?? project), archived: Boolean(project.archived) }
   detail = loaded
   if (preserve) {
     const available = new Set([...detail.memories, ...detail.skills].map(item => item.id))
@@ -460,6 +571,14 @@ function applyDetail(project, loaded, preserve) {
   availability.dataset.state = current.online ? 'online' : 'offline'
   byId('project-meta').replaceChildren(...current.projectIds.map(value => text('span', value, 'chip')),
     ...current.agents.map(agent => agentLabel(agent, 'chip')), availability)
+  if (current.archived) {
+    const archived = text('span', '已归档', 'chip')
+    archived.dataset.state = 'archived'
+    byId('project-meta').append(archived)
+  }
+  byId('project-archive-action-label').textContent = current.archived ? '恢复项目' : '归档项目'
+  byId('project-archive-action-icon').setAttribute('href', current.archived ? '#icon-restore' : '#icon-archive')
+  archiveAction.disabled = archiveBusy
   libraryTabs[0].querySelector('.tab-count').textContent = detail.memories.length
   libraryTabs[1].querySelector('.tab-count').textContent = detail.skills.length
   byId('empty').hidden = true
@@ -499,7 +618,7 @@ async function selectProject(project, reveal = false) {
 }
 
 function canAutoRefresh() {
-  return document.visibilityState === 'visible' && !dialog.open && agentPopover.hidden && !detailLoading
+  return document.visibilityState === 'visible' && !dialog.open && agentPopover.hidden && !detailLoading && !archiveBusy
 }
 
 function liveState(label, scannedAt, error) {
@@ -518,7 +637,7 @@ function liveState(label, scannedAt, error) {
 }
 
 async function refresh(force, automatic = false) {
-  if (refreshing || (automatic && !canAutoRefresh())) return false
+  if (refreshing || archiveBusy || (automatic && !canAutoRefresh())) return false
   refreshing = true
   refreshButton.disabled = true
   refreshButton.dataset.loading = 'true'
@@ -526,11 +645,13 @@ async function refresh(force, automatic = false) {
   try {
     const result = await api('catalog', { refresh: force })
     if (automatic && !canAutoRefresh()) return false
-    const previous = result.projects.find(project => project.id === current?.id)
+    const previous = result.projects.find(project => project.id === current?.id
+      && Boolean(project.archived) === (projectState === 'archived'))
     const revision = detailRevision
     const loaded = previous && detail ? await api('detail', { projectId: previous.id }) : undefined
     if (automatic && !canAutoRefresh()) return false
     catalog = result.projects
+    archiveAvailable = catalog.every(project => typeof project.archived === 'boolean')
     agentIcons = result.agentIcons ?? {}
     const activeAgent = availableAgents[activeAgentIndex]
     availableAgents = ['', ...[...new Set(catalog.flatMap(project => project.agents))]
@@ -538,21 +659,14 @@ async function refresh(force, automatic = false) {
     if (!availableAgents.includes(selectedAgent)) selectedAgent = ''
     renderAgentPicker(activeAgent)
     renderSources(result.sources)
-    if (!automatic) status('')
+    if (!archiveAvailable) status('请完全退出 DSH 并重新打开，加载项目归档。')
+    else if (!automatic) status('')
     if (revision === detailRevision) {
       const next = previous ?? filteredProjects()[0]
       if (loaded) applyDetail(previous, loaded, true)
       else if (next) void selectProject(next)
-      else {
-        current = undefined
-        detail = undefined
-        detailLoading = false
-        ++detailRevision
-        byId('empty').textContent = '未找到可浏览的项目。请展开本机来源查看读取状态。'
-        byId('empty').hidden = false
-        byId('project-detail').hidden = true
-        byId('handoff').hidden = true
-      }
+      else if (catalog.length) emptyProjectDetail(projectState === 'archived' ? '暂无可查看的归档项目。' : '当前列表暂无项目。')
+      else emptyProjectDetail('未找到可浏览的项目。请展开本机来源查看读取状态。')
     }
     renderProjects()
     sourceRevision = result.revision ?? sourceRevision
@@ -903,10 +1017,31 @@ window.addEventListener('scroll', positionAgentPicker, { passive: true })
 assetSearch.addEventListener('input', renderAssets)
 wireClear(projectSearch, renderProjects)
 wireClear(assetSearch, renderAssets)
+projectManage.addEventListener('click', () => {
+  managingProjects = !managingProjects
+  selectedProjects.clear()
+  renderProjects()
+})
+selectVisible.addEventListener('change', () => {
+  selectedProjects.clear()
+  if (selectVisible.checked) {
+    for (const project of filteredProjects()) selectedProjects.add(project.id)
+  }
+  renderProjects()
+})
+bulkArchive.addEventListener('click', () => updateProjectArchive([...selectedProjects], projectState !== 'archived'))
+archiveAction.addEventListener('click', () => {
+  if (current) void updateProjectArchive([current.id], !current.archived)
+})
+projectUndo.addEventListener('click', () => {
+  if (undoArchive) void updateProjectArchive(undoArchive.projectIds, undoArchive.archived, true)
+})
 for (const button of projectFilters) {
   button.addEventListener('click', () => {
+    const changesArchiveView = (projectState === 'archived') !== (button.dataset.projectState === 'archived')
     projectState = button.dataset.projectState
     projectList.scrollTop = 0
+    if (changesArchiveView) alignProjectWithArchiveView()
     renderProjects()
   })
 }
