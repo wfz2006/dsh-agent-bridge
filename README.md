@@ -6,12 +6,12 @@
 
 ## 安装
 
-获取安装包 `dsh-agent-bridge-0.6.0.tgz`，在 **DSH Desktop → 插件 → 安装插件** 填入该文件在你电脑上的完整路径。安装或更新后，从 **应用 → 退出** 完全退出 DSH，再打开以加载新版插件。侧栏会出现 **Agent 工作接续**。公开安装包见 [GitHub Releases](https://github.com/wfz2006/dsh-agent-bridge/releases)。
+获取安装包 `dsh-agent-bridge-0.7.0.tgz`，在 **DSH Desktop → 插件 → 安装插件** 填入该文件在你电脑上的完整路径。安装或更新后，从 **应用 → 退出** 完全退出 DSH，再打开以加载新版插件。侧栏会出现 **Agent 工作接续**。公开安装包见 [GitHub Releases](https://github.com/wfz2006/dsh-agent-bridge/releases)。
 
 使用 DSH Web 时，在包含安装包的目录运行以下命令。
 
 ```sh
-dsh plugin --profile web add ./dsh-agent-bridge-0.6.0.tgz
+dsh plugin --profile web add ./dsh-agent-bridge-0.7.0.tgz
 dsh web
 ```
 
@@ -22,6 +22,10 @@ dsh web
 1. 打开 **Agent 工作接续**，按项目名、路径、Agent 或目录状态筛选。按 `/` 可以定位项目搜索框。不同 Git worktree 会独立显示。
 2. 在资料区勾选记忆与 Skills。接续清单会汇总两类资料，可以移除单项或勾选近期会话。Skills 页会标记会话中记录过的使用。
 3. 从接续清单打开 **预览交接**，在侧栏中核对内容，选择导入或导出。导入会在原工作目录创建 DSH 会话并填入可编辑的草稿。
+
+当前项目离开筛选结果时，右侧会提示重新选择。搜索后按 `↓` 聚焦第一项，或按 `Enter` 打开第一项。每个项目的资料勾选和近期会话选项会单独保存，切换项目或重启 DSH 后可继续使用。
+
+项目详情右上角可置顶常用项目。成功在 DSH 打开交接草稿的项目会进入「最近接续」，最多显示五个符合当前筛选的非置顶项目。
 
 右上角可以选择蓝色、白色或黑色，插件会记住选择。Agent 筛选菜单支持方向键、回车和按字母查找。已适配的 Agent 名称旁显示随包提供的官方图标。[图标来源](web/agent-icons/NOTICE.md)
 

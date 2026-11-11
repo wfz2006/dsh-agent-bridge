@@ -188,7 +188,16 @@ window.__ModuleLoader__.load({
             importing = true;
             try {
               const sessionId = await prepareSession(request, (id) => {
-                if (iframe.current === frame) ctx.uiWorkspace.openSession(id);
+                if (iframe.current !== frame) return;
+                ctx.uiWorkspace.openSession(id);
+                if (typeof request.bridgeNonce === 'string' && /^[a-f0-9]{64}$/.test(request.bridgeNonce)) {
+                  // The native workspace may replace the panel before it receives the reply.
+                  void fetch(new URL('api', url), {
+                    method: 'POST', keepalive: true,
+                    headers: { 'Content-Type': 'application/json', 'X-DSH-Agent-Bridge': request.bridgeNonce },
+                    body: JSON.stringify({ action: 'record-project-continuation', ticket: request.requestId }),
+                  }).catch(() => {});
+                }
               });
               reply({ ok: true, sessionId });
             } catch (error) {

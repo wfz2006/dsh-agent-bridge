@@ -23,6 +23,7 @@ const selectVisible = byId('project-select-visible')
 const bulkArchive = byId('project-bulk-action')
 const archiveAction = byId('project-archive-action')
 const projectUndo = byId('project-undo')
+const projectPin = byId('project-pin')
 const assetList = byId('asset-list')
 const queueList = byId('queue-list')
 const projectFilters = [...document.querySelectorAll('[data-project-state]')]
@@ -40,9 +41,11 @@ const agentInitials = { claude: 'CC', codex: 'CX', workbuddy: 'WB', trae: 'TR', 
 const sourceStates = { ready: '可读取', partial: '部分可读', unavailable: '未找到', error: '读取失败' }
 const scopeNames = { project: '项目', agent: 'Agent 全局', shared: '共享' }
 let catalog = []
+let catalogLoaded = false
 let agentIcons = {}
 let availableAgents = ['']
 let selectedAgent = ''
+let projectQuery = ''
 let activeAgentIndex = 0
 let agentQuery = ''
 let agentQueryAt = 0
@@ -53,13 +56,18 @@ let detailLoading = false
 let tab = 'memory'
 let projectState = 'all'
 let archiveAvailable = false
+let preferencesAvailable = false
 let managingProjects = false
 const selectedProjects = new Set()
+const pinRequests = new Set()
+const projectSelections = new Map()
+const selectionSaves = new Map()
 let archiveBusy = false
 let undoArchive
 let selected = new Set()
 let includeHistory = false
 let sourceRevision = null
+let lastPinRevision = 0
 let refreshing = false
 let polling = false
 let pollTimer
@@ -201,7 +209,7 @@ function chooseAgent(index) {
   closeAgentPicker(true)
   renderAgentPicker()
   projectList.scrollTop = 0
-  renderProjects()
+  updateProjectView()
 }
 
 function navigateAgents(event) {
@@ -247,11 +255,12 @@ function syncSearch(input) {
   if (hint) hint.hidden = Boolean(input.value)
 }
 
-async function api(action, values = {}) {
+async function api(action, values = {}, { keepalive = false } = {}) {
   const response = await fetch('./api', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-DSH-Agent-Bridge': nonce },
     body: JSON.stringify({ action, ...values }),
+    keepalive,
   })
   const data = await response.json().catch(() => null)
   if (!response.ok || !data) throw new Error(data?.error || '无法连接 DSH 插件。')
@@ -280,15 +289,57 @@ function renderSources(sources) {
 }
 
 function projectMatches() {
-  const query = projectSearch.value.trim().toLowerCase()
   return catalog.filter(project => (!selectedAgent || project.agents.includes(selectedAgent))
     && [project.name, project.cwd, ...project.projectIds, ...project.agents.map(agentName)]
-      .some(value => value.toLowerCase().includes(query)))
+      .some(value => value.toLowerCase().includes(projectQuery)))
 }
 
 function filteredProjects(matches = projectMatches()) {
   if (projectState === 'archived') return matches.filter(project => project.archived)
   return matches.filter(project => !project.archived && (projectState === 'all' || project.online === (projectState === 'online')))
+}
+
+function projectGroups(matches) {
+  if (!preferencesAvailable || projectState === 'archived') return [['', matches]]
+  const pinned = matches.filter(project => project.pinned)
+  const recent = matches.filter(project => !project.pinned && project.continuedAt != null)
+    .sort((a, b) => b.continuedAt - a.continuedAt).slice(0, 5)
+  if (!pinned.length && !recent.length) return [['', matches]]
+  const featured = new Set([...pinned, ...recent].map(project => project.id))
+  return [['置顶', pinned], ['最近接续', recent], ['其他项目', matches.filter(project => !featured.has(project.id))]]
+}
+
+function renderPin() {
+  const pinned = Boolean(current?.pinned)
+  projectPin.hidden = !preferencesAvailable || !current || current.archived
+  projectPin.disabled = !detail || pinRequests.has(current?.id)
+  projectPin.setAttribute('aria-pressed', String(pinned))
+  byId('project-pin-label').textContent = pinned ? '取消置顶' : '置顶'
+  byId('project-pin-icon').setAttribute('href', pinned ? '#icon-unpin' : '#icon-pin')
+}
+
+async function toggleProjectPin() {
+  if (!preferencesAvailable || !current || current.archived || !detail) return
+  const projectId = current.id
+  if (pinRequests.has(projectId)) return
+  const pinned = !current.pinned
+  pinRequests.add(projectId)
+  renderPin()
+  try {
+    const result = await api('set-project-pin', { projectId, pinned })
+    lastPinRevision = Math.max(lastPinRevision, result.revision)
+    const project = catalog.find(item => item.id === projectId)
+    if (project) project.pinned = pinned
+    if (current?.id === projectId) current.pinned = pinned
+    status('')
+    renderProjects()
+  } catch (error) {
+    status(error.message, true)
+  } finally {
+    pinRequests.delete(projectId)
+    renderPin()
+    schedulePoll(0)
+  }
 }
 
 function renderArchiveControls(matches) {
@@ -312,6 +363,50 @@ function renderArchiveControls(matches) {
   archiveAction.disabled = archiveBusy || detailLoading || !current
 }
 
+function projectRow(project, matches) {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'project'
+  button.id = `project-${project.id}`
+  button.setAttribute('aria-pressed', String(current?.id === project.id))
+  button.title = project.cwd
+  const mark = text('span', '', 'project-icon')
+  mark.dataset.agent = project.agents[0] || 'local'
+  mark.append(icon('folder'))
+  const main = text('span', '', 'project-main')
+  main.append(text('span', project.name, 'project-title'), text('span', shortPath(project.cwd), 'project-path'))
+  const source = text('span', '', 'project-source')
+  for (const agent of project.agents.slice(0, 2)) source.append(agentLabel(agent))
+  if (project.agents.length > 2) {
+    const rest = text('span', `+${project.agents.length - 2}`, 'project-more-agents')
+    rest.title = project.agents.slice(2).map(agentName).join('、')
+    source.append(rest)
+  }
+  if (!project.agents.length) source.textContent = '本地项目'
+  const indicator = text('span', '', 'project-state')
+  indicator.dataset.state = project.online ? 'online' : 'offline'
+  indicator.setAttribute('aria-label', project.online ? '原目录可用' : '原目录不可访问')
+  main.append(source)
+  button.append(mark, main, indicator)
+  button.addEventListener('click', () => selectProject(project, true))
+  if (!managingProjects) return button
+  const row = text('div', '', 'project-row')
+  const check = document.createElement('input')
+  check.id = `check-project-${project.id}`
+  check.className = 'project-check'
+  check.type = 'checkbox'
+  check.checked = selectedProjects.has(project.id)
+  check.disabled = archiveBusy
+  check.setAttribute('aria-label', `选择 ${project.name}`)
+  check.addEventListener('change', () => {
+    if (check.checked) selectedProjects.add(project.id)
+    else selectedProjects.delete(project.id)
+    renderArchiveControls(matches)
+  })
+  row.append(check, button)
+  return row
+}
+
 function renderProjects() {
   syncSearch(projectSearch)
   const base = projectMatches()
@@ -319,7 +414,7 @@ function renderProjects() {
   const active = base.filter(project => !project.archived)
   const online = active.filter(project => project.online).length
   const counts = { all: active.length, online, offline: active.length - online, archived: base.length - active.length }
-  const labels = { all: '全部', online: '可接续', offline: '离线', archived: '已归档' }
+  const labels = { all: '未归档', online: '可接续', offline: '离线', archived: '已归档' }
   for (const button of projectFilters) {
     const state = button.dataset.projectState
     button.hidden = state === 'archived' && !archiveAvailable
@@ -329,49 +424,12 @@ function renderProjects() {
   const total = catalog.filter(project => Boolean(project.archived) === (projectState === 'archived')).length
   byId('project-count').textContent = matches.length === total ? `${total} 项` : `${matches.length} / ${total}`
   renderArchiveControls(matches)
-  const items = matches.map(project => {
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'project'
-    button.id = `project-${project.id}`
-    button.setAttribute('aria-pressed', String(current?.id === project.id))
-    button.title = project.cwd
-    const mark = text('span', '', 'project-icon')
-    mark.dataset.agent = project.agents[0] || 'local'
-    mark.append(icon('folder'))
-    const main = text('span', '', 'project-main')
-    main.append(text('span', project.name, 'project-title'), text('span', shortPath(project.cwd), 'project-path'))
-    const source = text('span', '', 'project-source')
-    for (const agent of project.agents.slice(0, 2)) source.append(agentLabel(agent))
-    if (project.agents.length > 2) {
-      const rest = text('span', `+${project.agents.length - 2}`, 'project-more-agents')
-      rest.title = project.agents.slice(2).map(agentName).join('、')
-      source.append(rest)
-    }
-    if (!project.agents.length) source.textContent = '本地项目'
-    const indicator = text('span', '', 'project-state')
-    indicator.dataset.state = project.online ? 'online' : 'offline'
-    indicator.setAttribute('aria-label', project.online ? '原目录可用' : '原目录不可访问')
-    main.append(source)
-    button.append(mark, main, indicator)
-    button.addEventListener('click', () => selectProject(project, true))
-    if (!managingProjects) return button
-    const row = text('div', '', 'project-row')
-    const check = document.createElement('input')
-    check.id = `check-project-${project.id}`
-    check.className = 'project-check'
-    check.type = 'checkbox'
-    check.checked = selectedProjects.has(project.id)
-    check.disabled = archiveBusy
-    check.setAttribute('aria-label', `选择 ${project.name}`)
-    check.addEventListener('change', () => {
-      if (check.checked) selectedProjects.add(project.id)
-      else selectedProjects.delete(project.id)
-      renderArchiveControls(matches)
-    })
-    row.append(check, button)
-    return row
-  })
+  const items = []
+  for (const [label, group] of projectGroups(matches)) {
+    if (!group.length) continue
+    if (label) items.push(text('h3', label, 'project-group-heading'))
+    for (const project of group) items.push(projectRow(project, matches))
+  }
   const focused = projectList.contains(document.activeElement) ? document.activeElement.id : ''
   const scroll = projectList.scrollTop
   const emptyMessage = projectState === 'archived' ? '没有匹配的归档项目。' : '没有匹配的项目。'
@@ -397,13 +455,27 @@ function emptyProjectDetail(message) {
   byId('empty').hidden = false
   byId('project-detail').hidden = true
   byId('handoff').hidden = true
+  byId('preview').disabled = true
 }
 
-function alignProjectWithArchiveView() {
-  if (current && Boolean(current.archived) === (projectState === 'archived')) return
-  const next = filteredProjects()[0]
-  if (next) void selectProject(next)
-  else emptyProjectDetail(projectState === 'archived' ? '暂无可查看的归档项目。' : '当前列表暂无项目。')
+function reconcileProject(matches, selectFirst = false) {
+  if (current && matches.some(project => project.id === current.id)) return
+  if (selectFirst && matches.length) {
+    const [, firstGroup] = projectGroups(matches).find(([, group]) => group.length)
+    void selectProject(firstGroup[0])
+  } else if (matches.length) emptyProjectDetail('从项目列表选择要接续的项目。')
+  else if (catalog.length) emptyProjectDetail('当前筛选下没有项目。')
+  else if (catalogLoaded) emptyProjectDetail('未找到可浏览的项目。请展开本机来源查看读取状态。')
+}
+
+function updateProjectView() {
+  reconcileProject(filteredProjects())
+  renderProjects()
+}
+
+function updateProjectSearch() {
+  projectQuery = projectSearch.value.trim().toLowerCase()
+  updateProjectView()
 }
 
 async function updateProjectArchive(projectIds, archived, undo = false) {
@@ -422,7 +494,7 @@ async function updateProjectArchive(projectIds, archived, undo = false) {
       if (updated.has(project.id)) project.archived = archived
     }
     if (updated.has(current?.id)) current.archived = archived
-    alignProjectWithArchiveView()
+    reconcileProject(filteredProjects(), true)
     selectedProjects.clear()
     const changed = result.changedProjectIds
     undoArchive = !undo && changed.length ? { projectIds: changed, archived: !archived } : undefined
@@ -466,6 +538,7 @@ function renderSelection() {
       const next = row.nextElementSibling ?? row.previousElementSibling
       const focusId = next?.querySelector('.queue-remove')?.id
       selected.delete(item.id)
+      void saveProjectSelection()
       renderAssets()
       const focusTarget = byId(focusId) ?? byId('preview')
       focusTarget.focus({ preventScroll: true })
@@ -475,6 +548,32 @@ function renderSelection() {
   }) : [text('p', '勾选资料后会列在这里。', 'queue-empty')]))
   queueList.scrollTop = scroll
   if (focused) byId(focused)?.focus({ preventScroll: true })
+}
+
+function saveProjectSelection() {
+  if (!current || !detail) return
+  const projectId = current.id
+  projectSelections.set(projectId, { assetIds: [...selected], history: includeHistory })
+  if (!preferencesAvailable || selectionSaves.has(projectId)) return
+  selectionSaves.set(projectId, flushProjectSelection(projectId))
+}
+
+async function flushProjectSelection(projectId) {
+  try {
+    while (projectSelections.has(projectId)) {
+      const selection = projectSelections.get(projectId)
+      try {
+        await api('set-project-selection', { projectId, ...selection }, { keepalive: true })
+        if (projectSelections.get(projectId) === selection) projectSelections.delete(projectId)
+      } catch (error) {
+        if (projectSelections.get(projectId) !== selection) continue
+        if (current?.id === projectId) status(`勾选已保留在当前面板。${error.message}`, true)
+        return
+      }
+    }
+  } finally {
+    selectionSaves.delete(projectId)
+  }
 }
 
 function renderAssets() {
@@ -515,6 +614,7 @@ function renderAssets() {
       row.dataset.selected = String(checkbox.checked)
       status('')
       renderSelection()
+      void saveProjectSelection()
     })
     const label = text('label', '', 'asset-label')
     label.htmlFor = checkbox.id
@@ -548,23 +648,33 @@ function renderAssets() {
 }
 
 function applyDetail(project, loaded, preserve) {
-  current = { ...(loaded.project ?? project), archived: Boolean(project.archived) }
+  const latest = catalog.find(item => item.id === project.id) ?? project
+  current = { ...(loaded.project ?? latest), archived: Boolean(latest.archived), pinned: Boolean(latest.pinned) }
   detail = loaded
-  if (preserve) {
-    const available = new Set([...detail.memories, ...detail.skills].map(item => item.id))
-    selected = new Set([...selected].filter(id => available.has(id)))
-  } else {
-    const pinned = detail.memories.filter(item => item.agent !== 'export'
-      && /(?:当前状态|最新交接|current[- _]state|latest[- _]handoff)/i.test(item.name)).slice(0, 3)
-    const observed = detail.skills.filter(item => item.used && item.scope === 'project').slice(0, 3)
-    selected = new Set([...pinned, ...observed].map(item => item.id))
-    includeHistory = detail.historyCount > 0
+  if (!preserve) {
+    const saved = projectSelections.get(project.id) ?? loaded.selection
+    if (saved) {
+      selected = new Set(saved.assetIds)
+      includeHistory = saved.history
+    } else {
+      const recommended = detail.memories.filter(item => item.agent !== 'export'
+        && /(?:当前状态|最新交接|current[- _]state|latest[- _]handoff)/i.test(item.name)).slice(0, 3)
+      const observed = detail.skills.filter(item => item.used && item.scope === 'project').slice(0, 3)
+      selected = new Set([...recommended, ...observed].map(item => item.id))
+      includeHistory = detail.historyCount > 0
+    }
   }
+  const available = new Set([...detail.memories, ...detail.skills].map(item => item.id))
+  selected = new Set([...selected].filter(id => available.has(id)))
   historyOption.checked = includeHistory && detail.historyCount > 0
   historyOption.disabled = detail.historyCount === 0
   byId('history-option').hidden = detail.historyCount === 0
   byId('history-label').textContent = `近期会话 · ${Math.min(8, detail.historyCount)} 条`
   byId('project-name').textContent = current.name
+  for (const label of [byId('handoff-project'), byId('compact-project')]) {
+    label.textContent = current.name
+    label.title = current.cwd
+  }
   byId('project-path').textContent = current.cwd
   byId('project-path').title = current.cwd
   const availability = text('span', current.online ? '原目录可用' : '原目录不可访问', 'chip availability')
@@ -579,6 +689,7 @@ function applyDetail(project, loaded, preserve) {
   byId('project-archive-action-label').textContent = current.archived ? '恢复项目' : '归档项目'
   byId('project-archive-action-icon').setAttribute('href', current.archived ? '#icon-restore' : '#icon-archive')
   archiveAction.disabled = archiveBusy
+  renderPin()
   libraryTabs[0].querySelector('.tab-count').textContent = detail.memories.length
   libraryTabs[1].querySelector('.tab-count').textContent = detail.skills.length
   byId('empty').hidden = true
@@ -587,7 +698,19 @@ function applyDetail(project, loaded, preserve) {
   renderAssets()
 }
 
+function revealProjectDetail() {
+  if (!compactLayout.matches) return
+  const heading = byId('project-name')
+  heading.focus({ preventScroll: true })
+  heading.closest('.detail').scrollIntoView({ block: 'start', behavior: reducedMotion.matches ? 'instant' : 'smooth' })
+}
+
 async function selectProject(project, reveal = false) {
+  if (!filteredProjects().some(item => item.id === project.id)) return
+  if (current?.id === project.id && (detail || detailLoading)) {
+    if (detail && reveal) revealProjectDetail()
+    return
+  }
   const revision = ++detailRevision
   current = project
   detail = undefined
@@ -601,15 +724,14 @@ async function selectProject(project, reveal = false) {
   byId('handoff').hidden = true
   renderProjects()
   try {
+    const pendingSelection = selectionSaves.get(project.id)
+    if (pendingSelection) await pendingSelection
+    if (revision !== detailRevision) return
     const loaded = await api('detail', { projectId: project.id })
     if (revision !== detailRevision) return
     byId('asset-list').scrollTop = 0
     applyDetail(project, loaded, false)
-    if (reveal && compactLayout.matches) {
-      const heading = byId('project-name')
-      heading.focus({ preventScroll: true })
-      heading.closest('.detail').scrollIntoView({ block: 'start', behavior: reducedMotion.matches ? 'instant' : 'smooth' })
-    }
+    if (reveal) revealProjectDetail()
   } catch (error) {
     if (revision === detailRevision) byId('empty').textContent = error.message
   } finally {
@@ -644,31 +766,30 @@ async function refresh(force, automatic = false) {
   if (!automatic) status(force ? '正在重新扫描本机来源…' : '正在扫描本机来源…')
   try {
     const result = await api('catalog', { refresh: force })
-    if (automatic && !canAutoRefresh()) return false
-    const previous = result.projects.find(project => project.id === current?.id
-      && Boolean(project.archived) === (projectState === 'archived'))
-    const revision = detailRevision
-    const loaded = previous && detail ? await api('detail', { projectId: previous.id }) : undefined
-    if (automatic && !canAutoRefresh()) return false
+    if (dialog.open || (automatic && !canAutoRefresh())) return false
+    if (result.revision < lastPinRevision) return false
+    const firstLoad = !catalogLoaded
+    catalogLoaded = true
     catalog = result.projects
     archiveAvailable = catalog.every(project => typeof project.archived === 'boolean')
+    preferencesAvailable = catalog.every(project => typeof project.pinned === 'boolean')
     agentIcons = result.agentIcons ?? {}
     const activeAgent = availableAgents[activeAgentIndex]
-    availableAgents = ['', ...[...new Set(catalog.flatMap(project => project.agents))]
+    availableAgents = ['', ...[...new Set([selectedAgent, ...catalog.flatMap(project => project.agents)])]
       .filter(Boolean).sort((left, right) => agentName(left).localeCompare(agentName(right), 'zh-CN'))]
-    if (!availableAgents.includes(selectedAgent)) selectedAgent = ''
     renderAgentPicker(activeAgent)
     renderSources(result.sources)
-    if (!archiveAvailable) status('请完全退出 DSH 并重新打开，加载项目归档。')
+    if (!archiveAvailable || !preferencesAvailable) status('请完全退出 DSH 并重新打开，加载新版插件。')
     else if (!automatic) status('')
-    if (revision === detailRevision) {
-      const next = previous ?? filteredProjects()[0]
-      if (loaded) applyDetail(previous, loaded, true)
-      else if (next) void selectProject(next)
-      else if (catalog.length) emptyProjectDetail(projectState === 'archived' ? '暂无可查看的归档项目。' : '当前列表暂无项目。')
-      else emptyProjectDetail('未找到可浏览的项目。请展开本机来源查看读取状态。')
-    }
+    const matches = filteredProjects()
+    reconcileProject(matches, firstLoad)
     renderProjects()
+    const previous = matches.find(project => project.id === current?.id)
+    const revision = detailRevision
+    if (previous && detail) {
+      const loaded = await api('detail', { projectId: previous.id })
+      if (revision === detailRevision && !dialog.open) applyDetail(previous, loaded, true)
+    }
     sourceRevision = result.revision ?? sourceRevision
     liveState('实时扫描已开启', result.scannedAt)
     return true
@@ -804,11 +925,11 @@ async function viewAsset(asset) {
 
 async function preview() {
   const project = current
-  if (!project) return
+  if (!project || !detail || !filteredProjects().some(item => item.id === project.id)) return
   const note = project.online
     ? '可导出 Markdown，或在原工作目录打开 DSH 会话并继续编辑草稿。'
     : '原工作目录不可访问。可将现有交接资料导出为 Markdown。'
-  const epoch = showDialog('handoff', '交接预览', note, '正在准备…')
+  const epoch = showDialog('handoff', `交接预览 · ${project.name}`, note, '正在准备…')
   try {
     const result = await api('preview', { projectId: project.id, assetIds: [...selected], history: historyOption.checked })
     if (!dialog.open || dialogEpoch !== epoch) return
@@ -849,7 +970,7 @@ async function importSession() {
   status('正在创建 DSH 会话…', false, 'dialog-status')
   try {
     const { path, prompt } = await api('open', { ticket })
-    await requestParent('open', { path, prompt }, ticket)
+    await requestParent('open', { path, prompt, bridgeNonce: nonce }, ticket)
     ticket = undefined
     dialog.close()
     status('DSH 会话已打开。交接草稿已填入输入框。')
@@ -987,7 +1108,18 @@ window.addEventListener('message', event => {
   else request.reject(new Error(data.error || 'DSH 暂无法完成此操作。'))
 })
 refreshButton.addEventListener('click', () => refresh(true))
-projectSearch.addEventListener('input', renderProjects)
+projectSearch.addEventListener('input', event => {
+  if (!event.isComposing) updateProjectSearch()
+})
+projectSearch.addEventListener('compositionend', updateProjectSearch)
+projectSearch.addEventListener('keydown', event => {
+  if (event.isComposing || event.keyCode === 229 || !['ArrowDown', 'Enter'].includes(event.key)) return
+  const first = projectList.querySelector('.project')
+  if (!first) return
+  event.preventDefault()
+  first.focus()
+  if (event.key === 'Enter') first.click()
+})
 agentFilter.addEventListener('click', () => {
   if (agentPopover.hidden) openAgentPicker()
   else closeAgentPicker(true)
@@ -1015,7 +1147,7 @@ document.addEventListener('focusin', event => {
 window.addEventListener('resize', positionAgentPicker)
 window.addEventListener('scroll', positionAgentPicker, { passive: true })
 assetSearch.addEventListener('input', renderAssets)
-wireClear(projectSearch, renderProjects)
+wireClear(projectSearch, updateProjectSearch)
 wireClear(assetSearch, renderAssets)
 projectManage.addEventListener('click', () => {
   managingProjects = !managingProjects
@@ -1033,16 +1165,15 @@ bulkArchive.addEventListener('click', () => updateProjectArchive([...selectedPro
 archiveAction.addEventListener('click', () => {
   if (current) void updateProjectArchive([current.id], !current.archived)
 })
+projectPin.addEventListener('click', toggleProjectPin)
 projectUndo.addEventListener('click', () => {
   if (undoArchive) void updateProjectArchive(undoArchive.projectIds, undoArchive.archived, true)
 })
 for (const button of projectFilters) {
   button.addEventListener('click', () => {
-    const changesArchiveView = (projectState === 'archived') !== (button.dataset.projectState === 'archived')
     projectState = button.dataset.projectState
     projectList.scrollTop = 0
-    if (changesArchiveView) alignProjectWithArchiveView()
-    renderProjects()
+    updateProjectView()
   })
 }
 document.addEventListener('keydown', event => {
@@ -1067,6 +1198,7 @@ projectList.addEventListener('keydown', event => {
 historyOption.addEventListener('change', () => {
   includeHistory = historyOption.checked
   renderSelection()
+  void saveProjectSelection()
 })
 libraryTabs.forEach((button, index) => {
   button.addEventListener('click', () => switchTab(index))

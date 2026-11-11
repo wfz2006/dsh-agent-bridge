@@ -7,12 +7,16 @@ import { listProjectAssets, readAsset } from './assets.js'
 import { readProjectHistory, scanProjects } from './projects.js'
 import { createSourceMonitor } from './watch.js'
 import { makeExport } from './export.js'
-import { ProjectArchiveError, readArchivedProjects, writeProjectArchive } from './project-archive.js'
+import {
+  ProjectArchiveError, readProjectSelection, readProjectState, writeProjectArchive,
+  writeProjectContinuation, writeProjectPin, writeProjectSelection,
+} from './project-archive.js'
 
 const run = promisify(execFile)
 const limit = 32_000
 const fallbackScanInterval = 15_000
 const ticketLifetime = 10 * 60_000
+const catalogId = /^[0-9a-f]{24}$/
 
 class RequestError extends Error {
   constructor(message, status = 400) {
@@ -137,16 +141,21 @@ function sortProjects(a, b) {
     || a.name.localeCompare(b.name, 'zh-CN')
 }
 
-function applyProjectArchive(projects, archivedIds) {
-  const visibleArchive = []
+function applyProjectState(projects, { archivedIds, preferences }) {
+  const visibleState = []
   for (const project of projects) {
+    const preference = preferences.get(project.id)
     project.archived = archivedIds.has(project.id)
-    if (project.archived) visibleArchive.push(project.id)
+    project.pinned = preference?.pinned ?? false
+    project.continuedAt = preference?.continuedAt ?? null
+    if (project.archived || project.pinned || project.continuedAt !== null) {
+      visibleState.push([project.id, project.archived, project.pinned, project.continuedAt])
+    }
   }
-  return keyFor(visibleArchive.sort())
+  return keyFor(visibleState.sort((a, b) => a[0].localeCompare(b[0])))
 }
 
-function archiveFailure(operation, error) {
+function storageFailure(operation, error, subject = '项目归档记录') {
   const sqliteCode = error.errcode & 0xff
   let detail = '请检查 agent-bridge-archive.sqlite 及其所在目录。'
   if (error instanceof ProjectArchiveError) detail = error.message
@@ -155,12 +164,22 @@ function archiveFailure(operation, error) {
   else if ([3, 8, 14].includes(sqliteCode) || ['EACCES', 'EPERM', 'EROFS'].includes(error.code)) {
     detail = '请检查归档文件和目录的访问权限。'
   }
-  return new RequestError(`无法${operation}项目归档记录。${detail}`, 503)
+  return new RequestError(`无法${operation}${subject}。${detail}`, 503)
 }
 
-async function loadProjectArchive(config) {
-  try { return await readArchivedProjects(config) }
-  catch (error) { throw archiveFailure('读取', error) }
+async function loadProjectState(config) {
+  try { return await readProjectState(config) }
+  catch (error) { throw storageFailure('读取', error, '项目归档和偏好记录') }
+}
+
+function isCatalogId(id) {
+  return typeof id === 'string' && catalogId.test(id)
+}
+
+function requireProject(current, projectId) {
+  const project = current.projects.find(item => item.id === projectId)
+  if (!project) throw new RequestError('项目目录已刷新，请重新选择项目。', 404)
+  return project
 }
 
 export function createCatalog(loadConfig) {
@@ -196,14 +215,14 @@ export function createCatalog(loadConfig) {
     })
   }
 
-  async function synchronizeProjectArchive() {
+  async function synchronizeProjectState() {
     if (scanning) await scanning
     const current = snapshot
-    const archivedIds = await loadProjectArchive(current.config)
-    if (scanning || snapshot !== current) return synchronizeProjectArchive()
-    const archiveFingerprint = applyProjectArchive(current.projects, archivedIds)
-    if (current.archiveFingerprint !== archiveFingerprint) {
-      current.archiveFingerprint = archiveFingerprint
+    const state = await loadProjectState(current.config)
+    if (scanning || snapshot !== current) return synchronizeProjectState()
+    const stateFingerprint = applyProjectState(current.projects, state)
+    if (current.stateFingerprint !== stateFingerprint) {
+      current.stateFingerprint = stateFingerprint
       revision++
       wake()
     }
@@ -213,7 +232,7 @@ export function createCatalog(loadConfig) {
   async function scan(refresh = false) {
     if (scanning) return scanning
     if (!refresh && snapshot?.epoch === epoch && Date.now() - snapshot.scannedAt < fallbackScanInterval) {
-      return synchronizeProjectArchive()
+      return synchronizeProjectState()
     }
     scanning = (async () => {
       const scanEpoch = epoch
@@ -232,11 +251,11 @@ export function createCatalog(loadConfig) {
       }
       projects.sort(sortProjects)
       const fingerprint = keyFor(projects, result.sources)
-      const archiveFingerprint = applyProjectArchive(projects, await loadProjectArchive(config))
+      const stateFingerprint = applyProjectState(projects, await loadProjectState(config))
       const changed = refresh || snapshot?.epoch !== scanEpoch || snapshot?.fingerprint !== fingerprint
-        || snapshot?.archiveFingerprint !== archiveFingerprint
+        || snapshot?.stateFingerprint !== stateFingerprint
       details.clear()
-      snapshot = { config, projects, sources: result.sources, scannedAt: Date.now(), fingerprint, archiveFingerprint, epoch: scanEpoch }
+      snapshot = { config, projects, sources: result.sources, scannedAt: Date.now(), fingerprint, stateFingerprint, epoch: scanEpoch }
       await monitor.update(config, [...watched.values()])
       if (changed) {
         revision++
@@ -249,7 +268,7 @@ export function createCatalog(loadConfig) {
 
   async function setProjectArchive(input) {
     if (typeof input.archived !== 'boolean' || !Array.isArray(input.projectIds) || !input.projectIds.length
-      || input.projectIds.some(id => typeof id !== 'string' || !/^[0-9a-f]{24}$/.test(id))) {
+      || !input.projectIds.every(isCatalogId)) {
       throw new RequestError('归档请求格式无效，请重新选择项目。')
     }
     const projectIds = [...new Set(input.projectIds)]
@@ -258,16 +277,50 @@ export function createCatalog(loadConfig) {
     if (projectIds.some(id => !known.has(id))) throw new RequestError('有项目已不在当前目录中，请刷新后重试。', 404)
     let changedProjectIds
     try { changedProjectIds = await writeProjectArchive(current.config, projectIds, input.archived) }
-    catch (error) { throw archiveFailure('保存', error) }
-    await synchronizeProjectArchive()
+    catch (error) { throw storageFailure('保存', error) }
+    await synchronizeProjectState()
     return { projectIds, changedProjectIds, archived: input.archived, revision }
+  }
+
+  async function setProjectPin({ projectId, pinned }) {
+    if (!isCatalogId(projectId) || typeof pinned !== 'boolean') throw new RequestError('置顶请求格式无效。')
+    const current = await scan()
+    requireProject(current, projectId)
+    try { await writeProjectPin(current.config, projectId, pinned) }
+    catch (error) { throw storageFailure('保存', error, '项目置顶') }
+    await synchronizeProjectState()
+    return { projectId, pinned, revision }
+  }
+
+  async function setProjectSelection({ projectId, assetIds, history }) {
+    if (!isCatalogId(projectId) || typeof history !== 'boolean'
+      || !Array.isArray(assetIds) || assetIds.length > 24 || !assetIds.every(isCatalogId)) {
+      throw new RequestError('资料选择格式无效，每个项目最多记住 24 项。')
+    }
+    const current = snapshot ?? await scan()
+    requireProject(current, projectId)
+    const selection = { assetIds: [...new Set(assetIds)], history }
+    try { await writeProjectSelection(current.config, projectId, selection) }
+    catch (error) { throw storageFailure('保存', error, '项目资料选择') }
+    return { projectId, selection }
+  }
+
+  async function recordProjectContinuation(id) {
+    const ticket = getTicket(id)
+    if (!ticket.opened) throw new RequestError('请先打开交接草稿，再记录接续。', 409)
+    ticket.continuation ??= writeProjectContinuation(ticket.config, ticket.projectId).catch(error => {
+      delete ticket.continuation
+      throw storageFailure('保存', error, '项目接续记录')
+    })
+    const continuedAt = await ticket.continuation
+    await synchronizeProjectState()
+    return { projectId: ticket.projectId, continuedAt, revision }
   }
 
   async function detail(id) {
     const current = await scan()
-    const { config, projects } = current
-    const project = projects.find(item => item.id === id)
-    if (!project) throw new RequestError('项目目录已刷新，请重新选择项目。', 404)
+    const { config } = current
+    const project = requireProject(current, id)
     if (details.has(id)) return details.get(id)
     const pending = (async () => {
       if (!watched.has(project.cwd)) {
@@ -285,7 +338,7 @@ export function createCatalog(loadConfig) {
         used: kind === 'skill' && used.has(item.name.toLowerCase()),
       })
       const result = {
-        project, history,
+        project, history, config,
         memories: memories.map(item => normalize(item, 'memory')),
         skills: skills.map(item => normalize(item, 'skill')),
       }
@@ -346,7 +399,10 @@ export function createCatalog(loadConfig) {
     }
     if (tickets.size >= 40) tickets.delete(tickets.keys().next().value)
     const ticket = randomUUID()
-    tickets.set(ticket, { created: Date.now(), path: canImport ? current : null, prompt, truncated, title: entry.project.name })
+    tickets.set(ticket, {
+      created: Date.now(), path: canImport ? current : null, prompt, truncated, title: entry.project.name,
+      projectId: entry.project.id, config: entry.config,
+    })
     return { ticket, prompt, truncated, canImport, preview }
   }
 
@@ -386,6 +442,9 @@ export function createCatalog(loadConfig) {
         return { projects: projects.map(publicProject), sources, scannedAt, revision }
       }
       if (action === 'set-project-archive') return setProjectArchive(input)
+      if (action === 'set-project-pin') return setProjectPin(input)
+      if (action === 'set-project-selection') return setProjectSelection(input)
+      if (action === 'record-project-continuation') return recordProjectContinuation(input.ticket)
       if (action === 'changes') {
         const inspect = async () => {
           const current = await scan()
@@ -399,10 +458,13 @@ export function createCatalog(loadConfig) {
         return { revision, changed: input.revision !== revision, scannedAt: snapshot.scannedAt }
       }
       if (action === 'detail') {
-        const { project, history, memories, skills } = await detail(input.projectId)
+        const { project, history, memories, skills, config } = await detail(input.projectId)
+        let selection
+        try { selection = await readProjectSelection(config, project.id) }
+        catch (error) { throw storageFailure('读取', error, '项目资料选择') }
         return {
           project: publicProject(project), memories: memories.map(publicAsset), skills: skills.map(publicAsset),
-          usedSkills: history.usedSkills, historyCount: history.messages.length,
+          usedSkills: history.usedSkills, historyCount: history.messages.length, selection,
         }
       }
       if (action === 'asset') {
@@ -423,6 +485,7 @@ export function createCatalog(loadConfig) {
         if (!ticket.path) throw new RequestError('原工作目录不可访问。可导出交接。', 409)
         const current = await currentDirectory(ticket.path)
         if (!current || pathKey(current) !== pathKey(ticket.path)) throw new RequestError('原工作目录已变化。', 409)
+        ticket.opened = true
         return { path: current, prompt: ticket.prompt }
       }
       throw new RequestError('找不到该操作。', 404)

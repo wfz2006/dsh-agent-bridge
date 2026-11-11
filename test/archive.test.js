@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { createCatalog } from '../src/catalog.js'
 
@@ -84,4 +85,73 @@ test('archive state survives restart, merges independent catalog mutations and k
   assert.equal(changed.changed, true)
   assert.ok(changed.revision > observed.revision)
   assert.deepEqual((await second.execute('catalog', {})).projects.map(project => project.archived), [false, false])
+})
+
+test('v0.6 archive state stays readable and migrates on first preference write', async t => {
+  const { create, archiveFile } = await fixture(t)
+  const catalog = create()
+  const [{ id }] = (await catalog.execute('catalog', {})).projects
+  const legacy = new DatabaseSync(archiveFile)
+  legacy.exec(`PRAGMA application_id = ${0x44534841}; CREATE TABLE archived_projects (project_id TEXT PRIMARY KEY) STRICT`)
+  legacy.prepare('INSERT INTO archived_projects (project_id) VALUES (?)').run(id)
+  legacy.close()
+  const old = await catalog.execute('detail', { projectId: id })
+  assert.equal(old.project.archived, true)
+  assert.equal(old.project.pinned, false)
+  assert.equal(old.project.continuedAt, null)
+  assert.equal(old.selection, null)
+  const untouched = new DatabaseSync(archiveFile, { readOnly: true })
+  assert.deepEqual(untouched.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(row => row.name), ['archived_projects'])
+  untouched.close()
+
+  const second = create()
+  const before = await second.execute('catalog', {})
+  const pinned = await catalog.execute('set-project-pin', { projectId: id, pinned: true })
+  assert.equal(pinned.projectId, id)
+  assert.equal(pinned.pinned, true)
+  assert.equal((await second.execute('changes', { revision: before.revision })).changed, true)
+  const saved = (await create().execute('detail', { projectId: id })).project
+  assert.equal(saved.pinned, true)
+  assert.equal(saved.archived, true)
+  assert.equal(saved.continuedAt, null)
+})
+
+test('per-project selection saves independently and continuation requires a verified ticket', async t => {
+  const { create, archiveFile } = await fixture(t)
+  const first = create()
+  const second = create()
+  const listing = await second.execute('catalog', {})
+  const [a, b] = listing.projects
+  const detail = await first.execute('detail', { projectId: a.id })
+  assert.equal(detail.selection, null)
+  await assert.rejects(stat(archiveFile), { code: 'ENOENT' })
+  await assert.rejects(first.execute('set-project-selection', { projectId: a.id, assetIds: ['arbitrary'], history: true }), { status: 400 })
+  await assert.rejects(first.execute('set-project-selection', { projectId: '0'.repeat(24), assetIds: [], history: false }), { status: 404 })
+  await assert.rejects(first.execute('set-project-pin', { projectId: a.id, pinned: 'true' }), { status: 400 })
+  await assert.rejects(stat(archiveFile), { code: 'ENOENT' })
+
+  const asset = detail.memories[0].id
+  const selection = { assetIds: [asset, '1'.repeat(24)], history: false }
+  assert.deepEqual(await first.execute('set-project-selection', {
+    projectId: a.id, assetIds: [asset, asset, '1'.repeat(24)], history: false,
+  }), { projectId: a.id, selection })
+  assert.equal((await second.execute('changes', { revision: listing.revision })).changed, false)
+  assert.deepEqual((await second.execute('detail', { projectId: a.id })).selection, selection)
+  assert.equal((await second.execute('detail', { projectId: b.id })).selection, null)
+
+  const preview = await first.execute('preview', { projectId: a.id, assetIds: [asset] })
+  await assert.rejects(first.execute('record-project-continuation', { ticket: preview.ticket }), { status: 409 })
+  assert.equal((await second.execute('catalog', {})).projects[0].continuedAt, null)
+  await first.execute('open', { ticket: preview.ticket })
+  const results = await Promise.all([
+    first.execute('record-project-continuation', { ticket: preview.ticket }),
+    first.execute('record-project-continuation', { ticket: preview.ticket }),
+  ])
+  assert.deepEqual(results[0], results[1])
+  assert.equal(results[0].projectId, a.id)
+  assert.ok(Number.isSafeInteger(results[0].continuedAt) && results[0].continuedAt > 0)
+  assert.equal((await second.execute('changes', { revision: listing.revision })).changed, true)
+  const reloaded = await create().execute('detail', { projectId: a.id })
+  assert.equal(reloaded.project.continuedAt, results[0].continuedAt)
+  assert.deepEqual(reloaded.selection, selection)
 })
