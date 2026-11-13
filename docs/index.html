@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="在 DeepSeek Harness 中接续其他 AI Agent 的项目、记忆和 Skills。">
+  <title>Agent Bridge · 把上下文带回工作现场</title>
+  <link rel="stylesheet" href="./landing.css">
+</head>
+<body>
+  <header class="header wrap">
+    <a class="brand" href="#top" aria-label="Agent Bridge 首页"><span class="brand-icon">↗</span><span>agent<span class="brand-light">bridge</span></span></a>
+    <nav aria-label="页面导航"><a href="#features">功能</a><a href="#workflow">如何使用</a><a href="#sources">支持的来源</a></nav>
+    <a class="nav-link" href="https://github.com/wfz2006/dsh-agent-bridge">GitHub <span aria-hidden="true">↗</span></a>
+  </header>
+
+  <main id="top">
+    <section class="hero wrap">
+      <div class="hero-copy">
+        <p class="eyebrow"><span></span> DSH 的 Agent 工作接续插件</p>
+        <h1>项目还在，<br>思路也<span>接得上。</span></h1>
+        <p class="hero-description">在 DeepSeek Harness 中找到其他 Agent 的项目、记忆和 Skills，把需要的上下文带进新的开发会话。</p>
+        <div class="hero-actions"><a class="button primary" href="#install">开始使用 <span>↗</span></a><a class="button subtle" href="https://github.com/wfz2006/dsh-agent-bridge">查看项目 <span>↗</span></a></div>
+        <p class="hero-note">本地读取 · 预览后导入 · Markdown 导出</p>
+      </div>
+      <div class="hero-visual">
+        <div class="visual-top"><span class="window-dots"><i></i><i></i><i></i></span><span>AGENT WORKSPACE</span><span>DSH / PLUGIN</span></div>
+        <img src="./screenshots/v0.7.0/01-project-navigation.png" alt="Agent Bridge 的项目列表、资料和接续清单界面" fetchpriority="high">
+        <div class="visual-caption"><span>你的项目，仍在熟悉的工作目录</span><span>↗</span></div>
+      </div>
+    </section>
+
+    <section class="agent-strip" aria-label="支持的 Agent">
+      <div class="wrap strip-inner"><p>从你常用的 Agent 开始</p><div class="agent-list">
+        <span><img src="../web/agent-icons/codex.png" alt="">Codex</span><span><img src="../web/agent-icons/claude.svg" alt="">Claude Code</span><span><img src="../web/agent-icons/copilot.svg" alt="">Copilot</span><span><img src="../web/agent-icons/gemini.png" alt="">Gemini</span><span><img src="../web/agent-icons/opencode.png" alt="">OpenCode</span><a href="#sources">查看全部来源 →</a>
+      </div></div>
+    </section>
+
+    <section id="features" class="wrap section features">
+      <div class="section-intro"><p class="eyebrow">FIND YOUR CONTEXT</p><h2>项目和资料，<br>回到同一个视野。</h2><p>从散落的工作区里找到要继续的项目，查看可读取的记忆、Skills 和会话记录。</p></div>
+      <div class="feature-grid">
+        <article class="feature-card feature-wide"><div class="feature-text"><span class="feature-icon">⌕</span><h3>找到项目，再继续</h3><p>按 Agent、名称、路径和目录状态筛选。置顶常用项目，最近接续的项目也会出现在列表前面。</p></div><div class="feature-image crop-navigation"><img src="./screenshots/v0.7.0/01-project-navigation.png" alt="置顶和最近接续项目列表" loading="lazy"></div></article>
+        <article class="feature-card feature-split"><div class="feature-text"><span class="feature-icon">↘</span><h3>把列表整理清爽</h3><p>单独归档，或筛选后批量归档。需要时可以查看、恢复和撤销。</p></div><img src="./screenshots/v0.6.0/01-project-archive.png" alt="已归档项目和恢复操作" loading="lazy"></article>
+        <article class="feature-card feature-split dark-card"><div class="feature-text"><span class="feature-icon">✳</span><h3>每次打开，熟悉一点</h3><p>资料勾选按项目保存。蓝、白、黑三套主题，选择你喜欢的一种。</p></div><img src="./screenshots/v0.5.0/03-black-copilot-skills.png" alt="黑色主题下的 Skills 页面" loading="lazy"></article>
+      </div>
+    </section>
+
+    <section id="workflow" class="workflow section">
+      <div class="wrap workflow-grid"><div><p class="eyebrow">PICK UP WHERE YOU LEFT OFF</p><h2>从查看到接续，<br>每一步都看得见。</h2><p class="section-copy">在原工作目录打开 DSH 会话，交接内容会填入可编辑的草稿。你可以先核对，再决定何时发送。</p><a class="text-link" href="https://github.com/wfz2006/dsh-agent-bridge#使用">阅读使用说明 ↗</a></div>
+      <ol class="steps"><li><span>01</span><div><h3>选择项目</h3><p>从本机发现的项目中找到工作目录。</p></div></li><li><span>02</span><div><h3>挑选资料</h3><p>勾选记忆、Skills 和需要的近期会话。</p></div></li><li><span>03</span><div><h3>预览并接续</h3><p>核对交接内容，打开 DSH 草稿或导出 Markdown。</p></div></li></ol></div>
+    </section>
+
+    <section id="sources" class="wrap section sources-section"><div class="section-intro"><p class="eyebrow">BUILT FOR YOUR WORKSPACE</p><h2>从不同来源，<br>找到相关上下文。</h2><p>插件按当前用户的常见数据目录扫描，也支持配置自定义路径。不同 Agent 的可读取内容有所区别。</p></div>
+      <div class="source-grid"><article><h3>项目与会话</h3><p>Codex、Claude Code、OpenCode、Qoder、WorkBuddy、Gemini CLI 和 Qwen Code 的可识别工作目录与会话。</p></article><article><h3>工作区信息</h3><p>Copilot、TRAE 和 Antigravity 的可识别工作区及部分记录。部分会话可来自 AgentsView 归档。</p></article><article><h3>记忆与 Skills</h3><p>项目内的共享笔记、交接文件，以及相关 Agent 和共享目录中可读取的 Markdown 与 Skills。</p></article></div>
+      <a class="text-link" href="https://github.com/wfz2006/dsh-agent-bridge#来源">查看来源与配置详情 ↗</a>
+    </section>
+
+    <section id="install" class="install"><div class="wrap install-inner"><div><p class="eyebrow">GET STARTED</p><h2>准备好继续了吗？</h2><p>获取插件安装包，在 DSH Desktop 的插件页面填写安装包路径。安装后退出并重新打开 DSH。</p></div><div class="install-actions"><a class="button white" href="https://github.com/wfz2006/dsh-agent-bridge/releases">查看安装包 <span>↗</span></a><a class="install-guide" href="https://github.com/wfz2006/dsh-agent-bridge#安装">查看安装说明 →</a><small>项目源码包含构建说明，安装包版本以 Release 页面为准。</small></div></div></section>
+  </main>
+  <footer class="wrap footer"><a class="brand" href="#top"><span class="brand-icon">↗</span><span>agent<span class="brand-light">bridge</span></span></a><p>为 DeepSeek Harness 制作的独立插件</p><a href="https://github.com/wfz2006/dsh-agent-bridge">GitHub ↗</a></footer>
+</body>
+</html>
