@@ -1,8 +1,35 @@
-# DSH Agent Bridge · Agent 工作接续
+<div align="center">
 
-在 DeepSeek Harness 中查看本机其他 Agent 的项目、记忆和 Skills。选择要带入的资料后，在原工作目录打开新的 DSH 会话，接着已有分支和文件开发。
+# Agent Bridge
 
-[蓝色、白色、黑色主题截图](docs/screenshots/v0.5.0)
+### 把项目、记忆和 Skills 带回工作现场
+
+一个为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 制作的独立插件。查看其他 Agent 的本地项目，挑选上下文，在原工作目录接续开发。
+
+[下载安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest) · [快速开始](#安装) · [支持的来源](#来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
+
+![Agent Bridge 项目列表与接续清单](docs/screenshots/v0.7.0/01-project-navigation.png)
+
+</div>
+
+## 一眼了解
+
+| 查找与整理 | 准备交接 | 继续开发 |
+| --- | --- | --- |
+| 按 Agent、项目名、路径和状态筛选。置顶常用项目，归档不常用项目。 | 查看记忆和 Skills，勾选需要的资料，并预览交接内容。 | 在原目录打开可编辑的 DSH 草稿，或导出 Markdown 交接。 |
+
+项目资料会自动刷新，勾选按项目保存。界面支持蓝、白、黑三种主题。
+
+<details>
+<summary>查看更多界面截图</summary>
+
+| 项目归档 | 黑色主题 |
+| --- | --- |
+| ![归档项目和恢复操作](docs/screenshots/v0.6.0/01-project-archive.png) | ![黑色主题和 Skills](docs/screenshots/v0.5.0/03-black-copilot-skills.png) |
+
+[蓝色主题](docs/screenshots/v0.5.0/01-blue-agent-menu.png) · [白色主题](docs/screenshots/v0.5.0/02-white-copilot-workspace.png) · [Agent 图标](docs/screenshots/v0.5.1/01-agent-icons.png)
+
+</details>
 
 ## 安装
 
