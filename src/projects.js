@@ -7,6 +7,7 @@ const maxMessages = 36;
 const maxMessageLength = 4_000;
 const maxTranscriptBytes = 12 * 1024 * 1024;
 const maxDecodedTranscriptBytes = 32 * 1024 * 1024;
+const conversationLimits = { messages: 600, characters: 160_000, messageLength: 24_000 };
 
 const agentLabels = {
   codex: 'Codex', claude: 'Claude Code', opencode: 'OpenCode', workbuddy: 'WorkBuddy',
@@ -173,8 +174,9 @@ async function archivedProjects(file) {
     const sort = fields.has('ended_at') ? 'ended_at' : 'id';
     const deleted = fields.has('deleted_at') ? ' AND deleted_at IS NULL' : '';
     const machine = fields.has('machine') ? " AND machine IN ('', 'local')" : '';
-    return db.prepare(`SELECT id, cwd, agent, ${sort} AS date FROM sessions WHERE cwd <> ''${deleted}${machine} ORDER BY ${sort} DESC LIMIT ?`)
-      .all(maxSessions).map(({ id, cwd, agent, date }) => ({ cwd, agent, archive: { kind: 'agentsview', agent, file, id, date } }));
+    const title = fields.has('title') ? 'substr(title, 1, 200)' : 'NULL';
+    return db.prepare(`SELECT id, cwd, agent, ${sort} AS date, ${title} AS title FROM sessions WHERE cwd <> ''${deleted}${machine} ORDER BY ${sort} DESC LIMIT ?`)
+      .all(maxSessions).map(({ id, cwd, agent, date, title }) => ({ cwd, agent, archive: { kind: 'agentsview', agent, file, id, date, title } }));
   });
 }
 
@@ -189,9 +191,10 @@ async function codexProjects(root) {
       const fields = columns(db, 'threads');
       if (!['cwd', 'rollout_path', 'id'].every(field => fields.has(field))) return undefined;
       const sort = fields.has('updated_at') ? 'updated_at' : 'id';
-      return db.prepare(`SELECT id, cwd, rollout_path, ${sort} AS date FROM threads WHERE cwd <> '' ORDER BY ${sort} DESC LIMIT ?`).all(maxSessions);
+      const title = fields.has('title') ? 'substr(title, 1, 200)' : 'NULL';
+      return db.prepare(`SELECT id, cwd, rollout_path, ${sort} AS date, ${title} AS title FROM threads WHERE cwd <> '' ORDER BY ${sort} DESC LIMIT ?`).all(maxSessions);
     });
-    if (rows) return rows.map(({ id, cwd, rollout_path: file, date }) => ({ cwd, agent: 'codex', archive: { kind: 'codex', file, root, id, date } }));
+    if (rows) return rows.map(({ id, cwd, rollout_path: file, date, title }) => ({ cwd, agent: 'codex', archive: { kind: 'codex', file, root, id, date, title } }));
   }
   return jsonlProjects(root, 'codex', ['sessions', 'archived_sessions'], 4);
 }
@@ -209,8 +212,11 @@ async function opencodeProjects(root) {
   return withDatabase(file, db => {
     const tables = opencodeTables(db);
     if (!tables.length) throw new Error('未识别 OpenCode 会话表');
-    const projects = tables.flatMap(table => db.prepare(`SELECT id, directory AS cwd, time_updated AS date FROM ${table} WHERE directory <> '' ORDER BY time_updated DESC LIMIT ?`)
-      .all(maxSessions).map(({ id, cwd, date }) => ({ cwd, agent: 'opencode', archive: { kind: 'opencode', file, id, table, date } })));
+    const projects = tables.flatMap(table => {
+      const title = columns(db, table).has('title') ? 'substr(title, 1, 200)' : 'NULL';
+      return db.prepare(`SELECT id, directory AS cwd, time_updated AS date, ${title} AS title FROM ${table} WHERE directory <> '' ORDER BY time_updated DESC LIMIT ?`)
+        .all(maxSessions).map(({ id, cwd, date, title }) => ({ cwd, agent: 'opencode', archive: { kind: 'opencode', file, id, table, date, title } }));
+    });
     const fields = columns(db, 'project');
     if (fields.has('worktree')) {
       const name = fields.has('name') ? 'name' : 'NULL';
@@ -273,8 +279,11 @@ async function jsonlProjects(root, agent, children = ['projects'], depth = 1) {
     const batch = await Promise.all(files.slice(offset, offset + 32).map(async file => {
       try {
         const { text, truncated, modified } = await prefix(file, 96 * 1024);
-        const cwd = await nativeCwd(file, agent, rowsFrom(text, truncated));
-        return cwd ? { cwd, agent, archive: { kind: agent, file, root, date: modified } } : undefined;
+        const rows = rowsFrom(text, truncated);
+        const cwd = await nativeCwd(file, agent, rows);
+        const title = rows.findLast(row => row.type === 'custom-title' && typeof row.customTitle === 'string')?.customTitle
+          ?? rows.findLast(row => row.type === 'summary' && typeof row.summary === 'string')?.summary;
+        return cwd ? { cwd, agent, archive: { kind: agent, file, root, date: modified, title: title?.slice(0, 200) } } : undefined;
       } catch { return undefined; }
     }));
     result.push(...batch.filter(Boolean));
@@ -440,9 +449,10 @@ export async function scanProjects(config) {
   return { projects: [...discovered.values()], sources: sources.sort((a, b) => a.id.localeCompare(b.id)) };
 }
 
-function dateMillis(value) {
+export function dateMillis(value) {
   if (typeof value === 'string') return Date.parse(value) || 0;
-  return value > 0 && value < 10_000_000_000 ? value * 1_000 : value ?? 0;
+  if (!Number.isFinite(value) || value <= 0 || value > 8_640_000_000_000_000) return 0;
+  return Math.trunc(value < 10_000_000_000 ? value * 1_000 : value);
 }
 
 function compareDate(a, b) {
@@ -455,14 +465,27 @@ async function sameDirectory(cwd, expected) {
   return pathKey(actual ?? cwd) === pathKey(expected);
 }
 
-function appendMessage(result, role, text) {
+function appendMessage(result, role, text, timestamp) {
   if (!['user', 'assistant'].includes(role) || typeof text !== 'string' || !text.trim()) return;
   const value = text.trim();
-  if (value.startsWith('<environment_context>') || value.startsWith('<permissions instructions>')) return;
+  if (/^<(?:environment_context|permissions instructions|collaboration_mode|system-reminder|developer_instructions|user_instructions|app-context|subagent_notification)(?:[>\s])/i.test(value)
+    || /^# AGENTS\.md instructions for [\s\S]*\n<INSTRUCTIONS>/i.test(value)) return;
   for (const match of value.matchAll(/<skill>\s*<name>([^<]+)<\/name>/gi)) addSkill(result, match[1]);
   if (value.startsWith('<skill>')) return;
-  result.messages.push({ role, text: value.slice(0, maxMessageLength), agent: result.agent });
-  if (result.messages.length > maxMessages) result.messages.shift();
+  const { limits } = result;
+  if (limits) {
+    const bounded = value.slice(0, limits.messageLength);
+    result.messages.push({ role, text: bounded, agent: result.agent, time: dateMillis(timestamp) });
+    result.characters += bounded.length;
+    if (value.length > bounded.length) result.truncated = true;
+    while (result.messages.length > limits.messages || result.characters > limits.characters) {
+      result.characters -= result.messages.shift().text.length;
+      result.truncated = true;
+    }
+  } else {
+    result.messages.push({ role, text: value.slice(0, maxMessageLength), agent: result.agent });
+    if (result.messages.length > maxMessages) result.messages.shift();
+  }
 }
 
 function addSkill(result, name) {
@@ -507,13 +530,14 @@ async function readGeminiHistory(descriptor, cwd, config, result) {
     const marker = await scopedFile(path.resolve(path.dirname(file), '..', '.project_root'), base);
     if (!marker || !await sameDirectory((await prefix(marker, 32 * 1024)).text.trim(), cwd)) continue;
     const { text, truncated } = await prefix(file, maxTranscriptBytes);
+    if (truncated) result.truncated = true;
     const messages = json(text)?.messages ?? rowsFrom(text, truncated);
     if (!Array.isArray(messages)) continue;
     for (const row of messages) {
       const message = row.message ?? row;
       if (!['user', 'gemini', 'assistant'].includes(message.type)) continue;
       const content = Array.isArray(message.content) ? message.content.map(block => block?.text ?? '').join('\n') : message.content;
-      appendMessage(result, message.type === 'gemini' ? 'assistant' : message.type, content);
+      appendMessage(result, message.type === 'gemini' ? 'assistant' : message.type, content, message.timestamp);
       for (const tool of Array.isArray(message.toolCalls) ? message.toolCalls : []) readTool(result, tool.name, tool.args);
     }
     return;
@@ -572,11 +596,13 @@ async function readCopilotHistory(descriptor, cwd, config, result) {
     const marker = json((await prefix(workspace, 32 * 1024)).text);
     if (!await sameDirectory(localDirectory(marker?.folder), cwd)) continue;
     const { text, truncated } = await prefix(file, maxTranscriptBytes);
-    for (const request of copilotRequests(text, truncated).slice(-maxMessages)) {
-      appendMessage(result, 'user', request?.message?.text);
+    if (truncated) result.truncated = true;
+    const requests = copilotRequests(text, truncated);
+    for (const request of result.limits ? requests : requests.slice(-maxMessages)) {
+      appendMessage(result, 'user', request?.message?.text, request?.timestamp);
       const response = Array.isArray(request?.response) ? request.response : [];
       appendMessage(result, 'assistant', response.filter(item => !item?.kind || item.kind === 'markdownContent')
-        .map(item => item?.value?.value ?? item?.value ?? '').filter(value => typeof value === 'string').join(''));
+        .map(item => item?.value?.value ?? item?.value ?? '').filter(value => typeof value === 'string').join(''), request?.timestamp);
       for (const item of response) {
         if (item?.kind === 'toolInvocationSerialized') readTool(result, item.toolId, item.parameters);
       }
@@ -598,10 +624,10 @@ async function transcriptTail(file, compressed) {
       if (typeof zstdDecompressSync !== 'function') return undefined;
       const decoded = zstdDecompressSync(buffer.subarray(0, bytesRead), { maxOutputLength: maxDecodedTranscriptBytes });
       const header = rowsFrom(decoded.subarray(0, 96 * 1024).toString('utf8'), decoded.length > 96 * 1024);
-      return { header, history: parseTail(decoded, decoded.length > maxTranscriptBytes) };
+      return { header, history: parseTail(decoded, decoded.length > maxTranscriptBytes), truncated: decoded.length > maxTranscriptBytes };
     }
     const raw = buffer.toString('utf8', 0, bytesRead);
-    return { history: rowsFrom(start ? raw.slice(raw.indexOf('\n') + 1) : raw, false) };
+    return { history: rowsFrom(start ? raw.slice(raw.indexOf('\n') + 1) : raw, false), truncated: start > 0 };
   } finally {
     await handle.close();
   }
@@ -631,23 +657,26 @@ async function readJsonlHistory(descriptor, cwd, config, result) {
 
   // Active transcripts may have a torn last row. Large transcripts keep the latest bounded tail.
   const { history } = transcript;
+  if (transcript.truncated) result.truncated = true;
   for (const row of history) {
-    if (row.isSidechain || row.isMeta) continue;
+    if (result.limits && row.isCompactSummary) result.truncated = true;
+    if (row.isSidechain || row.isMeta || row.isCompactSummary) continue;
     if (descriptor.kind === 'codex') {
+      if (result.limits && row.type === 'compacted') result.truncated = true;
       if (row.type !== 'response_item') continue;
       const payload = row.payload;
-      if (payload?.type === 'message') appendMessage(result, payload.role, textBlocks(payload.content, result));
+      if (payload?.type === 'message') appendMessage(result, payload.role, textBlocks(payload.content, result), row.timestamp);
       if (payload?.type === 'function_call') readTool(result, payload.name, payload.arguments);
       if (payload?.type === 'custom_tool_call') readTool(result, payload.name, payload.input);
     } else if (descriptor.kind === 'workbuddy') {
-      if (row.type === 'message') appendMessage(result, row.role === 'human' ? 'user' : row.role, textBlocks(row.content, result));
+      if (row.type === 'message') appendMessage(result, row.role === 'human' ? 'user' : row.role, textBlocks(row.content, result), row.timestamp);
       if (row.type === 'function_call') readTool(result, row.name, row.arguments);
     } else if (descriptor.kind === 'qwen' && (row.type === 'user' || row.type === 'assistant')) {
       const parts = Array.isArray(row.message?.parts) ? row.message.parts : [];
-      appendMessage(result, row.type, parts.filter(part => !part?.thought && typeof part?.text === 'string').map(part => part.text).join('\n'));
+      appendMessage(result, row.type, parts.filter(part => !part?.thought && typeof part?.text === 'string').map(part => part.text).join('\n'), row.timestamp);
       for (const part of parts) readTool(result, part?.functionCall?.name, part?.functionCall?.args);
     } else if (row.type === 'user' || row.type === 'assistant') {
-      appendMessage(result, row.type, textBlocks(row.message?.content, result));
+      appendMessage(result, row.type, textBlocks(row.message?.content, result), row.timestamp);
     }
   }
 }
@@ -669,12 +698,17 @@ async function readDatabaseHistory(descriptor, cwd, config, result) {
   if (!file) return;
   const snapshot = await withDatabase(file, db => {
     if (descriptor.kind === 'agentsview') {
-      const project = db.prepare('SELECT cwd, agent FROM sessions WHERE id = ?').get(descriptor.id);
+      const sessionFields = columns(db, 'sessions');
+      const deleted = sessionFields.has('deleted_at') ? ' AND deleted_at IS NULL' : '';
+      const machine = sessionFields.has('machine') ? " AND machine IN ('', 'local')" : '';
+      const project = db.prepare('SELECT cwd, agent FROM sessions WHERE id = ?' + deleted + machine).get(descriptor.id);
       const fields = columns(db, 'messages');
       const content = fields.has('dialogue_text') ? "COALESCE(dialogue_text, '')" : 'content';
       const system = fields.has('is_system') ? ' AND is_system = 0' : '';
-      const messages = db.prepare(`SELECT role, substr(${content}, 1, ?) AS text FROM messages WHERE session_id = ? AND role IN ('user', 'assistant')${system} ORDER BY ordinal DESC LIMIT ?`)
-        .all(maxMessageLength, descriptor.id, maxMessages).reverse();
+      const time = fields.has('timestamp') ? 'timestamp' : 'NULL';
+      const messages = db.prepare(`SELECT role, substr(${content}, 1, ?) AS text, ${time} AS time FROM messages WHERE session_id = ? AND role IN ('user', 'assistant')${system} ORDER BY ordinal DESC LIMIT ?`)
+        .all(result.limits ? result.limits.messageLength + 1 : maxMessageLength, descriptor.id,
+          result.limits ? result.limits.messages + 1 : maxMessages).reverse();
       const skills = columns(db, 'tool_calls').has('skill_name') ? db.prepare('SELECT DISTINCT skill_name FROM tool_calls WHERE session_id = ? AND skill_name IS NOT NULL LIMIT 200').all(descriptor.id) : [];
       return { cwd: project?.cwd, agent: project?.agent, messages, skills };
     }
@@ -683,25 +717,46 @@ async function readDatabaseHistory(descriptor, cwd, config, result) {
     const fields = columns(db, 'session_message');
     if (['type', 'session_id', 'data'].every(field => fields.has(field))) {
       const order = fields.has('seq') ? 'seq' : 'time_created';
-      const messages = db.prepare(`SELECT type, data FROM session_message WHERE session_id = ? AND type IN ('user','assistant','skill') ORDER BY ${order} DESC LIMIT ?`)
-        .all(descriptor.id, 100).reverse();
+      const time = fields.has('time_created') ? 'time_created' : 'NULL';
+      const messages = db.prepare(`SELECT type, data, ${time} AS time FROM session_message WHERE session_id = ? AND type IN ('user','assistant','skill') ORDER BY ${order} DESC LIMIT ?`)
+        .all(descriptor.id, result.limits ? result.limits.messages + 1 : 100).reverse();
       if (messages.length) return { cwd: project?.directory, projection: messages };
     }
     if (!columns(db, 'message').has('data') || !columns(db, 'part').has('data')) return { cwd: project?.directory };
-    const messages = db.prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT ?').all(descriptor.id, maxMessages).reverse();
+    const messages = db.prepare('SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT ?')
+      .all(descriptor.id, result.limits ? result.limits.messages + 1 : maxMessages).reverse();
     const parts = db.prepare('SELECT data FROM part WHERE session_id = ? AND message_id = ? ORDER BY time_created LIMIT 100');
-    return { cwd: project?.directory, legacy: messages.map(row => ({ role: json(row.data)?.role, parts: parts.all(descriptor.id, row.id).map(part => json(part.data)) })) };
+    return { cwd: project?.directory, legacy: messages.map(row => ({ role: json(row.data)?.role, time: row.time_created, parts: parts.all(descriptor.id, row.id).map(part => json(part.data)) })) };
   });
   if (!snapshot || !await sameDirectory(snapshot.cwd, cwd)) return;
   if (snapshot.agent) result.agent = snapshot.agent;
-  for (const row of snapshot.messages ?? []) appendMessage(result, row.role, row.text);
+  for (const row of snapshot.messages ?? []) appendMessage(result, row.role, row.text, row.time);
   for (const row of snapshot.skills ?? []) addSkill(result, row.skill_name);
   for (const row of snapshot.projection ?? []) {
     const data = json(row.data);
     if (row.type === 'skill') addSkill(result, data?.name ?? data?.skill);
-    else appendMessage(result, row.type, data?.text ?? textBlocks(data?.content, result));
+    else appendMessage(result, row.type, data?.text ?? textBlocks(data?.content, result), row.time);
   }
-  for (const row of snapshot.legacy ?? []) appendMessage(result, row.role, textBlocks(row.parts, result));
+  for (const row of snapshot.legacy ?? []) appendMessage(result, row.role, textBlocks(row.parts, result), row.time);
+  if (result.limits && (snapshot.messages ?? snapshot.projection ?? snapshot.legacy ?? []).length > result.limits.messages) {
+    result.truncated = true;
+  }
+}
+
+async function readHistory(archive, cwd, config, result) {
+  result.agent = archive.agent ?? archive.kind;
+  if (archive.kind === 'agentsview' || archive.kind === 'opencode') await readDatabaseHistory(archive, cwd, config, result);
+  if (['codex', 'claude', 'qoder', 'qwen', 'workbuddy'].includes(archive.kind)) await readJsonlHistory(archive, cwd, config, result);
+  if (archive.kind === 'gemini') await readGeminiHistory(archive, cwd, config, result);
+  if (archive.kind === 'antigravity') await readAntigravityHistory(archive, cwd, config, result);
+  if (archive.kind === 'copilot') await readCopilotHistory(archive, cwd, config, result);
+}
+
+export async function readConversationHistory(archive, cwd, config) {
+  const result = { messages: [], usedSkills: new Set(), limits: conversationLimits, characters: 0, truncated: false };
+  await readHistory(archive, cwd, config, result);
+  const start = result.messages.findIndex(message => message.role === 'user');
+  return { messages: start < 0 ? [] : result.messages.slice(start), truncated: result.truncated || start > 0 };
 }
 
 export async function readProjectHistory(project, config) {
@@ -709,14 +764,8 @@ export async function readProjectHistory(project, config) {
   const archives = project.archives ?? (project.archive ? [project.archive] : []);
   const ordered = [...archives].filter(item => typeof item?.file === 'string').sort((a, b) => compareDate(b.date, a.date));
   for (const archive of ordered.slice(0, 12).reverse()) {
-    try {
-      result.agent = archive.agent ?? archive.kind;
-      if (archive.kind === 'agentsview' || archive.kind === 'opencode') await readDatabaseHistory(archive, project.cwd, config, result);
-      if (['codex', 'claude', 'qoder', 'qwen', 'workbuddy'].includes(archive.kind)) await readJsonlHistory(archive, project.cwd, config, result);
-      if (archive.kind === 'gemini') await readGeminiHistory(archive, project.cwd, config, result);
-      if (archive.kind === 'antigravity') await readAntigravityHistory(archive, project.cwd, config, result);
-      if (archive.kind === 'copilot') await readCopilotHistory(archive, project.cwd, config, result);
-    } catch { continue; }
+    try { await readHistory(archive, project.cwd, config, result); }
+    catch { continue; }
   }
   const seen = new Set();
   const messages = result.messages.filter(({ role, text, agent }) => {

@@ -175,6 +175,18 @@ window.__ModuleLoader__.load({
               }
               return;
             }
+            if (request.type === 'dsh-agent-bridge:open-imported') {
+              try {
+                await ctx.sessions.refresh();
+                const snapshot = ctx.sessions.list.getSnapshot();
+                if (!Object.hasOwn(snapshot.byId, request.sessionId)) throw new Error('会话已保存，请从工作区列表打开。');
+                if (iframe.current === frame) ctx.uiWorkspace.openSession(request.sessionId);
+                reply({ ok: true });
+              } catch (error) {
+                reply({ ok: false, error: error instanceof Error ? error.message.slice(0, 500) : '会话已保存，请从工作区列表打开。' });
+              }
+              return;
+            }
             if (request.type !== 'dsh-agent-bridge:open') return;
             if (!validPath(request.path) || typeof request.prompt !== 'string'
               || !request.prompt.trim() || request.prompt.length > 65_536) {

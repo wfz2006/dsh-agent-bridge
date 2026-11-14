@@ -141,6 +141,9 @@
               <button class="clear-search icon-button" id="clear-asset-search" type="button" aria-label="清除资料搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
             </div>
           </div>
+          <button id="native-history" class="secondary native-history" type="button" hidden>
+            <svg class="icon button-icon" aria-hidden="true"><use href="#icon-history"/></svg>接续原会话
+          </button>
           <div id="library-panel" role="tabpanel" aria-labelledby="tab-memory">
             <p id="asset-note" class="asset-note"></p>
             <div id="asset-list" class="asset-list"></div>
@@ -185,6 +188,11 @@
         <button id="dialog-close" class="secondary icon-button" type="button" aria-label="关闭" title="关闭"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
       </header>
       <div class="dialog-content">
+        <div id="history-choice" class="session-choice history-choice" hidden>
+          <label for="history-select">选择一条来源会话</label>
+          <select id="history-select"></select>
+          <p id="history-path" class="muted"></p>
+        </div>
         <div id="dialog-text" class="dialog-text" tabindex="0"></div>
         <div id="session-choice" class="session-choice" hidden>
           <label for="session-select">选择要导出的 DSH 会话</label>
@@ -200,6 +208,7 @@
       <footer class="dialog-actions">
         <a id="export-download" class="secondary" download hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>下载 Markdown</a>
         <button id="export" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出 Markdown</button>
+        <button id="history-import" class="primary" type="button" hidden><span id="history-import-label">迁入并打开会话</span><svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
         <button id="import" class="primary" type="button" hidden>导入并接续<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
       </footer>
     </div>

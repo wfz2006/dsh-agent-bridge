@@ -4,7 +4,7 @@ import { realpath, stat } from 'node:fs/promises'
 import path, { win32 } from 'node:path'
 import { promisify } from 'node:util'
 import { listProjectAssets, readAsset } from './assets.js'
-import { readProjectHistory, scanProjects } from './projects.js'
+import { dateMillis, readConversationHistory, readProjectHistory, scanProjects } from './projects.js'
 import { createSourceMonitor } from './watch.js'
 import { makeExport } from './export.js'
 import {
@@ -17,6 +17,7 @@ const limit = 32_000
 const fallbackScanInterval = 15_000
 const ticketLifetime = 10 * 60_000
 const catalogId = /^[0-9a-f]{24}$/
+const conversationTicketLimit = 12
 
 class RequestError extends Error {
   constructor(message, status = 400) {
@@ -122,7 +123,28 @@ async function gitStatus(cwd) {
 }
 
 function publicProject({ archives, ...project }) {
-  return { ...project, sessions: archives.length }
+  return { ...project, sessions: archives.length, hasConversations: archives.some(canReadConversation) }
+}
+
+function canReadConversation(archive) {
+  // Antigravity's native CLI index stores prompts, not the assistant replies.
+  return archive.kind !== 'antigravity' && typeof archive.file === 'string'
+}
+
+function conversationId(archive) {
+  return keyFor(archive.kind, archive.file, archive.table, archive.id)
+}
+
+function conversationTitle(value, bytes = 200) {
+  const normalized = redact(value).replace(/[\s\p{Cc}]+/gu, ' ').trim()
+  let title = ''
+  let length = 0
+  for (const char of normalized) {
+    length += Buffer.byteLength(char)
+    if (length > bytes) break
+    title += char
+  }
+  return title
 }
 
 async function currentDirectory(cwd) {
@@ -182,7 +204,7 @@ function requireProject(current, projectId) {
   return project
 }
 
-export function createCatalog(loadConfig) {
+export function createCatalog(loadConfig, { importConversation } = {}) {
   let snapshot
   let scanning
   let revision = 0
@@ -191,6 +213,7 @@ export function createCatalog(loadConfig) {
   const details = new Map()
   const signatures = new Map()
   const tickets = new Map()
+  const conversationTickets = new Map()
   const watched = new Map()
   const listeners = new Set()
   const monitor = createSourceMonitor({ onChange() {
@@ -412,6 +435,85 @@ export function createCatalog(loadConfig) {
     return ticket
   }
 
+  async function listConversations(projectId) {
+    const current = await scan()
+    const project = requireProject(current, projectId)
+    const archives = project.archives
+      .filter(canReadConversation)
+      .sort((a, b) => dateMillis(b.date) - dateMillis(a.date))
+    const seen = new Set()
+    const sessions = archives.flatMap(archive => {
+      const id = conversationId(archive)
+      if (seen.has(id)) return []
+      seen.add(id)
+      return [{
+        id, agent: archive.agent ?? archive.kind, date: dateMillis(archive.date),
+        title: conversationTitle(archive.title), archivedSource: archive.kind === 'agentsview',
+      }]
+    })
+    return { sessions }
+  }
+
+  async function previewConversation({ projectId, sessionId }) {
+    if (!isCatalogId(sessionId)) throw new RequestError('会话标识无效。')
+    const current = await scan()
+    const project = requireProject(current, projectId)
+    const { config } = current
+    const archive = project.archives.find(item => canReadConversation(item) && conversationId(item) === sessionId)
+    if (!archive) throw new RequestError('找不到这条会话，请刷新项目。', 404)
+    const history = await readConversationHistory(archive, project.cwd, config).catch(() => {
+      throw new RequestError('会话已移动或无法读取，请刷新后重试。', 409)
+    })
+    if (!history.messages.length) throw new RequestError('这条会话没有可迁入的文字问答。', 409)
+    const messages = history.messages.map(({ role, text, time }) => ({ role, text: redact(text), time }))
+    const title = conversationTitle(archive.title || messages[0].text, 80) || '迁入的 Agent 会话'
+    const path = await currentDirectory(project.cwd)
+    const canImport = Boolean(path && pathKey(path) === pathKey(project.cwd))
+    const ticket = randomUUID()
+    for (const [key, record] of conversationTickets) {
+      if (!record.pending && Date.now() - record.created > ticketLifetime) conversationTickets.delete(key)
+    }
+    if (canImport && conversationTickets.size >= conversationTicketLimit) {
+      const oldest = [...conversationTickets].find(([, record]) => !record.pending)
+      if (!oldest) throw new RequestError('其他会话正在迁入，请稍后重试。', 409)
+      conversationTickets.delete(oldest[0])
+    }
+    if (canImport) conversationTickets.set(ticket, {
+      created: Date.now(), projectId, sessionId: randomUUID(), path, config, messages, title,
+    })
+    return { title, messages, ticket: canImport ? ticket : null, canImport, cwd: project.cwd, truncated: history.truncated }
+  }
+
+  async function commitConversation(ticket) {
+    const record = conversationTickets.get(ticket)
+    if (!record || Date.now() - record.created > ticketLifetime) {
+      throw new RequestError('会话预览已过期，请重新打开。', 409)
+    }
+    if (record.result) return record.result
+    if (record.pending) return record.pending
+    record.pending = (async () => {
+      const cwd = await currentDirectory(record.path)
+      if (!cwd || pathKey(cwd) !== pathKey(record.path)) {
+        throw new RequestError('原工作目录已变化，请刷新项目。', 409)
+      }
+      try {
+        record.result = await importConversation(record, cwd)
+      } catch (error) {
+        if (error.status) throw error
+        const message = record.stored ? '会话历史已写入，暂时无法加入工作区。可重试打开。' : '无法将会话写入 DSH。请检查工作区和会话存储后重试。'
+        throw new RequestError(message, 503)
+      }
+      delete record.messages
+      delete record.stored
+      try {
+        await writeProjectContinuation(record.config, record.projectId)
+        await synchronizeProjectState()
+      } catch { /* A saved session remains usable even if the recents index cannot be updated. */ }
+      return record.result
+    })().finally(() => { delete record.pending })
+    return record.pending
+  }
+
   function exportSession(conversation) {
     if (!conversation || typeof conversation.title !== 'string' || conversation.title.length > 500
       || typeof conversation.path !== 'string' || conversation.path.length > 4096
@@ -435,6 +537,7 @@ export function createCatalog(loadConfig) {
       wake()
       monitor.dispose()
       tickets.clear()
+      conversationTickets.clear()
     },
     async execute(action, input) {
       if (action === 'catalog') {
@@ -445,6 +548,12 @@ export function createCatalog(loadConfig) {
       if (action === 'set-project-pin') return setProjectPin(input)
       if (action === 'set-project-selection') return setProjectSelection(input)
       if (action === 'record-project-continuation') return recordProjectContinuation(input.ticket)
+      if (action === 'list-conversations' || action === 'preview-conversation' || action === 'import-conversation') {
+        if (!importConversation) throw new RequestError('当前 DSH 未提供会话迁入服务。', 409)
+        if (action === 'list-conversations') return listConversations(input.projectId)
+        if (action === 'preview-conversation') return previewConversation(input)
+        return commitConversation(input.ticket)
+      }
       if (action === 'changes') {
         const inspect = async () => {
           const current = await scan()

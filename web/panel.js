@@ -7,6 +7,8 @@ const exportDownload = byId('export-download')
 const dialogClose = byId('dialog-close')
 const dialogText = byId('dialog-text')
 const sessionSelect = byId('session-select')
+const historySelect = byId('history-select')
+const historyImport = byId('history-import')
 const refreshButton = byId('refresh')
 const agentFilter = byId('agent-filter')
 const agentPicker = byId('agent-picker')
@@ -56,6 +58,7 @@ let detailLoading = false
 let tab = 'memory'
 let projectState = 'all'
 let archiveAvailable = false
+let nativeSessionImport = false
 let preferencesAvailable = false
 let managingProjects = false
 const selectedProjects = new Set()
@@ -77,6 +80,10 @@ let dialogMode
 let dialogEpoch = 0
 let dialogBusy = false
 let nativeSessions = []
+let historyProject
+let historyTicket
+let importedSessionId
+let historyPreview = 0
 let downloadUrl
 let requestNumber = 0
 
@@ -692,6 +699,7 @@ function applyDetail(project, loaded, preserve) {
   renderPin()
   libraryTabs[0].querySelector('.tab-count').textContent = detail.memories.length
   libraryTabs[1].querySelector('.tab-count').textContent = detail.skills.length
+  byId('native-history').hidden = !nativeSessionImport || !current.hasConversations
   byId('empty').hidden = true
   byId('project-detail').hidden = false
   byId('handoff').hidden = false
@@ -772,6 +780,7 @@ async function refresh(force, automatic = false) {
     catalogLoaded = true
     catalog = result.projects
     archiveAvailable = catalog.every(project => typeof project.archived === 'boolean')
+    nativeSessionImport = result.nativeSessionImport === true
     preferencesAvailable = catalog.every(project => typeof project.pinned === 'boolean')
     agentIcons = result.agentIcons ?? {}
     const activeAgent = availableAgents[activeAgentIndex]
@@ -859,6 +868,8 @@ function setDialogBusy(busy) {
   importButton.disabled = busy
   exportButton.disabled = busy
   sessionSelect.disabled = busy
+  historySelect.disabled = busy
+  historyImport.disabled = busy
 }
 
 function showDialog(mode, title, note, body) {
@@ -866,6 +877,9 @@ function showDialog(mode, title, note, body) {
   dialog.dataset.mode = mode
   ticket = undefined
   nativeSessions = []
+  historyProject = undefined
+  historyTicket = undefined
+  importedSessionId = undefined
   clearDownload()
   byId('dialog-title').textContent = title
   byId('dialog-note').textContent = note
@@ -875,14 +889,98 @@ function showDialog(mode, title, note, body) {
   dialogText.textContent = body
   dialogText.closest('.dialog-content').scrollTop = 0
   byId('session-choice').hidden = true
+  byId('history-choice').hidden = true
   status('', false, 'dialog-status')
   importButton.hidden = true
   exportButton.hidden = true
+  historyImport.hidden = true
   setDialogBusy(false)
   if (!dialog.open) dialog.showModal()
   clearTimeout(pollTimer)
   liveState('实时扫描已暂停')
   return ++dialogEpoch
+}
+
+async function chooseSourceConversation() {
+  const project = current
+  if (!project || !detail || !nativeSessionImport || !filteredProjects().some(item => item.id === project.id)) return
+  const epoch = showDialog('history', '接续原会话', '导入可读取的用户和助手文字。工具执行、附件和运行状态留在原 Agent。', '正在读取会话列表…')
+  historyProject = project
+  byId('history-path').textContent = project.cwd
+  try {
+    const { sessions } = await api('list-conversations', { projectId: project.id })
+    if (!dialog.open || dialogEpoch !== epoch) return
+    if (!sessions.length) {
+      dialogText.textContent = '这个项目暂无可迁入的会话。'
+      return
+    }
+    const dateFormat = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' })
+    historySelect.replaceChildren(...sessions.map((session, index) => {
+      const date = new Date(session.date)
+      const timestamp = session.date > 0 && Number.isFinite(date.getTime()) ? dateFormat.format(date) : ''
+      const label = [agentName(session.agent), session.archivedSource ? 'AgentsView' : '', timestamp,
+        session.title || '会话 ' + (index + 1)].filter(Boolean).join(' · ')
+      return new Option(label, session.id)
+    }))
+    byId('history-choice').hidden = false
+    historySelect.focus()
+    await previewSourceConversation()
+  } catch (error) {
+    if (dialog.open && dialogEpoch === epoch) dialogText.textContent = error.message
+  }
+}
+
+async function previewSourceConversation() {
+  const epoch = dialogEpoch
+  const revision = ++historyPreview
+  historyTicket = undefined
+  importedSessionId = undefined
+  historyImport.hidden = true
+  byId('history-import-label').textContent = '迁入并打开会话'
+  dialogText.dataset.format = 'plain'
+  dialogText.textContent = '正在读取这条会话…'
+  status('', false, 'dialog-status')
+  try {
+    const result = await api('preview-conversation', { projectId: historyProject.id, sessionId: historySelect.value })
+    if (!dialog.open || dialogEpoch !== epoch || revision !== historyPreview) return
+    historyTicket = result.ticket
+    const title = text('h3', result.title, 'preview-lead')
+    const summary = text('p', [
+      result.messages.length + ' 条文字消息',
+      result.truncated ? '源记录或读取范围有限，部分历史未带入' : '',
+      result.canImport ? '' : '原工作目录不可访问，当前可预览',
+    ].filter(Boolean).join(' · '), 'preview-context')
+    dialogText.dataset.format = 'history'
+    dialogText.replaceChildren(title, summary, ...result.messages.map(message => {
+      const row = text('section', '', 'history-message')
+      row.dataset.role = message.role
+      row.append(text('h3', message.role === 'user' ? '用户' : '助手'), text('p', message.text, 'preview-body'))
+      return row
+    }))
+    historyImport.hidden = !result.canImport
+  } catch (error) {
+    if (dialog.open && dialogEpoch === epoch && revision === historyPreview) dialogText.textContent = error.message
+  }
+}
+
+async function importSourceConversation() {
+  if (!historyTicket || dialogBusy) return
+  setDialogBusy(true)
+  status(importedSessionId ? '正在打开已迁入的会话…' : '正在迁入会话…', false, 'dialog-status')
+  try {
+    if (!importedSessionId) {
+      const result = await api('import-conversation', { ticket: historyTicket })
+      importedSessionId = result.sessionId
+    }
+    await requestParent('open-imported', { sessionId: importedSessionId })
+    dialog.close()
+    status('历史已迁入。打开会话即可继续。')
+  } catch (error) {
+    if (importedSessionId) byId('history-import-label').textContent = '打开已迁入会话'
+    status(error.message, true, 'dialog-status')
+  } finally {
+    setDialogBusy(false)
+  }
 }
 
 function renderHandoff({ intro, sections, footer }) {
@@ -1215,6 +1313,9 @@ libraryTabs.forEach((button, index) => {
 byId('copy-path').addEventListener('click', copyProjectPath)
 byId('preview').addEventListener('click', preview)
 byId('native-export').addEventListener('click', chooseNativeSession)
+byId('native-history').addEventListener('click', chooseSourceConversation)
+historySelect.addEventListener('change', previewSourceConversation)
+historyImport.addEventListener('click', importSourceConversation)
 sessionSelect.addEventListener('change', clearDownload)
 sessionSelect.addEventListener('change', renderSessionPath)
 dialogClose.addEventListener('click', () => dialog.close())

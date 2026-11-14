@@ -404,6 +404,14 @@ pre {
   border: 1px solid var(--line); border-radius: 9px; background: var(--field); font: .82rem/1.65 var(--mono);
 }
 .dialog-text[data-format='handoff'] { display: grid; gap: 12px; min-width: 0; }
+.native-history { margin-block: 1px 10px; }
+.history-choice:not([hidden]) { margin-block-end: 14px; }
+#history-path { overflow-wrap: anywhere; }
+.dialog-text[data-format='history'] { display: grid; gap: 9px; min-width: 0; }
+.history-message { padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px; }
+.history-message[data-role='user'] { background: var(--field); }
+.history-message .preview-body { margin-block-start: 4px; }
+.history-message h3 { color: var(--accent); font-size: .78rem; }
 .preview-intro, .preview-section { padding: 13px 14px; border: 1px solid var(--line); border-radius: 11px; }
 .preview-intro { background: var(--field); }
 .preview-lead { margin-bottom: 8px; font-size: 1rem; font-weight: 650; overflow-wrap: anywhere; }

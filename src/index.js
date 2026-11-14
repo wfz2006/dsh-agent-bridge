@@ -3,9 +3,13 @@ import { existsSync, readdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { createCatalog } from './catalog.js'
 import { loadConfig } from './config.js'
+import { nativeSessionServices, saveNativeSession } from './session-import.js'
 
 export const name = 'dsh-agent-bridge'
-export const inject = ['connection', 'webServer']
+export const inject = {
+  connection: true, webServer: true,
+  sessions: false, sessionPersistence: false, workspaceRegistry: false, sessionProjectionCache: false,
+}
 
 const prefix = '/agent-bridge'
 const pageHeaders = {
@@ -54,7 +58,14 @@ async function readBody(req) {
 }
 
 export function apply(ctx) {
-  const catalog = createCatalog(loadConfig)
+  const services = () => nativeSessionServices(ctx)
+  const catalog = createCatalog(loadConfig, {
+    importConversation(record, cwd) {
+      const host = services()
+      if (!host) throw Object.assign(new Error('当前 DSH 未提供会话迁入服务。'), { status: 409 })
+      return saveNativeSession(host, record, cwd)
+    },
+  })
   ctx.effect(() => () => catalog.dispose())
   const nonce = randomBytes(32).toString('hex')
   const staticRoutes = [
@@ -111,7 +122,14 @@ export function apply(ctx) {
       return
     }
     const input = await readBody(req)
+    const conversationAction = ['list-conversations', 'preview-conversation', 'import-conversation'].includes(input.action)
+    const nativeSessionImport = (conversationAction || input.action === 'catalog')
+      && Boolean(services()) && ctx.connection.admit?.(req)?.peer?.principal?.kind === 'owner'
+    if (conversationAction && !nativeSessionImport) {
+      json(res, 403, { error: '请在支持会话迁入的本机 DSH 主界面中使用。' })
+      return
+    }
     const result = await catalog.execute(input.action, input)
-    json(res, 200, input.action === 'catalog' ? { ...result, agentIcons } : result)
+    json(res, 200, input.action === 'catalog' ? { ...result, agentIcons, nativeSessionImport } : result)
   })
 }
