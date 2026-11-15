@@ -7,7 +7,7 @@ const source = await readFile(new URL('../src/client.js', import.meta.url), 'utf
 const origin = 'http://127.0.0.1:8300';
 const panelUrl = `${origin}/agent-bridge/panel`;
 
-function mount({ rows, events = () => { throw new Error('Unexpected history read'); } }) {
+function mount({ rows, events = () => { throw new Error('Unexpected history read'); }, services }) {
   const replies = [];
   let onMessage;
   let renderPanel;
@@ -34,6 +34,7 @@ function mount({ rows, events = () => { throw new Error('Unexpected history read
       phase: 'ready', ids: rows.map(row => row.id), byId: Object.fromEntries(rows.map(row => [row.id, row])),
     }) } },
     remote: { session: { events } },
+    ...services,
   });
   renderPanel();
   return async (type, data = {}, event = {}) => {
@@ -91,4 +92,93 @@ test('native export preserves the latest long reply within its text budget', asy
   assert.equal(result.conversation.truncated, true);
   assert.equal(result.conversation.messages[0].text.length, 27_999);
   assert.equal(result.conversation.messages[0].text.isWellFormed(), true);
+});
+
+function draftHandoff({ outcome, archiveFails = false, draft = '' }) {
+  const sessions = new Map();
+  const opened = [];
+  const retained = new Set();
+  const send = mount({ rows: [], services: {
+    sessions: {
+      async create() {
+        const id = 'new-' + (sessions.size + 1);
+        sessions.set(id, { blank: true, running: false, archived: false, draft });
+        return id;
+      },
+      retain(id) {
+        retained.add(id);
+        const row = sessions.get(id);
+        return { binding: { sessionId: id, ctx: { row }, session: { getSnapshot: () => row } }, ready: Promise.resolve(),
+          release: () => retained.delete(id) };
+      },
+    },
+    workspaces: {
+      async create() { return { workspaceId: 'import-workspace' }; },
+      async archiveSession(id, options) {
+        if (archiveFails || options?.stopActivity) throw new Error('Cannot archive');
+        sessions.get(id).archived = true;
+      },
+    },
+    conversation: { input: {
+      for(ctx) { return { snapshot: { draft: ctx.row.draft, attachmentIds: [] } }; },
+      requestDraftInitialization(binding, { prompt, whenDraftExists }) {
+        const row = sessions.get(binding.sessionId);
+        const status = outcome(row, whenDraftExists);
+        if (status === 'applied') row.draft = prompt;
+        return status;
+      },
+    } },
+    uiWorkspace: { openSession: id => opened.push(id) },
+  } });
+  return { send, sessions, opened, retained };
+}
+
+const handoff = { path: project.cwd, prompt: 'Continue from the reviewed project.' };
+
+test('a refused handoff draft archives the new blank chat and retries without leaving it visible', async () => {
+  let attempts = 0;
+  const { send, sessions, opened, retained } = draftHandoff({
+    outcome: () => ++attempts === 1 ? 'blocked' : 'applied',
+  });
+  const failed = await send('open', handoff);
+  assert.equal(failed.ok, false);
+  assert.equal(sessions.get('new-1').archived, true);
+  assert.equal(failed.recoverySessionId, undefined);
+  assert.deepEqual(opened, []);
+  assert.equal(retained.size, 0);
+  const retried = await send('open', handoff);
+  assert.equal(retried.ok, true);
+  assert.deepEqual(opened, ['new-2']);
+  assert.equal(sessions.get('new-2').draft, handoff.prompt);
+});
+
+test('a preserved draft stays intact and the same chat can be opened for manual recovery', async () => {
+  const { send, sessions, opened } = draftHandoff({ outcome: () => 'preserved', draft: 'User draft' });
+  const result = await send('open', handoff);
+  assert.equal(result.ok, false);
+  assert.equal(result.recoverySessionId, 'new-1');
+  assert.equal(sessions.get('new-1').draft, 'User draft');
+  assert.equal(sessions.get('new-1').archived, false);
+  assert.deepEqual(opened, []);
+  assert.equal((await send('recover-draft', { requestId: 'other-ticket', sessionId: result.recoverySessionId })).ok, false);
+  assert.equal((await send('recover-draft', { sessionId: result.recoverySessionId })).ok, true);
+  assert.deepEqual(opened, ['new-1']);
+  assert.equal(sessions.size, 1);
+});
+
+test('when the rollback fails, retry reuses the partial session instead of creating a duplicate', async () => {
+  let attempts = 0;
+  const { send, sessions, opened } = draftHandoff({ archiveFails: true, outcome: () => {
+    if (++attempts === 1) throw new Error('Draft failed');
+    return 'applied';
+  } });
+  const failed = await send('open', handoff);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.recoverySessionId, 'new-1');
+  // A new preview may issue a different ticket for the same project.
+  const recovered = await send('open', { ...handoff, requestId: 'new-ticket' });
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.sessionId, 'new-1');
+  assert.deepEqual(opened, ['new-1']);
+  assert.equal(sessions.size, 1);
 });

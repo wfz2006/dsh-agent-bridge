@@ -96,6 +96,7 @@ window.__ModuleLoader__.load({
       ctx.effect(() => ctx.locale.register(panelId, messages), 'agent bridge locale');
       const t = ctx.locale.bind(panelId);
       const recentImports = new Map();
+      const incompleteDrafts = new Map();
       let importing = false;
 
       async function exportRequest(request, signal) {
@@ -114,33 +115,75 @@ window.__ModuleLoader__.load({
         return { conversation: { title: selected.title, path: selected.path, ...dialogue } };
       }
 
+      function rememberImport(requestId, imported) {
+        if (!recentImports.has(requestId) && recentImports.size >= 32) {
+          recentImports.delete(recentImports.keys().next().value);
+        }
+        recentImports.set(requestId, imported);
+      }
+
+      async function rollbackDraft(imported, binding) {
+        try {
+          const session = binding?.session;
+          const state = session?.getSnapshot();
+          const input = binding && ctx.conversation.input.for(binding.ctx).snapshot;
+          // A preserved draft, attachments, or a chat already in use belong to
+          // the user. Archive only an unused, empty chat created by this handoff.
+          if (state && (!state.blank || state.running || state.promptAttempted || state.removed)) return false;
+          if (binding && (!input || input.draft !== '' || input.attachmentIds?.length
+            || ['adjudicating', 'submitting', 'sending'].includes(input.phase))) return false;
+          await ctx.workspaces.archiveSession(imported.sessionId);
+          incompleteDrafts.delete(imported.path);
+          for (const [key, item] of recentImports) if (item === imported) recentImports.delete(key);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
       async function prepareSession(request, reveal) {
-        let imported = recentImports.get(request.requestId);
+        const path = pathKey(request.path);
+        let imported = recentImports.get(request.requestId) ?? incompleteDrafts.get(path);
+        if (imported && imported.path !== path) throw new Error('交接工作目录已变化，请重新预览。');
         if (!imported) {
           const workspace = await ctx.workspaces.create({ path: request.path });
           const sessionId = await ctx.sessions.create({ workspaceId: workspace.workspaceId });
-          imported = { sessionId, ready: false };
-          recentImports.set(request.requestId, imported);
-          if (recentImports.size > 32) recentImports.delete(recentImports.keys().next().value);
+          imported = { sessionId, path, ready: false };
+          incompleteDrafts.set(path, imported);
         }
+        rememberImport(request.requestId, imported);
 
-        if (imported.ready) {
-          reveal(imported.sessionId);
-          return imported.sessionId;
-        }
-        const reference = ctx.sessions.retain(imported.sessionId, { source: panelId });
+        let reference;
         try {
-          await reference.ready;
-          const status = ctx.conversation.input.requestDraftInitialization(reference.binding, {
-            prompt: request.prompt,
-            whenDraftExists: 'keep',
-          });
-          if (status !== 'applied') throw new Error('DSH 未能填入交接草稿。');
-          imported.ready = true;
+          if (!imported.ready) {
+            let binding;
+            let outcome;
+            try {
+              reference = ctx.sessions.retain(imported.sessionId, { source: panelId });
+              binding = reference.binding;
+              await reference.ready;
+              outcome = ctx.conversation.input.requestDraftInitialization(binding, {
+                prompt: request.prompt,
+                whenDraftExists: 'keep',
+              });
+            } catch {
+              // A Host error can also leave an empty session to roll back.
+            }
+            if (outcome !== 'applied') {
+              if (outcome !== 'preserved' && await rollbackDraft(imported, binding)) {
+                throw new Error('DSH 未能填入交接草稿。空白会话已归档，可重试。');
+              }
+              throw new Error(outcome === 'preserved'
+                ? '会话中已有草稿，已原样保留。可打开会话并手动补入交接资料。'
+                : 'DSH 未能填入交接草稿。可重试同一会话，或打开后手动补入交接资料。');
+            }
+            imported.ready = true;
+            incompleteDrafts.delete(path);
+          }
           reveal(imported.sessionId);
           return imported.sessionId;
         } finally {
-          reference.release();
+          reference?.release();
         }
       }
 
@@ -187,6 +230,20 @@ window.__ModuleLoader__.load({
               }
               return;
             }
+            if (request.type === 'dsh-agent-bridge:recover-draft') {
+              const partial = recentImports.get(request.requestId);
+              if (importing || !partial || partial.ready || partial.sessionId !== request.sessionId) {
+                reply({ ok: false, error: '无法定位这条交接会话，请回到工作区检查。' });
+                return;
+              }
+              try {
+                ctx.uiWorkspace.openSession(partial.sessionId);
+                reply({ ok: true });
+              } catch {
+                reply({ ok: false, error: '暂时无法打开这条会话，请在工作区列表中重试。' });
+              }
+              return;
+            }
             if (request.type !== 'dsh-agent-bridge:open') return;
             if (!validPath(request.path) || typeof request.prompt !== 'string'
               || !request.prompt.trim() || request.prompt.length > 65_536) {
@@ -213,9 +270,10 @@ window.__ModuleLoader__.load({
               });
               reply({ ok: true, sessionId });
             } catch (error) {
+              const partial = recentImports.get(request.requestId);
               reply({
                 ok: false,
-                sessionId: recentImports.get(request.requestId)?.sessionId,
+                recoverySessionId: partial?.ready === false ? partial.sessionId : undefined,
                 error: error instanceof Error ? error.message.slice(0, 500) : 'DSH 无法打开交接会话。',
               });
             } finally {

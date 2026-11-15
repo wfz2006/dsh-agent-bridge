@@ -1,12 +1,20 @@
+import { createReadStream } from 'node:fs';
 import { open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 const maxSessions = 8_000;
 const maxMessages = 36;
 const maxMessageLength = 4_000;
 const maxTranscriptBytes = 12 * 1024 * 1024;
-const maxDecodedTranscriptBytes = 32 * 1024 * 1024;
+const maxTranscriptRowBytes = 256 * 1024;
+const tailBufferBytes = maxTranscriptBytes + 1;
+const transcriptHeaderBytes = 96 * 1024;
+const codexLocations = ['sessions', 'archived_sessions'];
+const jsonlFile = /\.jsonl$/i;
+const compressedCodexFile = /\.jsonl\.zst$/i;
+const hasZstd = typeof zlib.createZstdDecompress === 'function';
 const conversationLimits = { messages: 600, characters: 160_000, messageLength: 24_000 };
 
 const agentLabels = {
@@ -73,9 +81,9 @@ function json(text) {
 }
 
 function rowsFrom(text, truncated) {
-  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/);
-  if (truncated) lines.pop();
-  return lines.map(json).filter(Boolean);
+  const value = text.replace(/^\uFEFF/, '');
+  const end = truncated ? value.lastIndexOf('\n') + 1 : value.length;
+  return value.slice(0, end).split(/\r?\n/).map(json).filter(Boolean);
 }
 
 async function directories(root) {
@@ -184,19 +192,62 @@ async function codexProjects(root) {
   const entries = await directories(root);
   const states = entries.filter(entry => entry.isFile() && /^state_\d+\.sqlite$/.test(entry.name));
   states.sort((a, b) => Number(b.name.match(/\d+/)[0]) - Number(a.name.match(/\d+/)[0]));
+  let indexed;
+  let indexError;
   for (const entry of states) {
     const file = await scopedFile(path.join(root, entry.name), root);
     if (!file) continue;
-    const rows = await withDatabase(file, db => {
-      const fields = columns(db, 'threads');
-      if (!['cwd', 'rollout_path', 'id'].every(field => fields.has(field))) return undefined;
-      const sort = fields.has('updated_at') ? 'updated_at' : 'id';
-      const title = fields.has('title') ? 'substr(title, 1, 200)' : 'NULL';
-      return db.prepare(`SELECT id, cwd, rollout_path, ${sort} AS date, ${title} AS title FROM threads WHERE cwd <> '' ORDER BY ${sort} DESC LIMIT ?`).all(maxSessions);
-    });
-    if (rows) return rows.map(({ id, cwd, rollout_path: file, date, title }) => ({ cwd, agent: 'codex', archive: { kind: 'codex', file, root, id, date, title } }));
+    try {
+      indexed = await withDatabase(file, db => {
+        const fields = columns(db, 'threads');
+        if (!['cwd', 'rollout_path', 'id'].every(field => fields.has(field))) return undefined;
+        const sort = fields.has('updated_at') ? 'updated_at' : 'id';
+        const title = fields.has('title') ? 'substr(title, 1, 200)' : 'NULL';
+        return db.prepare(`SELECT id, cwd, rollout_path, ${sort} AS date, ${title} AS title FROM threads WHERE cwd <> '' ORDER BY ${sort} DESC LIMIT ?`).all(maxSessions);
+      });
+      if (indexed) break;
+    } catch (error) {
+      indexError = error;
+    }
   }
-  return jsonlProjects(root, 'codex', ['sessions', 'archived_sessions'], 4);
+  const bases = await transcriptDirectories(root, codexLocations);
+  if (!bases.length) throw indexError ?? missingStore();
+  const byFile = new Map();
+  for (let offset = 0; offset < (indexed?.length ?? 0); offset += 32) {
+    const batch = await Promise.all(indexed.slice(offset, offset + 32).map(async ({ id, cwd, rollout_path, date, title }) => {
+      const file = await resolveCodexTranscript(rollout_path, bases);
+      return file ? { cwd, agent: 'codex', archive: { kind: 'codex', file, root, id, date, title } } : undefined;
+    }));
+    for (const project of batch.filter(Boolean)) {
+      const key = pathKey(project.archive.file);
+      if (!byFile.has(key)) byFile.set(key, project);
+    }
+  }
+  // Files may be compressed or moved before SQLite catches up. Keep SQLite's
+  // titles when its path resolves, and discover compressed files independently.
+  const byId = new Set([...byFile.values()].map(project => project.archive.id).filter(Boolean));
+  const include = file => !byFile.has(pathKey(file))
+    && ((!indexed?.length && jsonlFile.test(file)) || (hasZstd && compressedCodexFile.test(file)));
+  const fallback = await scanJsonlProjects(root, 'codex', bases, 4, include, maxSessions - byFile.size);
+  for (const project of fallback) {
+    const { file, id } = project.archive;
+    if (id && byId.has(id)) continue;
+    if (id) byId.add(id);
+    byFile.set(pathKey(file), project);
+  }
+  return [...byFile.values()];
+}
+
+async function resolveCodexTranscript(file, bases) {
+  if (typeof file !== 'string' || !path.isAbsolute(file)) return undefined;
+  const candidates = compressedCodexFile.test(file) ? [file, file.slice(0, -4)]
+    : jsonlFile.test(file) ? [file, file + '.zst'] : [];
+  for (const candidate of candidates) {
+    const actual = await physicalPath(candidate);
+    if (!actual || !bases.some(base => inside(base, actual))
+      || !(jsonlFile.test(actual) || hasZstd && compressedCodexFile.test(actual))) continue;
+    if ((await stat(actual).catch(() => undefined))?.isFile()) return actual;
+  }
 }
 
 function opencodeTables(db) {
@@ -246,7 +297,7 @@ async function transcriptFiles(root, depth, limit, predicate) {
     const entries = await directories(current.root).catch(() => []);
     for (const entry of entries) {
       const file = path.join(current.root, entry.name);
-      if (entry.isFile() && predicate(entry.name)) files.push(file);
+      if (entry.isFile() && predicate(entry.name, file)) files.push(file);
       if (files.length >= limit) break;
       if (entry.isDirectory() && current.depth > 0 && entry.name !== 'subagents') {
         stack.push({ root: file, depth: current.depth - 1 });
@@ -270,20 +321,27 @@ async function nativeCwd(file, agent, rows) {
 async function jsonlProjects(root, agent, children = ['projects'], depth = 1) {
   const roots = await transcriptDirectories(root, children);
   if (!roots.length) throw missingStore();
+  return scanJsonlProjects(root, agent, roots, depth, file => jsonlFile.test(file));
+}
+
+async function scanJsonlProjects(root, agent, roots, depth, include, limit = maxSessions) {
   const files = [];
   for (const target of roots) {
-    files.push(...await transcriptFiles(target, depth, maxSessions - files.length, name => /\.jsonl$/i.test(name)));
+    files.push(...await transcriptFiles(target, depth, limit - files.length, (_name, file) => include(file)));
   }
   const result = [];
   for (let offset = 0; offset < files.length; offset += 32) {
     const batch = await Promise.all(files.slice(offset, offset + 32).map(async file => {
       try {
-        const { text, truncated, modified } = await prefix(file, 96 * 1024);
+        const compressed = agent === 'codex' && compressedCodexFile.test(file);
+        const { text, truncated, modified } = compressed ? await compressedPrefix(file) : await prefix(file, transcriptHeaderBytes);
         const rows = rowsFrom(text, truncated);
         const cwd = await nativeCwd(file, agent, rows);
+        const id = agent === 'codex' ? rows.find(row => row.type === 'session_meta')?.payload?.id : undefined;
         const title = rows.findLast(row => row.type === 'custom-title' && typeof row.customTitle === 'string')?.customTitle
-          ?? rows.findLast(row => row.type === 'summary' && typeof row.summary === 'string')?.summary;
-        return cwd ? { cwd, agent, archive: { kind: agent, file, root, date: modified, title: title?.slice(0, 200) } } : undefined;
+          ?? rows.findLast(row => row.type === 'summary' && typeof row.summary === 'string')?.summary
+          ?? firstQuestion(rows, agent);
+        return cwd ? { cwd, agent, archive: { kind: agent, file, root, id, date: modified, title: title?.slice(0, 200) } } : undefined;
       } catch { return undefined; }
     }));
     result.push(...batch.filter(Boolean));
@@ -465,21 +523,42 @@ async function sameDirectory(cwd, expected) {
   return pathKey(actual ?? cwd) === pathKey(expected);
 }
 
+function stripRuntimeWrapper(text) {
+  let value = text.trimStart();
+  let stripped = false;
+  while (value.startsWith('<') || value.startsWith('#')) {
+    const wrapper = /^<(environment_context|permissions instructions|collaboration_mode|system-reminder|developer_instructions|user_instructions|app-context|subagent_notification)(?=[>\s])[^>]*(?:>|$)/i.exec(value);
+    const instructions = wrapper ? undefined : /^# AGENTS\.md instructions for [\s\S]*?\n<INSTRUCTIONS>/i.exec(value);
+    if (!wrapper && !instructions) break;
+    const closing = `</${wrapper?.[1].toLowerCase() ?? 'instructions'}>`;
+    const end = value.toLowerCase().indexOf(closing, (wrapper ?? instructions)[0].length);
+    if (end === -1) return '';
+    value = value.slice(end + closing.length).trimStart();
+    stripped = true;
+  }
+  return stripped ? value : text;
+}
+
+function messageText(text) {
+  return typeof text === 'string' ? stripRuntimeWrapper(text).trim() : '';
+}
+
 function appendMessage(result, role, text, timestamp) {
-  if (!['user', 'assistant'].includes(role) || typeof text !== 'string' || !text.trim()) return;
-  const value = text.trim();
-  if (/^<(?:environment_context|permissions instructions|collaboration_mode|system-reminder|developer_instructions|user_instructions|app-context|subagent_notification)(?:[>\s])/i.test(value)
-    || /^# AGENTS\.md instructions for [\s\S]*\n<INSTRUCTIONS>/i.test(value)) return;
+  if (role !== 'user' && role !== 'assistant') return;
+  const value = messageText(text);
+  if (!value) return;
   for (const match of value.matchAll(/<skill>\s*<name>([^<]+)<\/name>/gi)) addSkill(result, match[1]);
   if (value.startsWith('<skill>')) return;
   const { limits } = result;
   if (limits) {
-    const bounded = value.slice(0, limits.messageLength);
+    const bounded = value.slice(0, limits.messageLength).replace(/[\uD800-\uDBFF]$/, '');
     result.messages.push({ role, text: bounded, agent: result.agent, time: dateMillis(timestamp) });
     result.characters += bounded.length;
     if (value.length > bounded.length) result.truncated = true;
     while (result.messages.length > limits.messages || result.characters > limits.characters) {
-      result.characters -= result.messages.shift().text.length;
+      const first = result.messages.shift();
+      if (first.role === 'user') result.removedQuestion = first;
+      result.characters -= first.text.length;
       result.truncated = true;
     }
   } else {
@@ -515,10 +594,32 @@ function textBlocks(content, result) {
   for (const block of content) {
     if (typeof block === 'string') texts.push(block);
     if (['text', 'input_text', 'output_text'].includes(block?.type) && typeof block.text === 'string') texts.push(block.text);
-    if (block?.type === 'tool_use') readTool(result, block.name, block.input);
-    if (block?.type === 'tool') readTool(result, block.tool ?? block.name, block.state?.input ?? block.input ?? block.args);
+    if (result && block?.type === 'tool_use') readTool(result, block.name, block.input);
+    if (result && block?.type === 'tool') readTool(result, block.tool ?? block.name, block.state?.input ?? block.input ?? block.args);
   }
-  return texts.join('\n');
+  // A Codex user message can contain several independent input_text blocks.
+  // Filter each one so an internal block never hides a neighboring prompt.
+  return texts.map(stripRuntimeWrapper).filter(value => value.trim()).join('\n');
+}
+
+function firstQuestion(rows, agent) {
+  for (const row of rows) {
+    if (row.isSidechain || row.isMeta || row.isCompactSummary) continue;
+    let body;
+    if (agent === 'codex') {
+      if (row.type === 'response_item' && row.payload?.type === 'message' && row.payload.role === 'user') {
+        body = textBlocks(row.payload.content);
+      }
+    } else if (agent === 'workbuddy') {
+      if (row.type === 'message' && ['user', 'human'].includes(row.role)) body = textBlocks(row.content);
+    } else if (row.type === 'user') {
+      body = agent === 'qwen' && Array.isArray(row.message?.parts)
+        ? row.message.parts.filter(part => !part?.thought).map(part => part?.text ?? '').join('\n')
+        : textBlocks(row.message?.content);
+    }
+    const title = messageText(body);
+    if (title && !title.startsWith('<skill>')) return title;
+  }
 }
 
 async function readGeminiHistory(descriptor, cwd, config, result) {
@@ -611,49 +712,146 @@ async function readCopilotHistory(descriptor, cwd, config, result) {
   }
 }
 
-async function transcriptTail(file, compressed) {
+async function* zstdChunks(file) {
+  const decoder = zlib.createZstdDecompress();
+  const input = createReadStream(file);
+  input.on('error', error => decoder.destroy(error));
+  try {
+    yield* input.pipe(decoder);
+  } finally {
+    // Discovery stops after the header. Close both ends without reading the rest.
+    input.destroy();
+    decoder.destroy();
+  }
+}
+
+async function compressedPrefix(file) {
+  const { mtimeMs: modified } = await stat(file);
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of zstdChunks(file)) {
+    const part = chunk.subarray(0, transcriptHeaderBytes - bytes);
+    if (part.length) chunks.push(part);
+    bytes += part.length;
+    if (part.length < chunk.length) {
+      return { text: Buffer.concat(chunks, bytes).toString('utf8'), truncated: true, modified };
+    }
+  }
+  return { text: Buffer.concat(chunks, bytes).toString('utf8'), truncated: false, modified };
+}
+
+async function* compressedRows(file) {
+  // Keep at most one bounded JSONL record. Large tool outputs commonly sit
+  // between the last question and answer and must not compete with them.
+  let parts = [];
+  let bytes = 0;
+  for await (const chunk of zstdChunks(file)) {
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf(10, offset);
+      const end = newline === -1 ? chunk.length : newline;
+      const length = end - offset;
+      if (bytes <= maxTranscriptRowBytes && length) {
+        bytes += length;
+        if (bytes <= maxTranscriptRowBytes) parts.push(chunk.subarray(offset, end));
+        else parts = [];
+      }
+      if (newline === -1) break;
+      if (bytes > maxTranscriptRowBytes) yield null;
+      else if (bytes) {
+        const row = json(Buffer.concat(parts, bytes).toString('utf8').replace(/^\uFEFF/, ''));
+        if (row) yield row;
+      }
+      offset = newline + 1;
+      bytes = 0;
+      parts = [];
+    }
+  }
+  if (bytes > maxTranscriptRowBytes) yield null;
+  else if (bytes) {
+    const row = json(Buffer.concat(parts, bytes).toString('utf8').replace(/^\uFEFF/, ''));
+    if (row) yield row;
+  }
+}
+
+function readCodexRow(result, row) {
+  if (row === null || row.type === 'compacted' || row.isCompactSummary) {
+    if (result.limits) result.truncated = true;
+    return;
+  }
+  if (row.isSidechain || row.isMeta || row.type !== 'response_item') return;
+  const payload = row.payload;
+  if (payload?.type === 'message') appendMessage(result, payload.role, textBlocks(payload.content, result), row.timestamp);
+  if (payload?.type === 'function_call') readTool(result, payload.name, payload.arguments);
+  if (payload?.type === 'custom_tool_call') readTool(result, payload.name, payload.input);
+}
+
+async function readCompressedCodex(file, cwd, result) {
+  // Use a separate accumulator so a damaged file never contributes an
+  // incomplete history or discards previously read project context.
+  const local = { messages: [], usedSkills: new Set(), limits: result.limits,
+    characters: 0, truncated: false, agent: result.agent };
+  let validated = false;
+  for await (const row of compressedRows(file)) {
+    if (!validated) {
+      if (row?.type !== 'session_meta') return;
+      if (!await sameDirectory(row.payload?.cwd, cwd)) return;
+      validated = true;
+      continue;
+    }
+    readCodexRow(local, row);
+  }
+  if (result.limits) {
+    Object.assign(result, local);
+  } else {
+    result.messages.push(...local.messages);
+    if (result.messages.length > maxMessages) result.messages.splice(0, result.messages.length - maxMessages);
+    for (const skill of local.usedSkills) result.usedSkills.add(skill);
+  }
+}
+
+async function transcriptTail(file) {
   const handle = await open(file, 'r');
   try {
     const { size } = await handle.stat();
-    if (compressed && size > maxTranscriptBytes) return undefined;
-    const buffer = Buffer.alloc(Math.min(size, maxTranscriptBytes));
-    const start = size - buffer.length;
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-    if (compressed) {
-      const { zstdDecompressSync } = await import('node:zlib');
-      if (typeof zstdDecompressSync !== 'function') return undefined;
-      const decoded = zstdDecompressSync(buffer.subarray(0, bytesRead), { maxOutputLength: maxDecodedTranscriptBytes });
-      const header = rowsFrom(decoded.subarray(0, 96 * 1024).toString('utf8'), decoded.length > 96 * 1024);
-      return { header, history: parseTail(decoded, decoded.length > maxTranscriptBytes), truncated: decoded.length > maxTranscriptBytes };
-    }
-    const raw = buffer.toString('utf8', 0, bytesRead);
-    return { history: rowsFrom(start ? raw.slice(raw.indexOf('\n') + 1) : raw, false), truncated: start > 0 };
+    const buffer = Buffer.alloc(Math.min(size, tailBufferBytes));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, size - buffer.length);
+    return parseTail(buffer.subarray(0, bytesRead));
   } finally {
     await handle.close();
   }
 }
 
-function parseTail(decoded, bounded) {
-  const raw = decoded.subarray(Math.max(0, decoded.length - maxTranscriptBytes)).toString('utf8');
-  return rowsFrom(bounded ? raw.slice(raw.indexOf('\n') + 1) : raw, false);
+function parseTail(buffer) {
+  const truncated = buffer.length > maxTranscriptBytes;
+  // Inspect one byte before the window so a complete first line isn't dropped.
+  const newline = truncated ? buffer.indexOf(10, buffer.length - tailBufferBytes) : -1;
+  return {
+    history: truncated && newline === -1 ? [] : rowsFrom(buffer.toString('utf8', newline + 1), false),
+    truncated,
+  };
 }
 
 async function readJsonlHistory(descriptor, cwd, config, result) {
-  const roots = configuredRoots(config, descriptor.kind);
-  const locations = descriptor.kind === 'codex' ? ['sessions', 'archived_sessions'] : ['projects'];
+  const codex = descriptor.kind === 'codex';
+  const locations = codex ? codexLocations : ['projects'];
+  const bases = (await Promise.all(configuredRoots(config, descriptor.kind)
+    .map(root => transcriptDirectories(root, locations)))).flat();
   let file;
-  for (const root of roots) {
-    for (const base of await transcriptDirectories(root, locations)) {
-      file ??= await scopedFile(descriptor.file, base);
+  if (codex) file = await resolveCodexTranscript(descriptor.file, bases);
+  else {
+    for (const base of bases) {
+      file = await scopedFile(descriptor.file, base);
+      if (file) break;
     }
   }
-  const compressed = descriptor.kind === 'codex' && /\.jsonl\.zst$/i.test(file ?? '');
-  if (!file || (!compressed && !/\.jsonl$/i.test(file))) return;
+  if (!file) return;
+  if (codex && compressedCodexFile.test(file)) return readCompressedCodex(file, cwd, result);
+  if (!jsonlFile.test(file)) return;
   // Validate the embedded working directory before returning messages from this source.
-  const head = compressed ? undefined : await prefix(file, 96 * 1024);
-  const transcript = await transcriptTail(file, compressed);
-  const rows = transcript?.header ?? rowsFrom(head?.text ?? '', head?.truncated);
-  if (!transcript || !await sameDirectory(await nativeCwd(file, descriptor.kind, rows), cwd)) return;
+  const { text, truncated } = await prefix(file, transcriptHeaderBytes);
+  if (!await sameDirectory(await nativeCwd(file, descriptor.kind, rowsFrom(text, truncated)), cwd)) return;
+  const transcript = await transcriptTail(file);
 
   // Active transcripts may have a torn last row. Large transcripts keep the latest bounded tail.
   const { history } = transcript;
@@ -662,12 +860,7 @@ async function readJsonlHistory(descriptor, cwd, config, result) {
     if (result.limits && row.isCompactSummary) result.truncated = true;
     if (row.isSidechain || row.isMeta || row.isCompactSummary) continue;
     if (descriptor.kind === 'codex') {
-      if (result.limits && row.type === 'compacted') result.truncated = true;
-      if (row.type !== 'response_item') continue;
-      const payload = row.payload;
-      if (payload?.type === 'message') appendMessage(result, payload.role, textBlocks(payload.content, result), row.timestamp);
-      if (payload?.type === 'function_call') readTool(result, payload.name, payload.arguments);
-      if (payload?.type === 'custom_tool_call') readTool(result, payload.name, payload.input);
+      readCodexRow(result, row);
     } else if (descriptor.kind === 'workbuddy') {
       if (row.type === 'message') appendMessage(result, row.role === 'human' ? 'user' : row.role, textBlocks(row.content, result), row.timestamp);
       if (row.type === 'function_call') readTool(result, row.name, row.arguments);
@@ -755,6 +948,15 @@ async function readHistory(archive, cwd, config, result) {
 export async function readConversationHistory(archive, cwd, config) {
   const result = { messages: [], usedSkills: new Set(), limits: conversationLimits, characters: 0, truncated: false };
   await readHistory(archive, cwd, config, result);
+  if (result.messages[0]?.role === 'assistant' && result.removedQuestion) {
+    // The latest retained replies may belong to a long turn whose question
+    // fell out of the sliding budget. Keep that real question with its replies.
+    const question = result.removedQuestion;
+    while (result.messages.length >= result.limits.messages || result.characters + question.text.length > result.limits.characters) {
+      result.characters -= result.messages.shift().text.length;
+    }
+    result.messages.unshift(question);
+  }
   const start = result.messages.findIndex(message => message.role === 'user');
   return { messages: start < 0 ? [] : result.messages.slice(start), truncated: result.truncated || start > 0 };
 }

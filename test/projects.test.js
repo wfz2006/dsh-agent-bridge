@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
+import { createWriteStream } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
-import { readProjectHistory, scanProjects } from '../src/projects.js';
+import zlib from 'node:zlib';
+import { readConversationHistory, readProjectHistory, scanProjects } from '../src/projects.js';
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh-agent-projects-'));
@@ -19,6 +23,135 @@ async function writeJsonl(file, rows) {
   await mkdir(path.dirname(file), { recursive: true });
   await writeFile(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n');
 }
+
+const zstdOptions = { skip: !zlib.createZstdCompress && 'This Node version does not provide Zstandard' };
+const codexRow = (role, ...blocks) => ({
+  type: 'response_item',
+  payload: { type: 'message', role, content: blocks.map(text => ({ type: role === 'user' ? 'input_text' : 'output_text', text })) },
+});
+const codexMeta = (cwd, id) => ({ type: 'session_meta', payload: { id, cwd } });
+const jsonl = row => JSON.stringify(row) + '\n';
+
+async function writeZstd(file, chunks) {
+  await mkdir(path.dirname(file), { recursive: true });
+  await pipeline(Readable.from(chunks), zlib.createZstdCompress(), createWriteStream(file));
+}
+
+function codexIndex(root, records) {
+  const database = new DatabaseSync(path.join(root, 'state_5.sqlite'));
+  try {
+    database.exec('CREATE TABLE threads (id TEXT, cwd TEXT, rollout_path TEXT, updated_at INTEGER, title TEXT)');
+    const insert = database.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?)');
+    for (const record of records) insert.run(...record);
+  } finally {
+    database.close();
+  }
+}
+
+const dialogue = result => result.messages.map(({ role, text }) => [role, text]);
+
+test('Codex finds compressed sessions and archives without a SQLite index', zstdOptions, async t => {
+  const { root, cwd } = await fixture(t);
+  const paths = [
+    path.join(root, 'sessions', '2026', '11', '15', 'recent.jsonl.zst'),
+    path.join(root, 'archived_sessions', 'archived.jsonl.zst'),
+  ];
+  for (const [index, file] of paths.entries()) {
+    await writeZstd(file, [codexMeta(cwd, 'thread-' + index), codexRow('user', 'Continue chat ' + index),
+      codexRow('assistant', 'Previous answer')].map(jsonl));
+  }
+  const config = { agentRoots: { codex: [root] } };
+  const { projects } = await scanProjects(config);
+  assert.equal(projects.length, 2);
+  for (const [index, file] of paths.entries()) {
+    const project = projects.find(item => item.archive?.file === file);
+    assert.equal(project?.archive?.title, 'Continue chat ' + index);
+    assert.deepEqual(dialogue(await readConversationHistory(project.archive, cwd, config)), [
+      ['user', 'Continue chat ' + index], ['assistant', 'Previous answer'],
+    ]);
+  }
+});
+
+test('Codex uses the compressed replacement of a stale index path and includes compressed files missing from the index', zstdOptions, async t => {
+  const { root, cwd } = await fixture(t);
+  const stale = path.join(root, 'sessions', '2026', '11', '15', 'compressed-in-place.jsonl');
+  const indexed = path.join(root, 'archived_sessions', 'indexed.jsonl.zst');
+  const unindexed = path.join(root, 'archived_sessions', 'unindexed.jsonl.zst');
+  for (const [id, file] of [['one', stale + '.zst'], ['two', indexed], ['three', unindexed]]) {
+    await writeZstd(file, [codexMeta(cwd, id), codexRow('user', 'Question ' + id)].map(jsonl));
+  }
+  codexIndex(root, [
+    ['one', cwd, stale, 1_794_009_600, 'Indexed title'],
+    ['two', cwd, indexed, 1_794_009_601, 'Indexed archive'],
+    ['missing', cwd, path.join(root, 'archived_sessions', 'missing.jsonl.zst'), 1_794_009_602, 'Unavailable'],
+  ]);
+  const config = { agentRoots: { codex: [root] } };
+  const { projects } = await scanProjects(config);
+  const archives = projects.map(item => item.archive).filter(Boolean);
+  assert.deepEqual(archives.map(item => [item.file, item.title]).sort(), [
+    [stale + '.zst', 'Indexed title'], [indexed, 'Indexed archive'], [unindexed, 'Question three'],
+  ].sort());
+  const transcript = await readConversationHistory(archives.find(item => item.title === 'Indexed title'), cwd, config);
+  assert.deepEqual(dialogue(transcript), [['user', 'Question one']]);
+});
+
+test('Codex streams compressed transcripts beyond 32 MiB without letting tool output displace dialogue', zstdOptions, async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'sessions', 'large.jsonl.zst');
+  const filler = jsonl({ type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(1024 * 1024) } });
+  function* transcript() {
+    yield jsonl(codexMeta(cwd, 'large'));
+    for (let i = 0; i < 12; i++) yield jsonl(codexRow('user', 'Earlier question ' + 'x'.repeat(23_990)));
+    yield jsonl(codexRow('user', '继续检查新版本 🧪'));
+    for (let i = 0; i < 36; i++) yield filler;
+    yield JSON.stringify(codexRow('assistant', '最新结果已记录。'));
+  }
+  await writeZstd(file, transcript());
+  codexIndex(root, [['large', cwd, file, 1_794_009_600, 'Long conversation']]);
+  const config = { agentRoots: { codex: [root] } };
+  const { projects } = await scanProjects(config);
+  const result = await readConversationHistory(projects[0].archive, cwd, config);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(dialogue(result).slice(-2), [['user', '继续检查新版本 🧪'], ['assistant', '最新结果已记录。']]);
+  assert.deepEqual(dialogue(await readConversationHistory(projects[0].archive, root, config)), []);
+});
+
+test('a long Codex answer sequence retains the real question and most recent answer for import', zstdOptions, async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'sessions', 'many-answers.jsonl.zst');
+  await writeZstd(file, [codexMeta(cwd, 'many-answers'), codexRow('user', '我上次的问题'),
+    ...Array.from({ length: 8 }, () => codexRow('assistant', 'x'.repeat(24_000))),
+    codexRow('assistant', '最后的回复。')].map(jsonl));
+  const config = { agentRoots: { codex: [root] } };
+  const { projects } = await scanProjects(config);
+  const result = await readConversationHistory(projects[0].archive, cwd, config);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(dialogue(result).at(0), ['user', '我上次的问题']);
+  assert.deepEqual(dialogue(result).at(-1), ['assistant', '最后的回复。']);
+  assert.ok(result.messages.reduce((sum, row) => sum + row.text.length, 0) <= 160_000);
+});
+
+test('Codex keeps user text after a runtime wrapper, including when both are in one text block', async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'sessions', 'mixed.jsonl');
+  const environment = '<environment_context>private local metadata</environment_context>';
+  await writeJsonl(file, [
+    codexMeta(cwd, 'mixed'),
+    codexRow('user', environment),
+    codexRow('user', environment, '请继续排查导入'),
+    codexRow('assistant', '已查到一个原因'),
+    codexRow('user', environment + '\n<permissions instructions>runtime flags</permissions instructions>\n把这个原因修好',
+      '<collaboration_mode>runtime mode</collaboration_mode>', '并补上测试'),
+    codexRow('user', '什么是 <environment_context>？'),
+  ]);
+  const config = { agentRoots: { codex: [root] } };
+  const { projects } = await scanProjects(config);
+  assert.equal(projects[0].archive.title, '请继续排查导入');
+  const expected = [['user', '请继续排查导入'], ['assistant', '已查到一个原因'],
+    ['user', '把这个原因修好\n并补上测试'], ['user', '什么是 <environment_context>？']];
+  assert.deepEqual(dialogue(await readConversationHistory(projects[0].archive, cwd, config)), expected);
+  assert.deepEqual(dialogue(await readProjectHistory(projects[0], config)), expected);
+});
 
 test('WorkspaceHub retains the project ID and native Claude reads only matching project dialogue', async t => {
   const { root, cwd } = await fixture(t);

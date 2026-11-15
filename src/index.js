@@ -72,6 +72,7 @@ export function apply(ctx) {
     ['/panel', 'panel.html', 'text/html; charset=utf-8'],
     ['/panel.css', 'panel.css', 'text/css; charset=utf-8'],
     ['/panel.js', 'panel.js', 'text/javascript; charset=utf-8'],
+    ['/project-context.js', 'project-context.js', 'text/javascript; charset=utf-8'],
     ['/geist-latin-wght-normal.woff2', 'geist-latin-wght-normal.woff2', 'font/woff2'],
   ]
   const agentIcons = Object.create(null)
@@ -90,8 +91,9 @@ export function apply(ctx) {
     ctx.effect(() => ctx.webServer.register({
       kind: 'exact', path: prefix + path,
       async handler(req, res) {
-        if (!isLoopback(req.socket.remoteAddress) || ctx.connection.requestRejection(req) !== undefined) {
-          json(res, 403, { error: '请在这台电脑上打开已登录的 DSH。' })
+        if (!isLoopback(req.socket.remoteAddress)
+          || ctx.connection.admit?.(req)?.peer?.principal?.kind !== 'owner') {
+          json(res, 403, { error: '请使用本机 DSH 所有者身份打开 Agent 接续。' })
           return
         }
         if (req.method !== method) {
@@ -123,8 +125,7 @@ export function apply(ctx) {
     }
     const input = await readBody(req)
     const conversationAction = ['list-conversations', 'preview-conversation', 'import-conversation'].includes(input.action)
-    const nativeSessionImport = (conversationAction || input.action === 'catalog')
-      && Boolean(services()) && ctx.connection.admit?.(req)?.peer?.principal?.kind === 'owner'
+    const nativeSessionImport = (conversationAction || input.action === 'catalog') && Boolean(services())
     if (conversationAction && !nativeSessionImport) {
       json(res, 403, { error: '请在支持会话迁入的本机 DSH 主界面中使用。' })
       return

@@ -129,51 +129,68 @@
               <button id="copy-path" class="path-copy icon-button" type="button" aria-label="复制工作目录" title="复制工作目录"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg></button>
             </div>
           </header>
-          <div class="library-toolbar">
-            <div class="tabs" role="tablist" aria-label="项目资料">
-              <button id="tab-memory" type="button" role="tab" aria-selected="true" aria-controls="library-panel"><svg class="icon" aria-hidden="true"><use href="#icon-memory"/></svg><span class="tab-label">记忆</span><span class="tab-count" aria-hidden="true"></span></button>
-              <button id="tab-skill" type="button" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1"><svg class="icon" aria-hidden="true"><use href="#icon-skill"/></svg><span class="tab-label">Skills</span><span class="tab-count" aria-hidden="true"></span></button>
+          <section class="continue-panel" aria-labelledby="continue-heading">
+            <header class="continue-heading">
+              <span class="continue-mark"><svg class="icon" aria-hidden="true"><use href="#icon-history"/></svg></span>
+              <div>
+                <h3 id="continue-heading" tabindex="-1">继续旧对话</h3>
+                <p>选一条对话，把历史消息迁入 DSH 继续聊。</p>
+              </div>
+            </header>
+            <p id="recent-status" class="recent-status" role="status"></p>
+            <ul id="recent-conversations" class="conversation-list" aria-label="最近对话"></ul>
+            <button id="browse-history" class="text-action" type="button" hidden>
+              <span id="browse-history-label">查看全部对话</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg>
+            </button>
+          </section>
+          <details id="draft-workflow" class="draft-workflow">
+            <summary class="disclosure draft-summary">
+              <span class="disclosure-mark"><svg class="icon" aria-hidden="true"><use href="#icon-memory"/></svg></span>
+              <span class="draft-title">用项目资料开新对话</span>
+              <svg class="icon disclosure-chevron" aria-hidden="true"><use href="#icon-chevron"/></svg>
+            </summary>
+            <div class="draft-body">
+              <div class="draft-intro">
+                <p>选几份有用的资料，生成可编辑的草稿。</p>
+                <div class="field asset-search-field">
+                  <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
+                  <label class="sr-only" for="asset-search">搜索项目和全局资料</label>
+                  <input id="asset-search" type="search" placeholder="搜索资料" autocomplete="off">
+                  <button class="clear-search icon-button" id="clear-asset-search" type="button" aria-label="清除资料搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+                </div>
+              </div>
+              <div id="project-materials" class="asset-list"></div>
+              <details id="global-library" class="global-library" hidden>
+                <summary class="disclosure">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-layers"/></svg>
+                  <span class="disclosure-title">全局资料库</span>
+                  <span id="global-count" class="disclosure-count"></span>
+                  <svg class="icon disclosure-chevron" aria-hidden="true"><use href="#icon-chevron"/></svg>
+                </summary>
+                <p class="global-note">这些资料跨项目使用，按需选择。</p>
+                <div id="global-materials" class="asset-list"></div>
+              </details>
+              <p id="selection-feedback" class="selection-feedback" role="status"></p>
+              <div class="draft-actions">
+                <details id="handoff" class="handoff">
+                  <summary class="disclosure">
+                    <svg class="icon" aria-hidden="true"><use href="#icon-bridge"/></svg>
+                    <span id="selection-summary" class="disclosure-title" aria-live="polite">接续清单</span>
+                    <span id="selection-global" class="disclosure-count" hidden></span>
+                    <svg class="icon disclosure-chevron" aria-hidden="true"><use href="#icon-chevron"/></svg>
+                  </summary>
+                  <div id="queue-list" class="queue-list"></div>
+                  <label id="history-option" class="history" hidden>
+                    <input type="checkbox" id="history">
+                    <span id="history-label">带入近期对话摘录</span>
+                  </label>
+                </details>
+                <button id="preview" class="primary" type="button" disabled>预览草稿<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+              </div>
             </div>
-            <div class="field asset-search-field">
-              <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
-              <label class="sr-only" for="asset-search">搜索资料</label>
-              <input id="asset-search" type="search" placeholder="搜索资料" autocomplete="off">
-              <button class="clear-search icon-button" id="clear-asset-search" type="button" aria-label="清除资料搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
-            </div>
-          </div>
-          <button id="native-history" class="secondary native-history" type="button" hidden>
-            <svg class="icon button-icon" aria-hidden="true"><use href="#icon-history"/></svg>接续原会话
-          </button>
-          <div id="library-panel" role="tabpanel" aria-labelledby="tab-memory">
-            <p id="asset-note" class="asset-note"></p>
-            <div id="asset-list" class="asset-list"></div>
-          </div>
+          </details>
         </div>
       </section>
-
-      <aside id="handoff" class="handoff" aria-label="接续清单" hidden>
-        <header class="handoff-heading">
-          <span class="handoff-mark"><svg class="icon" aria-hidden="true"><use href="#icon-bridge"/></svg></span>
-          <div class="handoff-heading-text">
-            <h2>接续清单</h2>
-            <p id="handoff-project" class="handoff-project"></p>
-          </div>
-          <span id="selection-count" class="queue-count" aria-live="polite"></span>
-        </header>
-        <div id="queue-list" class="queue-list"></div>
-        <label id="history-option" class="history">
-          <svg class="icon" aria-hidden="true"><use href="#icon-history"/></svg>
-          <span id="history-label">带入近期会话摘录</span>
-          <input type="checkbox" id="history">
-        </label>
-        <div class="actionbar">
-          <div class="compact-context">
-            <span id="compact-project" class="compact-project"></span>
-            <span id="compact-selection" class="compact-selection"></span>
-          </div>
-          <button id="preview" class="primary" type="button">预览交接<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
-        </div>
-      </aside>
     </div>
   </main>
 
@@ -188,10 +205,21 @@
         <button id="dialog-close" class="secondary icon-button" type="button" aria-label="关闭" title="关闭"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
       </header>
       <div class="dialog-content">
-        <div id="history-choice" class="session-choice history-choice" hidden>
-          <label for="history-select">选择一条来源会话</label>
-          <select id="history-select"></select>
-          <p id="history-path" class="muted"></p>
+        <div id="history-choice" class="history-choice" hidden>
+          <div class="field">
+            <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
+            <label class="sr-only" for="history-search">搜索来源对话</label>
+            <input id="history-search" type="search" placeholder="搜对话标题或 Agent" autocomplete="off">
+            <button class="clear-search icon-button" id="clear-history-search" type="button" aria-label="清除对话搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+          </div>
+          <p id="history-empty" class="recent-status" role="status"></p>
+          <ul id="history-results" class="conversation-list" aria-label="来源对话"></ul>
+          <button id="history-more" class="secondary" type="button" hidden>显示更多</button>
+        </div>
+        <div id="history-back" class="history-back" hidden>
+          <button id="history-back-button" class="text-action" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg>返回对话列表
+          </button>
         </div>
         <div id="dialog-text" class="dialog-text" tabindex="0"></div>
         <div id="session-choice" class="session-choice" hidden>
@@ -208,8 +236,9 @@
       <footer class="dialog-actions">
         <a id="export-download" class="secondary" download hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>下载 Markdown</a>
         <button id="export" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出 Markdown</button>
-        <button id="history-import" class="primary" type="button" hidden><span id="history-import-label">迁入并打开会话</span><svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
-        <button id="import" class="primary" type="button" hidden>导入并接续<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+        <button id="recover-draft" class="secondary" type="button" hidden>打开已创建的会话</button>
+        <button id="history-import" class="primary" type="button" hidden><span id="history-import-label">迁入并继续</span><svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+        <button id="import" class="primary" type="button" hidden>打开新对话<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
       </footer>
     </div>
   </dialog>

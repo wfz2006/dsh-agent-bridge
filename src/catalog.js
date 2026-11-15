@@ -435,23 +435,25 @@ export function createCatalog(loadConfig, { importConversation } = {}) {
     return ticket
   }
 
-  async function listConversations(projectId) {
+  async function listConversations(projectId, recent) {
     const current = await scan()
     const project = requireProject(current, projectId)
     const archives = project.archives
       .filter(canReadConversation)
       .sort((a, b) => dateMillis(b.date) - dateMillis(a.date))
     const seen = new Set()
-    const sessions = archives.flatMap(archive => {
+    const sessions = []
+    for (const archive of archives) {
       const id = conversationId(archive)
-      if (seen.has(id)) return []
+      if (seen.has(id)) continue
       seen.add(id)
-      return [{
+      if (recent && sessions.length === 3) continue
+      sessions.push({
         id, agent: archive.agent ?? archive.kind, date: dateMillis(archive.date),
         title: conversationTitle(archive.title), archivedSource: archive.kind === 'agentsview',
-      }]
-    })
-    return { sessions }
+      })
+    }
+    return recent ? { sessions, total: seen.size } : { sessions }
   }
 
   async function previewConversation({ projectId, sessionId }) {
@@ -550,7 +552,7 @@ export function createCatalog(loadConfig, { importConversation } = {}) {
       if (action === 'record-project-continuation') return recordProjectContinuation(input.ticket)
       if (action === 'list-conversations' || action === 'preview-conversation' || action === 'import-conversation') {
         if (!importConversation) throw new RequestError('当前 DSH 未提供会话迁入服务。', 409)
-        if (action === 'list-conversations') return listConversations(input.projectId)
+        if (action === 'list-conversations') return listConversations(input.projectId, input.recent === true)
         if (action === 'preview-conversation') return previewConversation(input)
         return commitConversation(input.ticket)
       }

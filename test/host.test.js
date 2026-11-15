@@ -23,7 +23,15 @@ test('the panel authenticates, refreshes changed project files, and exports revi
       if (typeof cleanup === 'function') cleanups.push(cleanup)
     },
     webServer: { register: route => routes.set(route.path, route.handler) },
-    connection: { requestRejection: req => req.headers.cookie === 'signed-in=yes' ? undefined : 'missing-cookie' },
+    connection: {
+      requestRejection: req => req.headers.cookie ? undefined : 401,
+      admit: req => {
+        if (req.headers.cookie === 'signed-in=yes') return { peer: { principal: { kind: 'owner' } } }
+        if (req.headers.cookie === 'signed-in=guest') return { peer: { principal: { kind: 'share-link' } } }
+        if (req.headers.cookie === 'signed-in=unknown') return { peer: {} }
+        return { rejection: 401 }
+      },
+    },
   })
   const server = createServer((req, res) => routes.get(req.url)(req, res))
   try {
@@ -79,6 +87,26 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     assert.deepEqual(selection.selection, { assetIds: [memory.id], history: false })
     const reviewed = await (await api({ action: 'preview', projectId: project.id, assetIds: [memory.id] })).json()
     assert.match(reviewed.prompt, /bridge-test-context/)
+    // Even with the owner's nonce, an admitted non-owner must not read or change local data.
+    const guest = { ...headers, Cookie: 'signed-in=guest' }
+    const forbidden = await Promise.all([
+      fetch(base + 'panel', { headers: guest }),
+      fetch(base + listing.agentIcons.copilot, { headers: guest }),
+      fetch(base + 'api', { method: 'POST', headers: { ...guest, Cookie: 'signed-in=unknown' }, body: '{' }),
+      ...[
+        { action: 'catalog' }, { action: 'detail', projectId: project.id },
+        { action: 'asset', projectId: project.id, assetId: memory.id },
+        { action: 'export', ticket: reviewed.ticket }, { action: 'open', ticket: reviewed.ticket },
+        { action: 'set-project-archive', projectIds: [project.id], archived: true },
+        { action: 'set-project-pin', projectId: project.id, pinned: false },
+        { action: 'set-project-selection', projectId: project.id, assetIds: [], history: true },
+      ].map(body => fetch(base + 'api', { method: 'POST', headers: guest, body: JSON.stringify(body) })),
+    ])
+    assert.deepEqual(forbidden.map(response => response.status), Array(forbidden.length).fill(403))
+    const stillOwnerState = await (await api({ action: 'detail', projectId: project.id })).json()
+    assert.equal(stillOwnerState.project.pinned, true)
+    assert.equal(stillOwnerState.project.archived, false)
+    assert.deepEqual(stillOwnerState.selection, { assetIds: [memory.id], history: false })
     assert.equal((await api({ action: 'record-project-continuation', ticket: reviewed.ticket })).status, 409)
     const opened = await (await api({ action: 'open', ticket: reviewed.ticket })).json()
     assert.equal(opened.path, directory)

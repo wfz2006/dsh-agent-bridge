@@ -1,13 +1,17 @@
+import { describeProjectContext } from './project-context.js'
+
 const byId = id => document.getElementById(id)
 const nonce = document.querySelector('meta[name=bridge-nonce]').content
 const dialog = byId('dialog')
 const importButton = byId('import')
+const recoverDraftButton = byId('recover-draft')
 const exportButton = byId('export')
 const exportDownload = byId('export-download')
 const dialogClose = byId('dialog-close')
 const dialogText = byId('dialog-text')
 const sessionSelect = byId('session-select')
-const historySelect = byId('history-select')
+const historySearch = byId('history-search')
+const historyResults = byId('history-results')
 const historyImport = byId('history-import')
 const refreshButton = byId('refresh')
 const agentFilter = byId('agent-filter')
@@ -26,10 +30,15 @@ const bulkArchive = byId('project-bulk-action')
 const archiveAction = byId('project-archive-action')
 const projectUndo = byId('project-undo')
 const projectPin = byId('project-pin')
-const assetList = byId('asset-list')
+const draftWorkflow = byId('draft-workflow')
+const projectMaterials = byId('project-materials')
+const globalLibrary = byId('global-library')
+const globalMaterials = byId('global-materials')
 const queueList = byId('queue-list')
+const recentList = byId('recent-conversations')
+const recentStatus = byId('recent-status')
+const browseHistory = byId('browse-history')
 const projectFilters = [...document.querySelectorAll('[data-project-state]')]
-const libraryTabs = ['memory', 'skill'].map(kind => byId(`tab-${kind}`))
 const compactLayout = matchMedia('(max-width: 700px)')
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)')
 const parentOrigin = window.origin === 'null' ? '*' : window.origin
@@ -41,7 +50,18 @@ const agentNames = {
 }
 const agentInitials = { claude: 'CC', codex: 'CX', workbuddy: 'WB', trae: 'TR', antigravity: 'AG' }
 const sourceStates = { ready: '可读取', partial: '部分可读', unavailable: '未找到', error: '读取失败' }
-const scopeNames = { project: '项目', agent: 'Agent 全局', shared: '共享' }
+const materialGroups = [
+  ['progress', '上次做到哪', '交接记录、最新进度和待办。'],
+  ['guides', '项目约定', '开发规则、操作指引和偏好。'],
+  ['used', '会话中提及的 Skills', '在这个项目的近期对话中有记录。'],
+  ['notes', '其他项目笔记', '经验、决策和存档，可按需带入。'],
+  ['skills', '其他项目 Skills', '放在项目目录里，按任务选用。'],
+]
+const globalGroups = [
+  ['guides', '通用指引'],
+  ['notes', '通用记忆'],
+  ['skills', '通用 Skills'],
+]
 let catalog = []
 let catalogLoaded = false
 let agentIcons = {}
@@ -53,9 +73,9 @@ let agentQuery = ''
 let agentQueryAt = 0
 let current
 let detail
+let context
 let detailRevision = 0
 let detailLoading = false
-let tab = 'memory'
 let projectState = 'all'
 let archiveAvailable = false
 let nativeSessionImport = false
@@ -80,14 +100,23 @@ let dialogMode
 let dialogEpoch = 0
 let dialogBusy = false
 let nativeSessions = []
+let recentRevision = 0
+let recentKey = ''
 let historyProject
+let historySessions
+let historyLimit = 30
+let historyChosenId
 let historyTicket
 let importedSessionId
+let draftRecovery
 let historyPreview = 0
 let downloadUrl
 let requestNumber = 0
 
 const clockFormat = new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium', hourCycle: 'h23' })
+const historyDateFormat = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' })
+const recentDateFormat = new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+const shortClock = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
 
 const agentName = value => Object.hasOwn(agentNames, value) ? agentNames[value] : String(value ?? '')
 const text = (tag, content, className) => {
@@ -456,12 +485,12 @@ function archiveFeedback(message, error = false) {
 function emptyProjectDetail(message) {
   current = undefined
   detail = undefined
+  context = undefined
   detailLoading = false
   ++detailRevision
   byId('empty').textContent = message
   byId('empty').hidden = false
   byId('project-detail').hidden = true
-  byId('handoff').hidden = true
   byId('preview').disabled = true
 }
 
@@ -520,26 +549,29 @@ async function updateProjectArchive(projectIds, archived, undo = false) {
 }
 
 function renderSelection() {
-  byId('selection-count').textContent = `${selected.size} 项`
-  byId('compact-selection').textContent = `${selected.size} 项资料${historyOption.checked ? ' · 含会话' : ''}`
-  byId('preview').disabled = !detail
-  if (!detail) return
+  if (!context) return
+  const entries = context.entries.filter(item => selected.has(item.id))
+  const skillCount = entries.filter(item => item.kind === 'skill').length
+  const memoryCount = entries.length - skillCount
+  const parts = [memoryCount ? `${memoryCount} 份记忆` : '', skillCount ? `${skillCount} 个 Skills` : ''].filter(Boolean)
+  const summary = parts.join('、') || '未选资料'
+  byId('selection-summary').textContent = `接续清单 · ${summary}${historyOption.checked ? ' + 摘录' : ''}`
+  const globalCount = entries.filter(item => item.global).length
+  byId('selection-global').textContent = `${globalCount} 项全局`
+  byId('selection-global').hidden = globalCount === 0
+  renderGlobalCount()
   const focused = queueList.contains(document.activeElement) ? document.activeElement.id : ''
   const scroll = queueList.scrollTop
-  const entries = [
-    ...detail.memories.map(item => [item, 'memory', '记忆']),
-    ...detail.skills.map(item => [item, 'skill', 'Skill']),
-  ].filter(([item]) => selected.has(item.id))
-  byId('handoff').dataset.empty = String(entries.length === 0)
-  queueList.replaceChildren(...(entries.length ? entries.map(([item, kind, type]) => {
+  queueList.replaceChildren(...(entries.length ? entries.map(item => {
     const row = text('div', '', 'queue-item')
-    const name = text('span', item.name, 'queue-title')
-    name.title = item.name
-    const kindLabel = text('span', type, 'queue-kind')
+    const title = materialName(item)
+    const name = text('span', title, 'queue-title')
+    name.title = title
+    const kindLabel = text('span', `${item.global ? '全局 ' : ''}${item.kind === 'memory' ? '记忆' : 'Skill'}`, 'queue-kind')
     const remove = text('button', '', 'queue-remove icon-button')
     remove.type = 'button'
     remove.id = `queue-remove-${item.id}`
-    remove.setAttribute('aria-label', `移除 ${item.name}`)
+    remove.setAttribute('aria-label', `移除 ${title}`)
     remove.append(icon('close'))
     remove.addEventListener('click', () => {
       const next = row.nextElementSibling ?? row.previousElementSibling
@@ -547,12 +579,12 @@ function renderSelection() {
       selected.delete(item.id)
       void saveProjectSelection()
       renderAssets()
-      const focusTarget = byId(focusId) ?? byId('preview')
+      const focusTarget = byId(focusId) ?? byId('handoff').querySelector('summary')
       focusTarget.focus({ preventScroll: true })
     })
-    row.append(icon(kind, 'queue-icon'), name, kindLabel, remove)
+    row.append(icon(item.kind, 'queue-icon'), name, kindLabel, remove)
     return row
-  }) : [text('p', '勾选资料后会列在这里。', 'queue-empty')]))
+  }) : [text('p', '尚未选择记忆或 Skills。', 'queue-empty')]))
   queueList.scrollTop = scroll
   if (focused) byId(focused)?.focus({ preventScroll: true })
 }
@@ -583,105 +615,143 @@ async function flushProjectSelection(projectId) {
   }
 }
 
+function materialName(asset) {
+  if (asset.kind === 'skill') return asset.name
+  if (/^memory[-_]summary$/i.test(asset.name)) return '记忆摘要'
+  if (/^memory$/i.test(asset.name)) return asset.global ? '长期记忆' : '项目记忆'
+  if (asset.group === 'guides' && /^(?:AGENTS|CLAUDE|GEMINI|QWEN|USER|SOUL)$/i.test(asset.name)) {
+    const label = asset.agent === 'shared' ? '' : `${agentName(asset.agent)} `
+    return label + (asset.global ? '全局指引' : '项目指引')
+  }
+  if (/^current[- _]state$/i.test(asset.name)) return '当前状态'
+  if (/^latest[- _]handoff$/i.test(asset.name)) return '最新交接'
+  return asset.name
+}
+
+function matchesMaterial(asset, query) {
+  return [materialName(asset), asset.name, agentName(asset.agent), asset.file, asset.detail]
+    .some(value => value?.toLowerCase().includes(query))
+}
+
+function renderGlobalCount() {
+  const assets = context.entries.filter(asset => asset.global)
+  const query = assetSearch.value.trim().toLowerCase()
+  const count = query ? assets.filter(asset => matchesMaterial(asset, query)).length : assets.length
+  const checked = assets.filter(asset => selected.has(asset.id)).length
+  globalLibrary.hidden = assets.length === 0
+  byId('global-count').textContent = `${count} ${query ? '项匹配' : '项'}${checked ? ` · ${checked} 已选` : ''}`
+}
+
+function makeMaterialRow(asset) {
+  const name = materialName(asset)
+  const row = text('div', '', 'asset-row')
+  const checkbox = document.createElement('input')
+  checkbox.type = 'checkbox'
+  checkbox.className = 'asset-check'
+  checkbox.id = `asset-${asset.id}`
+  checkbox.checked = selected.has(asset.id)
+  row.dataset.selected = String(checkbox.checked)
+  checkbox.addEventListener('change', () => {
+    if (checkbox.checked && selected.size >= 24) {
+      checkbox.checked = false
+      status('每次最多选择 24 项资料。', true, 'selection-feedback')
+      return
+    }
+    if (checkbox.checked) selected.add(asset.id)
+    else selected.delete(asset.id)
+    row.dataset.selected = String(checkbox.checked)
+    status('', false, 'selection-feedback')
+    renderSelection()
+    void saveProjectSelection()
+  })
+  const label = text('label', '', 'asset-label')
+  label.htmlFor = checkbox.id
+  label.title = name === asset.name ? asset.file : `${asset.name}\n${asset.file}`
+  const title = text('span', name, 'asset-title')
+  const meta = text('span', '', 'asset-meta')
+  if (asset.agent) meta.append(agentLabel(asset.agent))
+  if (!asset.global && context.suggestedIds.includes(asset.id)) {
+    meta.append(text('span', '建议带入', 'material-suggestion'))
+  } else if (asset.global && asset.used) {
+    meta.append(text('span', '近期会话提及', 'material-suggestion'))
+  }
+  label.append(title, meta)
+  const button = text('button', '', 'asset-view')
+  button.append(document.createTextNode('查看'), icon('chevron'))
+  button.type = 'button'
+  button.id = `asset-view-${asset.id}`
+  button.setAttribute('aria-label', `查看 ${name}`)
+  button.addEventListener('click', () => viewAsset(asset))
+  const marker = text('span', '', 'asset-icon')
+  marker.append(icon(asset.kind))
+  row.append(checkbox, marker, label, button)
+  return row
+}
+
+function fillMaterials(target, groups, assets, emptyMessage) {
+  const scroll = target.scrollTop
+  const focused = target.contains(document.activeElement) ? document.activeElement.id : ''
+  const sections = groups.flatMap(([key, title, note]) => {
+    const members = assets.filter(item => item.group === key)
+    if (!members.length) return []
+    const group = text('section', '', 'asset-group')
+    const heading = text('h4', title, 'asset-group-heading')
+    heading.append(text('span', String(members.length), 'disclosure-count'))
+    group.append(heading)
+    if (note) group.append(text('p', note, 'asset-group-note'))
+    group.append(...members.map(makeMaterialRow))
+    return [group]
+  })
+  target.replaceChildren(...(sections.length ? sections : [text('p', emptyMessage, 'asset-empty')]))
+  target.scrollTop = scroll
+  if (focused) byId(focused)?.focus({ preventScroll: true })
+}
+
+function renderGlobalMaterials() {
+  if (!context || !globalLibrary.open) return
+  const query = assetSearch.value.trim().toLowerCase()
+  fillMaterials(globalMaterials, globalGroups, context.entries.filter(item => item.global && matchesMaterial(item, query)), '没有匹配的全局资料。')
+}
+
 function renderAssets() {
-  if (!detail) return
-  const isMemory = tab === 'memory'
+  if (!context || !draftWorkflow.open) return
   const query = assetSearch.value.trim().toLowerCase()
   syncSearch(assetSearch)
-  const assets = (isMemory ? detail.memories : detail.skills)
-    .filter(asset => [asset.name, asset.agent, asset.file].some(value => value.toLowerCase().includes(query)))
-  libraryTabs.forEach((button, index) => {
-    const active = isMemory === (index === 0)
-    button.setAttribute('aria-selected', String(active))
-    button.tabIndex = active ? 0 : -1
-  })
-  byId('library-panel').setAttribute('aria-labelledby', `tab-${tab}`)
-  const note = byId('asset-note')
-  const used = detail.usedSkills
-  note.textContent = isMemory || !used.length ? ''
-    : `会话中记录的 Skills · ${used.slice(0, 4).join('、')}${used.length > 4 ? ` +${used.length - 4}` : ''}`
-  note.title = isMemory ? '' : used.join('、')
-  const rows = assets.map(asset => {
-    const row = document.createElement('div')
-    row.className = 'asset-row'
-    const checkbox = document.createElement('input')
-    checkbox.type = 'checkbox'
-    checkbox.className = 'asset-check'
-    checkbox.id = `asset-${asset.id}`
-    checkbox.checked = selected.has(asset.id)
-    row.dataset.selected = String(checkbox.checked)
-    checkbox.addEventListener('change', () => {
-      if (checkbox.checked && selected.size >= 24) {
-        checkbox.checked = false
-        status('每次交接最多选择 24 项资料。', true)
-        return
-      }
-      if (checkbox.checked) selected.add(asset.id)
-      else selected.delete(asset.id)
-      row.dataset.selected = String(checkbox.checked)
-      status('')
-      renderSelection()
-      void saveProjectSelection()
-    })
-    const label = text('label', '', 'asset-label')
-    label.htmlFor = checkbox.id
-    label.title = asset.file
-    const title = text('span', asset.name, 'asset-title')
-    const meta = text('span', '', 'asset-meta')
-    if (asset.agent) meta.append(agentLabel(asset.agent))
-    if (asset.scope) meta.append(text('span', scopeNames[asset.scope] ?? asset.scope, 'asset-scope'))
-    if (asset.used) meta.append(text('span', '会话提及', 'chip used-skill'))
-    label.append(title, meta)
-    const button = text('button', '', 'asset-view')
-    button.append(document.createTextNode('查看'), icon('chevron'))
-    button.type = 'button'
-    button.id = `asset-view-${asset.id}`
-    button.setAttribute('aria-label', `查看 ${asset.name}`)
-    button.addEventListener('click', () => viewAsset(asset))
-    const marker = text('span', '', 'asset-icon')
-    marker.dataset.kind = tab
-    marker.append(icon(tab))
-    row.append(checkbox, marker, label, button)
-    return row
-  })
-  const scroll = assetList.scrollTop
-  const focused = assetList.contains(document.activeElement) ? document.activeElement.id : ''
-  assetList.replaceChildren(...(rows.length ? rows : [
-    text('p', query ? '没有匹配的资料。' : (isMemory ? '这个项目暂无可读记忆。' : '这个项目暂无可读 Skills。'), 'asset-empty'),
-  ]))
-  assetList.scrollTop = scroll
-  if (focused) byId(focused)?.focus({ preventScroll: true })
+  fillMaterials(projectMaterials, materialGroups, context.entries.filter(item => !item.global && matchesMaterial(item, query)),
+    query ? '没有匹配的项目资料。' : '没有找到项目专用资料。你也可以直接预览草稿。')
+  renderGlobalMaterials()
   renderSelection()
 }
 
 function applyDetail(project, loaded, preserve) {
-  const latest = catalog.find(item => item.id === project.id) ?? project
-  current = { ...(loaded.project ?? latest), archived: Boolean(latest.archived), pinned: Boolean(latest.pinned) }
+  showProject(loaded.project ?? project)
   detail = loaded
+  context = describeProjectContext(loaded)
   if (!preserve) {
     const saved = projectSelections.get(project.id) ?? loaded.selection
     if (saved) {
       selected = new Set(saved.assetIds)
       includeHistory = saved.history
     } else {
-      const recommended = detail.memories.filter(item => item.agent !== 'export'
-        && /(?:当前状态|最新交接|current[- _]state|latest[- _]handoff)/i.test(item.name)).slice(0, 3)
-      const observed = detail.skills.filter(item => item.used && item.scope === 'project').slice(0, 3)
-      selected = new Set([...recommended, ...observed].map(item => item.id))
-      includeHistory = detail.historyCount > 0
+      selected = new Set(context.suggestedIds)
+      includeHistory = false
     }
   }
-  const available = new Set([...detail.memories, ...detail.skills].map(item => item.id))
+  const available = new Set(context.entries.map(item => item.id))
   selected = new Set([...selected].filter(id => available.has(id)))
   historyOption.checked = includeHistory && detail.historyCount > 0
   historyOption.disabled = detail.historyCount === 0
   byId('history-option').hidden = detail.historyCount === 0
-  byId('history-label').textContent = `近期会话 · ${Math.min(8, detail.historyCount)} 条`
+  byId('history-label').textContent = `带入近期对话摘录（最多 ${Math.min(8, detail.historyCount)} 条消息）`
+  byId('preview').disabled = false
+  assetSearch.disabled = false
+  renderAssets()
+}
+
+function showProject(project) {
+  const latest = catalog.find(item => item.id === project.id) ?? project
+  current = { ...project, archived: Boolean(latest.archived), pinned: Boolean(latest.pinned) }
   byId('project-name').textContent = current.name
-  for (const label of [byId('handoff-project'), byId('compact-project')]) {
-    label.textContent = current.name
-    label.title = current.cwd
-  }
   byId('project-path').textContent = current.cwd
   byId('project-path').title = current.cwd
   const availability = text('span', current.online ? '原目录可用' : '原目录不可访问', 'chip availability')
@@ -697,13 +767,8 @@ function applyDetail(project, loaded, preserve) {
   byId('project-archive-action-icon').setAttribute('href', current.archived ? '#icon-restore' : '#icon-archive')
   archiveAction.disabled = archiveBusy
   renderPin()
-  libraryTabs[0].querySelector('.tab-count').textContent = detail.memories.length
-  libraryTabs[1].querySelector('.tab-count').textContent = detail.skills.length
-  byId('native-history').hidden = !nativeSessionImport || !current.hasConversations
   byId('empty').hidden = true
   byId('project-detail').hidden = false
-  byId('handoff').hidden = false
-  renderAssets()
 }
 
 function revealProjectDetail() {
@@ -713,35 +778,121 @@ function revealProjectDetail() {
   heading.closest('.detail').scrollIntoView({ block: 'start', behavior: reducedMotion.matches ? 'instant' : 'smooth' })
 }
 
+function makeConversationRow(session, open) {
+  const row = text('li', '', 'conversation-item')
+  const button = text('button', '', 'conversation-row')
+  button.type = 'button'
+  button.dataset.session = session.id
+  const title = session.title || '未命名对话'
+  button.title = title
+  const info = text('span', '', 'conversation-info')
+  const meta = text('span', agentName(session.agent), 'conversation-meta')
+  if (session.archivedSource) meta.append(text('span', ' · 本地存档'))
+  const date = new Date(session.date)
+  if (session.date > 0 && Number.isFinite(date.getTime())) {
+    const today = new Date()
+    const yesterday = new Date(today)
+    yesterday.setDate(today.getDate() - 1)
+    const day = date.toDateString()
+    const display = day === today.toDateString() ? `今天 ${shortClock.format(date)}`
+      : day === yesterday.toDateString() ? `昨天 ${shortClock.format(date)}`
+        : date.getFullYear() === today.getFullYear() ? recentDateFormat.format(date) : historyDateFormat.format(date)
+    const timestamp = text('time', display)
+    timestamp.dateTime = date.toISOString()
+    timestamp.title = historyDateFormat.format(date)
+    meta.append(text('span', ' · '), timestamp)
+  }
+  info.append(text('span', title, 'conversation-title'), meta)
+  const action = text('span', '', 'conversation-action')
+  action.append(text('span', '预览'), icon('chevron'))
+  button.append(agentMark(session.agent), info, action)
+  button.addEventListener('click', () => open(session))
+  row.append(button)
+  return row
+}
+
+function resetRecentConversations() {
+  recentRevision++
+  recentKey = ''
+  recentList.replaceChildren()
+  browseHistory.hidden = true
+}
+
+async function loadRecentConversations(project) {
+  const revision = ++recentRevision
+  const isCurrent = () => current?.id === project.id && recentRevision === revision
+  if (!nativeSessionImport || !project.hasConversations) {
+    resetRecentConversations()
+    recentStatus.textContent = nativeSessionImport
+      ? '这个项目还没有可迁入的对话。可以用项目资料开新对话。'
+      : '当前 DSH 不支持迁入旧对话。可以用项目资料开新对话。'
+    return
+  }
+  if (!recentKey) recentStatus.textContent = '正在查找最近对话…'
+  try {
+    const { sessions, total } = await api('list-conversations', { projectId: project.id, recent: true })
+    if (!isCurrent()) return
+    const key = JSON.stringify(sessions)
+    if (key !== recentKey) {
+      const active = recentList.contains(document.activeElement) ? document.activeElement.dataset.session : ''
+      recentList.replaceChildren(...sessions.map(session => makeConversationRow(session, item => openSourceConversation(item))))
+      if (active) ([...recentList.querySelectorAll('button')].find(button => button.dataset.session === active)
+        ?? byId('continue-heading')).focus({ preventScroll: true })
+      recentKey = key
+    }
+    recentStatus.textContent = sessions.length
+      ? (current.online ? '' : '原工作目录不可访问，暂时只能预览。')
+      : '这个项目还没有可迁入的对话。可以用项目资料开新对话。'
+    byId('browse-history-label').textContent = `查看全部 ${total ?? sessions.length} 条对话`
+    browseHistory.hidden = (total ?? sessions.length) <= sessions.length
+  } catch {
+    if (!isCurrent()) return
+    recentStatus.textContent = recentList.childElementCount
+      ? '暂时无法刷新对话列表，可稍后重试。'
+      : '暂时读不到对话列表。可以刷新来源，或用项目资料开新对话。'
+  }
+}
+
 async function selectProject(project, reveal = false) {
   if (!filteredProjects().some(item => item.id === project.id)) return
   if (current?.id === project.id && (detail || detailLoading)) {
-    if (detail && reveal) revealProjectDetail()
+    if (reveal) revealProjectDetail()
     return
   }
   const revision = ++detailRevision
-  current = project
   detail = undefined
+  context = undefined
   detailLoading = true
   selected = new Set()
-  tab = 'memory'
   assetSearch.value = ''
-  byId('empty').textContent = '正在读取项目资料…'
-  byId('empty').hidden = false
-  byId('project-detail').hidden = true
-  byId('handoff').hidden = true
+  syncSearch(assetSearch)
+  draftWorkflow.open = false
+  globalLibrary.open = false
+  globalLibrary.hidden = true
+  byId('handoff').open = false
+  byId('history-option').hidden = true
+  byId('selection-global').hidden = true
+  byId('selection-summary').textContent = '接续清单'
+  byId('preview').disabled = true
+  assetSearch.disabled = true
+  status('', false, 'selection-feedback')
+  projectMaterials.replaceChildren(text('p', '正在读取项目资料…', 'asset-empty'))
+  globalMaterials.replaceChildren()
+  queueList.replaceChildren()
+  resetRecentConversations()
+  showProject(project)
   renderProjects()
+  if (reveal) revealProjectDetail()
+  void loadRecentConversations(project)
   try {
     const pendingSelection = selectionSaves.get(project.id)
     if (pendingSelection) await pendingSelection
     if (revision !== detailRevision) return
     const loaded = await api('detail', { projectId: project.id })
     if (revision !== detailRevision) return
-    byId('asset-list').scrollTop = 0
     applyDetail(project, loaded, false)
-    if (reveal) revealProjectDetail()
   } catch (error) {
-    if (revision === detailRevision) byId('empty').textContent = error.message
+    if (revision === detailRevision) projectMaterials.replaceChildren(text('p', error.message, 'asset-empty error'))
   } finally {
     if (revision === detailRevision) detailLoading = false
   }
@@ -795,9 +946,15 @@ async function refresh(force, automatic = false) {
     renderProjects()
     const previous = matches.find(project => project.id === current?.id)
     const revision = detailRevision
-    if (previous && detail) {
-      const loaded = await api('detail', { projectId: previous.id })
-      if (revision === detailRevision && !dialog.open) applyDetail(previous, loaded, true)
+    if (previous && !detailLoading) {
+      if (!detail) {
+        void selectProject(previous)
+      } else {
+        showProject(previous)
+        void loadRecentConversations(previous)
+        const loaded = await api('detail', { projectId: previous.id })
+        if (revision === detailRevision && !dialog.open) applyDetail(previous, loaded, true)
+      }
     }
     sourceRevision = result.revision ?? sourceRevision
     liveState('实时扫描已开启', result.scannedAt)
@@ -866,32 +1023,38 @@ function setDialogBusy(busy) {
   dialogBusy = busy
   dialogClose.disabled = busy
   importButton.disabled = busy
+  recoverDraftButton.disabled = busy
   exportButton.disabled = busy
   sessionSelect.disabled = busy
-  historySelect.disabled = busy
+  byId('history-back-button').disabled = busy
   historyImport.disabled = busy
 }
 
-function showDialog(mode, title, note, body) {
+function showDialog(mode, title, note, body, assetKind = 'memory') {
   dialogMode = mode
   dialog.dataset.mode = mode
   ticket = undefined
   nativeSessions = []
   historyProject = undefined
+  historySessions = undefined
+  historyChosenId = undefined
   historyTicket = undefined
   importedSessionId = undefined
+  draftRecovery = undefined
   clearDownload()
   byId('dialog-title').textContent = title
   byId('dialog-note').textContent = note
-  byId('dialog-mark').replaceChildren(icon(mode === 'session' ? 'download' : mode === 'asset' ? tab : 'bridge'))
+  byId('dialog-mark').replaceChildren(icon(mode === 'session' ? 'download' : mode === 'asset' ? assetKind : mode === 'history' ? 'history' : 'bridge'))
   dialogText.hidden = false
   dialogText.dataset.format = 'plain'
   dialogText.textContent = body
   dialogText.closest('.dialog-content').scrollTop = 0
   byId('session-choice').hidden = true
   byId('history-choice').hidden = true
+  byId('history-back').hidden = true
   status('', false, 'dialog-status')
   importButton.hidden = true
+  recoverDraftButton.hidden = true
   exportButton.hidden = true
   historyImport.hidden = true
   setDialogBusy(false)
@@ -901,57 +1064,97 @@ function showDialog(mode, title, note, body) {
   return ++dialogEpoch
 }
 
-async function chooseSourceConversation() {
+function startHistoryDialog(title, note, body) {
   const project = current
-  if (!project || !detail || !nativeSessionImport || !filteredProjects().some(item => item.id === project.id)) return
-  const epoch = showDialog('history', '接续原会话', '导入可读取的用户和助手文字。工具执行、附件和运行状态留在原 Agent。', '正在读取会话列表…')
+  if (dialog.open || !project || !nativeSessionImport || !filteredProjects().some(item => item.id === project.id)) return
+  const epoch = showDialog('history', title, note, body)
   historyProject = project
-  byId('history-path').textContent = project.cwd
+  return epoch
+}
+
+const historyNote = '迁入用户与助手的文字消息。工具记录、附件和运行状态留在来源 Agent。'
+
+function openSourceConversation(session) {
+  if (startHistoryDialog('继续旧对话', historyNote, '正在读取这条对话…') === undefined) return
+  void previewSourceConversation(session)
+}
+
+async function chooseSourceConversation() {
+  const epoch = startHistoryDialog('查看全部对话', '选择一条对话以预览历史消息。', '正在读取对话列表…')
+  if (epoch === undefined) return
   try {
-    const { sessions } = await api('list-conversations', { projectId: project.id })
+    const { sessions } = await api('list-conversations', { projectId: historyProject.id })
     if (!dialog.open || dialogEpoch !== epoch) return
-    if (!sessions.length) {
-      dialogText.textContent = '这个项目暂无可迁入的会话。'
-      return
-    }
-    const dateFormat = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' })
-    historySelect.replaceChildren(...sessions.map((session, index) => {
-      const date = new Date(session.date)
-      const timestamp = session.date > 0 && Number.isFinite(date.getTime()) ? dateFormat.format(date) : ''
-      const label = [agentName(session.agent), session.archivedSource ? 'AgentsView' : '', timestamp,
-        session.title || '会话 ' + (index + 1)].filter(Boolean).join(' · ')
-      return new Option(label, session.id)
-    }))
-    byId('history-choice').hidden = false
-    historySelect.focus()
-    await previewSourceConversation()
+    historySessions = sessions
+    historySearch.value = ''
+    historyLimit = 30
+    showHistoryResults()
   } catch (error) {
     if (dialog.open && dialogEpoch === epoch) dialogText.textContent = error.message
   }
 }
 
-async function previewSourceConversation() {
-  const epoch = dialogEpoch
-  const revision = ++historyPreview
+function renderHistoryResults() {
+  const query = historySearch.value.trim().toLowerCase()
+  syncSearch(historySearch)
+  const matches = historySessions.filter(session => [session.title, agentName(session.agent)]
+    .some(value => value?.toLowerCase().includes(query)))
+  historyResults.replaceChildren(...matches.slice(0, historyLimit).map(session => makeConversationRow(session, previewSourceConversation)))
+  byId('history-empty').textContent = matches.length ? '' : (query ? '没有找到匹配的对话。' : '这个项目暂无可迁入的对话。')
+  byId('history-more').hidden = matches.length <= historyLimit
+}
+
+function showHistoryResults() {
+  if (!historySessions) return
+  historyPreview++
   historyTicket = undefined
   importedSessionId = undefined
   historyImport.hidden = true
-  byId('history-import-label').textContent = '迁入并打开会话'
+  byId('history-back').hidden = true
+  byId('dialog-title').textContent = '查看全部对话'
+  byId('dialog-note').textContent = '选择一条对话以预览历史消息。'
+  dialogText.hidden = true
+  byId('history-choice').hidden = false
+  status('', false, 'dialog-status')
+  renderHistoryResults()
+  dialogText.closest('.dialog-content').scrollTop = 0
+  const previous = historyChosenId && [...historyResults.querySelectorAll('button')].find(button => button.dataset.session === historyChosenId)
+  ;(previous || historySearch).focus()
+}
+
+async function previewSourceConversation(session) {
+  const epoch = dialogEpoch
+  const revision = ++historyPreview
+  historyChosenId = session.id
+  historyTicket = undefined
+  importedSessionId = undefined
+  historyImport.hidden = true
+  byId('history-import-label').textContent = '迁入并继续'
+  byId('history-choice').hidden = true
+  byId('history-back').hidden = !historySessions
+  byId('dialog-title').textContent = '继续旧对话'
+  byId('dialog-note').textContent = historyNote
+  dialogText.hidden = false
   dialogText.dataset.format = 'plain'
-  dialogText.textContent = '正在读取这条会话…'
+  dialogText.textContent = '正在读取这条对话…'
+  dialogText.closest('.dialog-content').scrollTop = 0
+  if (historySessions) byId('history-back-button').focus()
+  else dialogText.focus({ preventScroll: true })
   status('', false, 'dialog-status')
   try {
-    const result = await api('preview-conversation', { projectId: historyProject.id, sessionId: historySelect.value })
+    const result = await api('preview-conversation', { projectId: historyProject.id, sessionId: session.id })
     if (!dialog.open || dialogEpoch !== epoch || revision !== historyPreview) return
     historyTicket = result.ticket
     const title = text('h3', result.title, 'preview-lead')
+    const source = text('p', '', 'preview-context history-source')
+    source.append(agentLabel(session.agent), text('code', result.cwd || historyProject.cwd, 'preview-source'))
     const summary = text('p', [
       result.messages.length + ' 条文字消息',
       result.truncated ? '源记录或读取范围有限，部分历史未带入' : '',
       result.canImport ? '' : '原工作目录不可访问，当前可预览',
     ].filter(Boolean).join(' · '), 'preview-context')
     dialogText.dataset.format = 'history'
-    dialogText.replaceChildren(title, summary, ...result.messages.map(message => {
+    dialogText.replaceChildren(title, source, summary, ...result.messages.map(message => {
       const row = text('section', '', 'history-message')
       row.dataset.role = message.role
       row.append(text('h3', message.role === 'user' ? '用户' : '助手'), text('p', message.text, 'preview-body'))
@@ -1011,7 +1214,7 @@ function renderHandoff({ intro, sections, footer }) {
 
 async function viewAsset(asset) {
   const project = current
-  const epoch = showDialog('asset', asset.name, asset.file, '正在读取…')
+  const epoch = showDialog('asset', materialName(asset), asset.file, '正在读取…', asset.kind)
   try {
     const result = await api('asset', { projectId: project.id, assetId: asset.id })
     if (!dialog.open || dialogEpoch !== epoch) return
@@ -1027,7 +1230,7 @@ async function preview() {
   const note = project.online
     ? '可导出 Markdown，或在原工作目录打开 DSH 会话并继续编辑草稿。'
     : '原工作目录不可访问。可将现有交接资料导出为 Markdown。'
-  const epoch = showDialog('handoff', `交接预览 · ${project.name}`, note, '正在准备…')
+  const epoch = showDialog('handoff', `草稿预览 · ${project.name}`, note, '正在准备…')
   try {
     const result = await api('preview', { projectId: project.id, assetIds: [...selected], history: historyOption.checked })
     if (!dialog.open || dialogEpoch !== epoch) return
@@ -1065,13 +1268,28 @@ function requestParent(type, values, requestId = `bridge-${Date.now()}-${++reque
 async function importSession() {
   if (!ticket || dialogBusy || importButton.hidden) return
   setDialogBusy(true)
-  status('正在创建 DSH 会话…', false, 'dialog-status')
+  status(draftRecovery ? '正在重试填入草稿…' : '正在创建 DSH 会话…', false, 'dialog-status')
   try {
     const { path, prompt } = await api('open', { ticket })
     await requestParent('open', { path, prompt, bridgeNonce: nonce }, ticket)
     ticket = undefined
     dialog.close()
     status('DSH 会话已打开。交接草稿已填入输入框。')
+  } catch (error) {
+    if (Object.hasOwn(error, 'recoverySessionId')) draftRecovery = error.recoverySessionId
+    recoverDraftButton.hidden = !draftRecovery
+    status(error.message, true, 'dialog-status')
+  } finally {
+    setDialogBusy(false)
+  }
+}
+
+async function recoverDraftSession() {
+  if (!ticket || !draftRecovery || dialogBusy) return
+  setDialogBusy(true)
+  try {
+    await requestParent('recover-draft', { sessionId: draftRecovery }, ticket)
+    dialog.close()
   } catch (error) {
     status(error.message, true, 'dialog-status')
   } finally {
@@ -1179,14 +1397,6 @@ async function copyProjectPath() {
   }
 }
 
-function switchTab(index, focus = false) {
-  tab = index === 0 ? 'memory' : 'skill'
-  assetSearch.value = ''
-  assetList.scrollTop = 0
-  renderAssets()
-  if (focus) libraryTabs[index].focus()
-}
-
 function wireClear(input, action) {
   input.parentElement.querySelector('.clear-search').addEventListener('click', () => {
     input.value = ''
@@ -1203,7 +1413,9 @@ window.addEventListener('message', event => {
   pending = undefined
   clearTimeout(request.timer)
   if (data.ok) request.resolve(data)
-  else request.reject(new Error(data.error || 'DSH 暂无法完成此操作。'))
+  else request.reject(Object.assign(new Error(data.error || 'DSH 暂无法完成此操作。'), {
+    recoverySessionId: typeof data.recoverySessionId === 'string' ? data.recoverySessionId : undefined,
+  }))
 })
 refreshButton.addEventListener('click', () => refresh(true))
 projectSearch.addEventListener('input', event => {
@@ -1247,6 +1459,8 @@ window.addEventListener('scroll', positionAgentPicker, { passive: true })
 assetSearch.addEventListener('input', renderAssets)
 wireClear(projectSearch, updateProjectSearch)
 wireClear(assetSearch, renderAssets)
+draftWorkflow.addEventListener('toggle', renderAssets)
+globalLibrary.addEventListener('toggle', renderGlobalMaterials)
 projectManage.addEventListener('click', () => {
   managingProjects = !managingProjects
   selectedProjects.clear()
@@ -1298,23 +1512,24 @@ historyOption.addEventListener('change', () => {
   renderSelection()
   void saveProjectSelection()
 })
-libraryTabs.forEach((button, index) => {
-  button.addEventListener('click', () => switchTab(index))
-  button.addEventListener('keydown', event => {
-    let next
-    if (event.key === 'Home') next = 0
-    if (event.key === 'End') next = libraryTabs.length - 1
-    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') next = (index + 1) % libraryTabs.length
-    if (next === undefined) return
-    event.preventDefault()
-    switchTab(next, true)
-  })
-})
 byId('copy-path').addEventListener('click', copyProjectPath)
 byId('preview').addEventListener('click', preview)
 byId('native-export').addEventListener('click', chooseNativeSession)
-byId('native-history').addEventListener('click', chooseSourceConversation)
-historySelect.addEventListener('change', previewSourceConversation)
+browseHistory.addEventListener('click', chooseSourceConversation)
+byId('history-back-button').addEventListener('click', showHistoryResults)
+function searchHistory() {
+  historyChosenId = undefined
+  historyLimit = 30
+  renderHistoryResults()
+}
+historySearch.addEventListener('input', searchHistory)
+wireClear(historySearch, searchHistory)
+byId('history-more').addEventListener('click', () => {
+  const index = historyResults.childElementCount
+  historyLimit += 30
+  renderHistoryResults()
+  historyResults.children[index]?.querySelector('button')?.focus()
+})
 historyImport.addEventListener('click', importSourceConversation)
 sessionSelect.addEventListener('change', clearDownload)
 sessionSelect.addEventListener('change', renderSessionPath)
@@ -1333,6 +1548,7 @@ dialog.addEventListener('close', () => {
   schedulePoll(0)
 })
 importButton.addEventListener('click', importSession)
+recoverDraftButton.addEventListener('click', recoverDraftSession)
 exportButton.addEventListener('click', exportMarkdown)
 document.addEventListener('visibilitychange', () => schedulePoll(0))
 for (const button of themeOptions) button.addEventListener('click', () => setTheme(button.dataset.themeChoice))

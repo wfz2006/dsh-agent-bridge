@@ -49,6 +49,7 @@ test('a reviewed conversation imports only that session, preserving repeated mes
   const other = projects.find(item => item.cwd === otherCwd)
   const { sessions } = await catalog.execute('list-conversations', { projectId: project.id })
   assert.equal(sessions.length, 2)
+  assert.deepEqual(sessions.map(session => session.title).sort(), ['Remember the blue key.', 'unselected chat'])
   const { sessions: [foreign] } = await catalog.execute('list-conversations', { projectId: other.id })
   await assert.rejects(catalog.execute('preview-conversation', { projectId: project.id, sessionId: foreign.id }), { status: 404 })
   await assert.rejects(catalog.execute('import-conversation', { ticket: 'arbitrary' }), { status: 409 })
