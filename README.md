@@ -4,11 +4,11 @@
 
 **浏览本机其他 Agent 的项目、记忆和 Skills，在原工作目录继续开发。**
 
-[![Release](https://img.shields.io/github/v/release/wfz2006/dsh-agent-bridge?style=flat-square&label=release&color=2EA043)](https://github.com/wfz2006/dsh-agent-bridge/releases)
+[![Version](https://img.shields.io/badge/version-v0.8.2-2459D7?style=flat-square)](https://github.com/wfz2006/dsh-agent-bridge/tree/v0.8.2)
 [![DSH Plugin](https://img.shields.io/badge/DSH-plugin-4B6EF5?style=flat-square)](https://awesome-dsh-plugin.com/)
 [![Tests](https://img.shields.io/badge/tests-41%2F41-2EA043?style=flat-square)](#卸载与构建)
 
-[下载安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [快速开始](#快速开始) · [功能](#功能) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
+[最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [v0.8.2 更新](#v082-更新) · [快速开始](#快速开始) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
 
 <a href="https://wfz2006.github.io/dsh-agent-bridge/"><img src="docs/screenshots/v0.8.2/01-recent-conversations.png" width="920" alt="Agent Bridge：项目列表与继续旧对话"></a>
 
@@ -23,6 +23,13 @@
 | 导出交接 | 多 Agent 来源 | 本机只读 |
 | :--- | :--- | :--- |
 | 导出 Markdown 交接，或导出 DSH 会话记录。 | Codex、Claude Code、Copilot、OpenCode、Qoder、WorkBuddy、Gemini CLI、Qwen Code、Antigravity、TRAE。 | 通过本机已认证的 DSH Host 读取，源文件与 Agent 数据库只读访问。 |
+
+## v0.8.2 更新
+
+- **继续旧对话放到首屏**：直接显示最近几条来源对话，预览用户与助手的文字后再迁入一条新的 DSH 原生会话。
+- **项目资料按用途分组**：上次做到哪、项目约定、会话中提到的 Skills 和其他笔记分开显示；全局资料默认折叠且不自动勾选，每个项目的选择会独立保留。
+- **真实数据更可靠**：自动发现 Codex `.jsonl.zst` 会话及索引中仍指向旧路径的压缩记录，大型历史按流式方式读取；运行环境包装信息不会覆盖同一消息里的真实提问。
+- **权限和失败恢复更明确**：面板仅接受本机 DSH 所有者身份。草稿初始化失败时会归档空白会话并复用同一会话重试；已有草稿保持原样，可打开原会话手动恢复。
 
 ## 界面
 
@@ -49,7 +56,7 @@
 
 ## 快速开始
 
-1. 下载 [已发布的 dsh-agent-bridge.tgz](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)，或从当前源码运行 `npm pack` 构建。
+1. 下载 [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)，或从 [v0.8.2 源码](https://github.com/wfz2006/dsh-agent-bridge/tree/v0.8.2) 运行 `npm pack` 构建。
 2. 打开 **DSH Desktop → 插件 → 安装插件**，选择这个文件。
 3. **完全退出 DSH 后再打开**，侧栏会出现 **Agent 工作接续**。
 
@@ -65,7 +72,7 @@ dsh web
 
 </details>
 
-发行包只依赖 DSH 的运行时。本版在 Windows 的官方 DSH Desktop 和 Web 0.2.2-rc.1 验收；原生会话入口依赖对应的 DSH 客户端服务。macOS 和 Linux 的数据路径规则有测试覆盖，桌面运行时的实机验收以 Windows 为准。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+发行包只依赖 DSH 的运行时。v0.8.2 在 Windows 的官方 DSH Desktop 0.2.2-rc.3 验收；原生会话入口依赖对应的 DSH 客户端服务。macOS 和 Linux 的数据路径规则有测试覆盖，桌面运行时的实机验收以 Windows 为准。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ## 使用
 
@@ -85,7 +92,9 @@ dsh web
 
 在提供原生会话存储服务的 DSH 中打开一个项目，首屏会显示最近三条可供预览的来源对话。点击其中一条即可查看用户和助手的消息。选择 **迁入并继续** 后，DSH 会在原目录创建一条包含这些历史消息的新会话，输入下一句即可继续。
 
-迁入保留可读取的文字、顺序和消息角色。工具调用与结果、附件、隐藏推理和运行状态仍由原 Agent 保存。较长的历史会按读取上限截取并在预览中标记。此功能在 Windows DSH Desktop 0.2.2-rc.3 验证。
+迁入保留可读取的文字、顺序和消息角色。工具调用与结果、附件、隐藏推理和运行状态仍由原 Agent 保存。Codex 的 `.jsonl.zst` 会话、索引中尚未更新的压缩路径和大型历史都会参与发现；大型历史采用流式读取，按文字预算保留近期问答并在预览中标记截取。此功能在 Windows DSH Desktop 0.2.2-rc.3 验证。
+
+DSH 未能填入交接草稿时，尚未使用的空白会话会自动归档，重试会复用同一会话；如果会话已有草稿，插件不会覆盖它，可以直接打开原会话并手动补入交接资料。
 
 ### 整理项目
 
@@ -95,7 +104,7 @@ dsh web
 
 ### 读取方式
 
-项目原有的 `.agents/skills` 和 `.dsh/skills` 由 DSH 原生发现。其他 Agent 的 Skill 以 `SKILL.md` 正文摘录和原路径带入，DSH 可在需要时读取同目录资源；导入预览会标记截取内容。插件通过本机已认证的 DSH Host 读取资料，源文件与 Agent 数据库按只读方式访问。发送之后，当前会话所选的模型会收到草稿。
+项目原有的 `.agents/skills` 和 `.dsh/skills` 由 DSH 原生发现。其他 Agent 的 Skill 以 `SKILL.md` 正文摘录和原路径带入，DSH 可在需要时读取同目录资源；导入预览会标记截取内容。插件通过本机已认证的 DSH Host 读取资料，面板、静态资源和 API 都要求 DSH 所有者身份；源文件与 Agent 数据库按只读方式访问。发送之后，当前会话所选的模型会收到草稿。
 
 ## 导出交接
 

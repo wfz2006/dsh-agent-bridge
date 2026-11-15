@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="在 DeepSeek Harness 中接续其他 AI Agent 的项目、记忆和 Skills。">
-  <title>Agent Bridge · 把上下文带回工作现场</title>
+  <meta name="description" content="在 DeepSeek Harness 中预览并迁入其他 AI Agent 的对话，同时接续项目记忆和 Skills。">
+  <title>Agent Bridge · 接着 Agent 的对话继续开发</title>
   <link rel="stylesheet" href="./landing.css">
 </head>
 <body>
@@ -17,16 +17,16 @@
   <main id="top">
     <section class="hero wrap">
       <div class="hero-copy">
-        <p class="eyebrow"><span></span> DSH 的 Agent 工作接续插件</p>
+        <p class="eyebrow"><span></span> v0.8.2 · 会话优先版</p>
         <h1>项目还在，<br>思路也<span>接得上。</span></h1>
-        <p class="hero-description">在 DeepSeek Harness 中找到其他 Agent 的项目、记忆和 Skills，把需要的上下文带进新的开发会话。</p>
+        <p class="hero-description">首屏直接显示最近对话。核对用户和助手的原始消息后，迁入 DSH 原生会话；项目记忆和 Skills 单独按用途选择。</p>
         <div class="hero-actions"><a class="button primary" href="#install">开始使用 <span>↗</span></a><a class="button subtle" href="https://github.com/wfz2006/dsh-agent-bridge">查看项目 <span>↗</span></a></div>
-        <p class="hero-note">本地读取 · 预览后导入 · Markdown 导出</p>
+        <p class="hero-note">本机所有者权限 · 原生会话迁入 · 预览后编辑 · Markdown 导出</p>
       </div>
       <div class="hero-visual">
         <div class="visual-top"><span class="window-dots"><i></i><i></i><i></i></span><span>AGENT WORKSPACE</span><span>DSH / PLUGIN</span></div>
-        <img src="./screenshots/v0.8.2/01-recent-conversations.png" alt="Agent Bridge 的项目列表与继续旧对话界面" fetchpriority="high">
-        <div class="visual-caption"><span>你的项目，仍在熟悉的工作目录</span><span>↗</span></div>
+        <img src="./screenshots/v0.8.2/01-recent-conversations.png" alt="Agent Bridge 首屏显示最近对话和项目资料入口" fetchpriority="high">
+        <div class="visual-caption"><span>最近对话在首屏，项目资料按用途展开</span><span>↗</span></div>
       </div>
     </section>
 
@@ -37,25 +37,25 @@
     </section>
 
     <section id="features" class="wrap section features">
-      <div class="section-intro"><p class="eyebrow">FIND YOUR CONTEXT</p><h2>项目和资料，<br>回到同一个视野。</h2><p>从散落的工作区里找到要继续的项目，查看可读取的记忆、Skills 和会话记录。</p></div>
+      <div class="section-intro"><p class="eyebrow">CONVERSATIONS FIRST</p><h2>对话在首屏，<br>资料按用途分组。</h2><p>继续旧对话时直接看最近消息；要开新对话时，再按进度、项目约定、Skills 和笔记选择资料。</p></div>
       <div class="feature-grid">
-        <article class="feature-card feature-wide"><div class="feature-text"><span class="feature-icon">⌕</span><h3>找到项目，再继续</h3><p>按 Agent、名称、路径和目录状态筛选。置顶常用项目，最近接续的项目也会出现在列表前面。</p></div><div class="feature-image crop-navigation"><img src="./screenshots/v0.8.2/01-recent-conversations.png" alt="项目列表与继续旧对话" loading="lazy"></div></article>
-        <article class="feature-card feature-split"><div class="feature-text"><span class="feature-icon">↘</span><h3>把列表整理清爽</h3><p>单独归档，或筛选后批量归档。需要时可以查看、恢复和撤销。</p></div><img src="./screenshots/v0.6.0/01-project-archive.png" alt="已归档项目和恢复操作" loading="lazy"></article>
-        <article class="feature-card feature-split dark-card"><div class="feature-text"><span class="feature-icon">✳</span><h3>每次打开，熟悉一点</h3><p>资料勾选按项目保存。蓝、白、黑三套主题，选择你喜欢的一种。</p></div><img src="./screenshots/v0.8.2/06-black-theme.png" alt="黑色主题下的项目与对话列表" loading="lazy"></article>
+        <article class="feature-card feature-wide"><div class="feature-text"><span class="feature-icon">↺</span><h3>从最近对话直接继续</h3><p>项目首屏先展示最近对话。点开后能核对用户与助手的消息，再选择迁入 DSH，过程清楚且可回退。</p></div><div class="feature-image crop-navigation"><img src="./screenshots/v0.8.2/02-conversation-preview.png" alt="来源对话的用户和助手消息预览" loading="lazy"></div></article>
+        <article class="feature-card feature-split"><div class="feature-text"><span class="feature-icon">☷</span><h3>项目资料按用途分组</h3><p>上次做到哪、项目约定、Skills 和其他笔记分开显示。全局资料默认折叠，也不会自动加入。</p></div><img src="./screenshots/v0.8.2/03-project-materials.png" alt="按用途分组的项目资料" loading="lazy"></article>
+        <article class="feature-card feature-split dark-card"><div class="feature-text"><span class="feature-icon">✓</span><h3>v0.8.2，处理真实历史</h3><p>发现 Codex 压缩会话，流式读取大型历史；权限限定为本机所有者，草稿失败时自动归档空白会话。</p></div><img src="./screenshots/v0.8.2/04-draft-preview.png" alt="可编辑的交接草稿预览" loading="lazy"></article>
       </div>
     </section>
 
     <section id="workflow" class="workflow section">
-      <div class="wrap workflow-grid"><div><p class="eyebrow">PICK UP WHERE YOU LEFT OFF</p><h2>从查看到接续，<br>每一步都看得见。</h2><p class="section-copy">在原工作目录打开 DSH 会话，交接内容会填入可编辑的草稿。你可以先核对，再决定何时发送。</p><a class="text-link" href="https://github.com/wfz2006/dsh-agent-bridge#使用">阅读使用说明 ↗</a></div>
-      <ol class="steps"><li><span>01</span><div><h3>选择项目</h3><p>从本机发现的项目中找到工作目录。</p></div></li><li><span>02</span><div><h3>挑选资料</h3><p>勾选记忆、Skills 和需要的近期会话。</p></div></li><li><span>03</span><div><h3>预览并接续</h3><p>核对交接内容，打开 DSH 草稿或导出 Markdown。</p></div></li></ol></div>
+      <div class="wrap workflow-grid"><div><p class="eyebrow">PICK UP WHERE YOU LEFT OFF</p><h2>预览完再迁入，<br>消息顺序留在 DSH。</h2><p class="section-copy">点击最近对话查看用户和助手的文字。确认后迁入一条新的 DSH 原生会话，下一条指令由你填写并发送。</p><a class="text-link" href="https://github.com/wfz2006/dsh-agent-bridge/blob/main/README.md#快速开始">阅读使用说明 ↗</a></div>
+      <ol class="steps"><li><span>01</span><div><h3>打开项目</h3><p>首屏先显示最近几条来源对话，资料入口单独保留。</p></div></li><li><span>02</span><div><h3>核对消息</h3><p>只预览可读取的用户与助手文字，截取范围明确标记。</p></div></li><li><span>03</span><div><h3>迁入并继续</h3><p>创建 DSH 原生会话，确认历史后再输入下一句。</p></div></li></ol></div>
     </section>
 
     <section id="sources" class="wrap section sources-section"><div class="section-intro"><p class="eyebrow">BUILT FOR YOUR WORKSPACE</p><h2>从不同来源，<br>找到相关上下文。</h2><p>插件按当前用户的常见数据目录扫描，也支持配置自定义路径。不同 Agent 的可读取内容有所区别。</p></div>
       <div class="source-grid"><article><h3>项目与会话</h3><p>Codex、Claude Code、OpenCode、Qoder、WorkBuddy、Gemini CLI 和 Qwen Code 的可识别工作目录与会话。</p></article><article><h3>工作区信息</h3><p>Copilot、TRAE 和 Antigravity 的可识别工作区及部分记录。部分会话可来自 AgentsView 归档。</p></article><article><h3>记忆与 Skills</h3><p>项目内的共享笔记、交接文件，以及相关 Agent 和共享目录中可读取的 Markdown 与 Skills。</p></article></div>
-      <a class="text-link" href="https://github.com/wfz2006/dsh-agent-bridge#来源">查看来源与配置详情 ↗</a>
+      <a class="text-link" href="https://github.com/wfz2006/dsh-agent-bridge/blob/main/README.md#支持来源">查看来源与配置详情 ↗</a>
     </section>
 
-    <section id="install" class="install"><div class="wrap install-inner"><div><p class="eyebrow">GET STARTED</p><h2>准备好继续了吗？</h2><p>获取插件安装包，在 DSH Desktop 的插件页面填写安装包路径。安装后退出并重新打开 DSH。</p></div><div class="install-actions"><a class="button white" href="https://github.com/wfz2006/dsh-agent-bridge/releases">查看安装包 <span>↗</span></a><a class="install-guide" href="https://github.com/wfz2006/dsh-agent-bridge#安装">查看安装说明 →</a><small>项目源码包含构建说明，安装包版本以 Release 页面为准。</small></div></div></section>
+    <section id="install" class="install"><div class="wrap install-inner"><div><p class="eyebrow">GET STARTED · V0.8.2</p><h2>准备好继续了吗？</h2><p>从 v0.8.2 源码构建插件，或从 Releases 获取当前公开安装包。安装后完全退出并重新打开 DSH。</p></div><div class="install-actions"><a class="button white" href="https://github.com/wfz2006/dsh-agent-bridge/releases">查看 Releases <span>↗</span></a><a class="install-guide" href="https://github.com/wfz2006/dsh-agent-bridge/blob/main/README.md#快速开始">查看安装说明 →</a><small>Pages 展示当前 main 分支；公开安装包版本以 Releases 页面为准。</small></div></div></section>
   </main>
   <footer class="wrap footer"><a class="brand" href="#top"><span class="brand-icon">↗</span><span>agent<span class="brand-light">bridge</span></span></a><p>为 DeepSeek Harness 制作的独立插件</p><a href="https://github.com/wfz2006/dsh-agent-bridge">GitHub ↗</a></footer>
 </body>
