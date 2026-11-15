@@ -10,7 +10,7 @@
 
 [下载安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [快速开始](#快速开始) · [功能](#功能) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
 
-<a href="https://wfz2006.github.io/dsh-agent-bridge/"><img src="docs/screenshots/v0.7.0/01-project-navigation.png" width="920" alt="Agent Bridge：项目列表、记忆与接续清单"></a>
+<a href="https://wfz2006.github.io/dsh-agent-bridge/"><img src="docs/screenshots/v0.8.2/01-recent-conversations.png" width="920" alt="Agent Bridge：项目列表与继续旧对话"></a>
 
 </div>
 
@@ -26,24 +26,24 @@
 
 ## 界面
 
-| 项目记忆 | 项目 Skills |
+| 继续旧对话 | 用项目资料开新对话 |
 | :---: | :---: |
-| <img src="docs/screenshots/01-project-memory.png" width="440" alt="项目记忆列表"> | <img src="docs/screenshots/02-project-skills.png" width="440" alt="项目 Skills 列表"> |
-| 记忆按项目和共享状态分组，可逐条预览。 | Skills 标记会话中记录过的使用。 |
+| <img src="docs/screenshots/v0.8.2/02-conversation-preview.png" width="440" alt="继续旧对话预览"> | <img src="docs/screenshots/v0.8.2/03-project-materials.png" width="440" alt="项目资料分组"> |
+| 选一条最近对话，核对消息后迁入并继续。 | 资料按进度、项目约定和 Skills 分组，全局资料库默认折叠。 |
 
-| 交接预览 | 导出 DSH 会话 |
+| 交接草稿预览 | 黑色主题 |
 | :---: | :---: |
-| <img src="docs/screenshots/03-handoff-preview.png" width="440" alt="交接预览"> | <img src="docs/screenshots/04-native-session-export.png" width="440" alt="导出 DSH 会话"> |
-| 预览记忆、Skills 和会话摘录，导入或导出 Markdown。 | 选择本机会话，导出为 Markdown。 |
+| <img src="docs/screenshots/v0.8.2/04-draft-preview.png" width="440" alt="交接草稿预览"> | <img src="docs/screenshots/v0.8.2/06-black-theme.png" width="440" alt="黑色主题"> |
+| 核对记忆、Skills 和来源，打开新对话或导出 Markdown。 | 蓝、白、黑三套主题，选择会记住。 |
 
 <details>
-<summary>更多界面：项目归档、主题和 Agent 图标</summary>
+<summary>更多界面：项目归档、全局资料库和 Agent 图标</summary>
 
-| 项目归档 | 黑色主题 |
+| 项目归档 | 全局资料库 |
 | --- | --- |
-| ![归档项目和恢复操作](docs/screenshots/v0.6.0/01-project-archive.png) | ![黑色主题和 Skills](docs/screenshots/v0.5.0/03-black-copilot-skills.png) |
+| ![归档项目和恢复操作](docs/screenshots/v0.6.0/01-project-archive.png) | ![全局资料库](docs/screenshots/v0.8.2/05-global-library.png) |
 
-[蓝色主题](docs/screenshots/v0.5.0/01-blue-agent-menu.png) · [白色主题](docs/screenshots/v0.5.0/02-white-copilot-workspace.png) · [Agent 图标](docs/screenshots/v0.5.1/01-agent-icons.png)
+[Agent 图标](docs/screenshots/v0.5.1/01-agent-icons.png)
 
 </details>
 
