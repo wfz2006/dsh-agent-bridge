@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: 'dsh-agent-bridge',
+  id: '@wwwfz/dsh-agent-bridge',
   factory: (require) => {
     const { createElement: h, useEffect, useRef } = require('react');
     const panelId = 'dsh-agent-bridge';

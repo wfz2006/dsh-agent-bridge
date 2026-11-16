@@ -1,6 +1,6 @@
 {
   "name": "@wwwfz/dsh-agent-bridge",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Standalone DeepSeek Harness plugin for live local agent discovery, context import, and Markdown handoff export.",
   "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "agent", "handoff", "skills"],
   "repository": { "type": "git", "url": "git+https://github.com/wfz2006/dsh-agent-bridge.git" },
