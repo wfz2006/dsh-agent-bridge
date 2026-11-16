@@ -6,9 +6,10 @@
 
 [![Version](https://img.shields.io/badge/version-v0.8.2-2459D7?style=flat-square)](https://github.com/wfz2006/dsh-agent-bridge/tree/v0.8.2)
 [![DSH Plugin](https://img.shields.io/badge/DSH-plugin-4B6EF5?style=flat-square)](https://awesome-dsh-plugin.com/)
+[![npm](https://img.shields.io/npm/v/@wwwfz/dsh-agent-bridge?style=flat-square&label=npm)](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge)
 [![Tests](https://img.shields.io/badge/tests-41%2F41-2EA043?style=flat-square)](#卸载与构建)
 
-[最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [v0.8.2 更新](#v082-更新) · [快速开始](#快速开始) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
+[npm 安装](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge) · [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [v0.8.2 更新](#v082-更新) · [快速开始](#快速开始) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
 
 <a href="https://wfz2006.github.io/dsh-agent-bridge/"><img src="docs/screenshots/v0.8.2/01-recent-conversations.png" width="920" alt="Agent Bridge：项目列表与继续旧对话"></a>
 
@@ -56,12 +57,21 @@
 
 ## 快速开始
 
+**方式一：npm（推荐）**
+
+```sh
+dsh plugin --profile web add @wwwfz/dsh-agent-bridge
+dsh web
+```
+
+**方式二：离线安装包**
+
 1. 下载 [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)，或从 [v0.8.2 源码](https://github.com/wfz2006/dsh-agent-bridge/tree/v0.8.2) 运行 `npm pack` 构建。
 2. 打开 **DSH Desktop → 插件 → 安装插件**，选择这个文件。
 3. **完全退出 DSH 后再打开**，侧栏会出现 **Agent 工作接续**。
 
 <details>
-<summary>DSH Web 安装</summary>
+<summary>DSH Web 离线安装</summary>
 
 在安装包所在目录运行：
 
