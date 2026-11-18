@@ -2,35 +2,32 @@
 
 # Agent Bridge
 
-**浏览本机其他 Agent 的项目、记忆和 Skills，在原工作目录继续开发。**
+**把旧对话接到 DeepSeek Harness，在原工作目录继续。**
 
-[![Version](https://img.shields.io/badge/version-v0.9.0-2459D7?style=flat-square)](https://github.com/wfz2006/dsh-agent-bridge)
-[![DSH Plugin](https://img.shields.io/badge/DSH-plugin-4B6EF5?style=flat-square)](https://awesome-dsh-plugin.com/)
-[![npm](https://img.shields.io/npm/v/@wwwfz/dsh-agent-bridge?style=flat-square&label=npm)](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge)
-[![Tests](https://img.shields.io/badge/tests-106%2F106-2EA043?style=flat-square)](#卸载与构建)
+在 DSH 浏览 Codex、Claude Code 等 Agent 的本机项目，接着旧对话聊，或带上项目记忆和 Skills 开一段新对话。
 
-[npm 安装](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge) · [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [v0.9.0 更新](#v090-更新) · [快速开始](#快速开始) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
+[图文介绍](https://wfz2006.github.io/dsh-agent-bridge/) · [快速开始](#快速开始) · [界面](#界面) · [支持来源](#支持来源)
 
-<a href="https://wfz2006.github.io/dsh-agent-bridge/"><img src="docs/screenshots/v0.8.2/01-recent-conversations.png" width="920" alt="Agent Bridge：项目列表与继续旧对话"></a>
+<a href="https://wfz2006.github.io/dsh-agent-bridge/"><img src="https://raw.githubusercontent.com/wfz2006/dsh-agent-bridge/main/docs/screenshots/v0.9.0/workspace.png" width="920" alt="Agent Bridge 项目首屏显示最近三条旧对话和项目资料入口"></a>
+
+界面演示来自 **main v0.9.0** · [GitHub Release v0.8.2](https://github.com/wfz2006/dsh-agent-bridge/releases/tag/v0.8.2) · [npm v0.8.3](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge)
 
 </div>
 
 ## 功能
 
-| 查找项目 | 选择上下文 | 原地接续 |
-| :--- | :--- | :--- |
-| 按 Agent、项目名、路径和状态筛选；置顶常用项目，归档不再使用的项目。 | 勾选项目记忆、Skills 和近期会话，先预览再交接。 | 在原工作目录创建 DSH 会话，并填入可编辑的交接草稿。 |
-
-| 导出交接 | 多 Agent 来源 | 本机只读 |
-| :--- | :--- | :--- |
-| 导出 Markdown 交接，或导出 DSH 会话记录。 | Codex、Claude Code、Copilot、OpenCode、Qoder、WorkBuddy、Gemini CLI、Qwen Code、Antigravity、TRAE。 | 通过本机已认证的 DSH Host 读取，源文件与 Agent 数据库只读访问。 |
+| 想做什么 | 在 Agent Bridge 里怎么做 |
+| --- | --- |
+| **接着旧对话聊** | 选项目和一条最近对话，核对内容后迁入。DSH 在原工作目录创建一条带历史的新会话。 |
+| **用项目资料开新对话** | 按进度、项目约定和 Skills 选择资料，查看可编辑的草稿。 |
+| **整理项目或交接给别人** | 置顶、归档或恢复项目，也可导出本机版和分享版 Markdown。 |
 
 ## v0.9.0 更新
 
-- **按项目启用完整 Skill 包**：继续旧对话或从项目资料开新对话时，可为当前本机项目启用确认过的 `SKILL.md`、`scripts/`、`references/` 和 `assets/`，由 DSH 原生 Skill 入口调用，不再只依赖正文摘录。
-- **启用前核对，启用后可撤销**：来源、目标项目、包内文件、脚本和同名冲突先进入确认预览；已有同款按内容指纹复用，同名不同内容保留原技能。来源变化只提示，更新需重新预览；停用只撤销当前项目登记。
-- **来源消失仍可管理**：私有快照与项目登记分开保存。原目录被移走后，面板仍保留「已启用的项目 Skills」入口，可继续使用快照或停用。
-- **状态不夸大**：区分「DSH 已发现」「可为此项目启用」「仅可带入说明」「同名，待核对」「待确认」和「当前模式不可调用」。只有服务端重新确认实际登记和调用策略后，才从草稿中省略技能正文；确认失败时保留文字路径。
+- **原对话统计**在迁入预览和 DSH 会话的「来源记录」顶部。查看已读轮次、消息数、工具调用，以及源记录可提供的消息时间跨度和累计 Token。
+- **来源记录按回合折叠**，可查看已保存的思考摘要、工具调用和结果，继续聊天后仍可查阅迁入时的记录。
+- **完整 Skill 包按项目启用**。核对包内脚本、参考文件、资源和同名冲突后启用，可停用或恢复上一版。
+- **Markdown 预览和文件链接**保留原文结构。项目内文件经过路径核对可从预览打开，导出可选本机版和分享版。
 
 ## v0.8.2 更新
 
@@ -41,39 +38,36 @@
 
 ## 界面
 
-| 继续旧对话 | 用项目资料开新对话 |
+| 原对话统计 | 为当前项目启用 Skill |
 | :---: | :---: |
-| <img src="docs/screenshots/v0.8.2/02-conversation-preview.png" width="440" alt="继续旧对话预览"> | <img src="docs/screenshots/v0.8.2/03-project-materials.png" width="440" alt="项目资料分组"> |
-| 选一条最近对话，核对消息后迁入并继续。 | 资料按进度、项目约定和 Skills 分组，全局资料库默认折叠。 |
+| <img src="https://raw.githubusercontent.com/wfz2006/dsh-agent-bridge/main/docs/screenshots/v0.9.0/source-record.png" width="440" alt="来源记录含原对话统计和折叠的工具记录"> | <img src="https://raw.githubusercontent.com/wfz2006/dsh-agent-bridge/main/docs/screenshots/v0.9.0/skill-review.png" width="440" alt="项目 Skill 包启用前显示作用范围和脚本及资源"> |
+| 点会话头部的「来源记录」，再按需展开每一轮。 | 确认作用范围和包内容，再启用完整 Skill。 |
 
-| 交接草稿预览 | 黑色主题 |
-| :---: | :---: |
-| <img src="docs/screenshots/v0.8.2/04-draft-preview.png" width="440" alt="交接草稿预览"> | <img src="docs/screenshots/v0.8.2/06-black-theme.png" width="440" alt="黑色主题"> |
-| 核对记忆、Skills 和来源，打开新对话或导出 Markdown。 | 蓝、白、黑三套主题，选择会记住。 |
+<img src="https://raw.githubusercontent.com/wfz2006/dsh-agent-bridge/main/docs/screenshots/v0.9.0/markdown-preview.png" width="510" alt="Markdown 预览中的标题、步骤列表、可点击的本机项目文件链接和表格">
 
 <details>
-<summary>更多界面：项目归档、全局资料库和 Agent 图标</summary>
+<summary>更多界面（项目归档、全局资料库和主题）</summary>
 
 | 项目归档 | 全局资料库 |
 | --- | --- |
-| ![归档项目和恢复操作](docs/screenshots/v0.6.0/01-project-archive.png) | ![全局资料库](docs/screenshots/v0.8.2/05-global-library.png) |
+| ![归档项目和恢复操作](https://raw.githubusercontent.com/wfz2006/dsh-agent-bridge/main/docs/screenshots/v0.6.0/01-project-archive.png) | ![全局资料库](https://raw.githubusercontent.com/wfz2006/dsh-agent-bridge/main/docs/screenshots/v0.8.2/05-global-library.png) |
 
-[Agent 图标](docs/screenshots/v0.5.1/01-agent-icons.png)
+[Agent 图标](https://github.com/wfz2006/dsh-agent-bridge/blob/main/docs/screenshots/v0.5.1/01-agent-icons.png) · [黑色主题](https://github.com/wfz2006/dsh-agent-bridge/blob/main/docs/screenshots/v0.8.2/06-black-theme.png)
 
 </details>
 
 ## 快速开始
 
-**方式一：npm（推荐）**
+**DSH Web · npm v0.8.3**
 
 ```sh
 dsh plugin --profile web add @wwwfz/dsh-agent-bridge
 dsh web
 ```
 
-**方式二：离线安装包**
+**DSH Desktop · GitHub Release v0.8.2**
 
-1. 下载 [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)，或从当前 0.9.0 工作树运行 `npm pack` 构建（该候选版本尚未发布）。
+1. 下载 [公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)。
 2. 打开 **DSH Desktop → 插件 → 安装插件**，选择这个文件。
 3. **完全退出 DSH 后再打开**，侧栏会出现 **Agent 工作接续**。
 
@@ -89,7 +83,7 @@ dsh web
 
 </details>
 
-发行包只依赖 DSH 的运行时。v0.9.0 候选版已在隔离的 Windows 官方 DSH Desktop 0.2.2-rc.3 完成原生 Skill 验收；未替换日常 DSH 配置，当前也未发布。原生会话入口依赖对应的 DSH 客户端服务。macOS 和 Linux 的数据路径规则有测试覆盖，桌面运行时的实机验收以 Windows 为准。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+**体验 v0.9.0**。从 main 克隆项目，使用 Node.js 22.13 或更新版本运行 `npm pack`，再安装生成的 `.tgz`。验收使用隔离的 Windows DSH Desktop 0.2.2-rc.3 和 DSH Web。原生会话和 Skills 需要宿主提供相应服务。macOS 和 Linux 的数据路径规则有测试覆盖。 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ## 使用
 
