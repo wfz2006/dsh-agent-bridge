@@ -20,13 +20,13 @@
 
 ### DSH Desktop
 
-1. 下载 [GitHub 安装包 v0.8.2](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)。
+1. 下载 [GitHub 安装包 v0.9.0](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)。
 2. 在 DSH 的 **插件 → 安装插件** 选择下载的 `.tgz`。
 3. 完全退出再打开 DSH，从侧栏进入 **Agent 工作接续**。
 
 ### DSH Web
 
-在已安装 DSH CLI 的环境里运行。当前 npm 版本为 [v0.8.3](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge)。
+在已安装 DSH CLI 的环境里运行。当前 npm 版本为 [v0.9.0](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge)。
 
 ~~~sh
 dsh plugin --profile web add @wwwfz/dsh-agent-bridge
@@ -34,29 +34,9 @@ dsh web
 ~~~
 
 > [!NOTE]
-> 下方演示的原对话统计、项目级原生 Skills 和新版 Markdown 预览来自 `main` 的 v0.9.0。可从源码构建本地包体验。
-
-<details>
-<summary>构建 v0.9.0 安装包</summary>
-
-需要 Node.js 22.13 或更新版本。
-
-~~~sh
-git clone https://github.com/wfz2006/dsh-agent-bridge.git
-cd dsh-agent-bridge
-npm pack
-~~~
-
-把生成的 `wwwfz-dsh-agent-bridge-0.9.0.tgz` 交给 Desktop 插件管理页。Web 版可在同一目录运行下面两条命令。
-
-~~~sh
-dsh plugin --profile web add ./wwwfz-dsh-agent-bridge-0.9.0.tgz
-dsh web
-~~~
+> 下方演示的原对话统计、项目级原生 Skills 和新版 Markdown 预览来自 v0.9.0。
 
 Windows DSH Desktop 0.2.2-rc.3 和 DSH Web 已完成隔离验收。原生会话和 Skills 需要宿主提供对应服务。macOS 和 Linux 的数据路径规则有测试覆盖。 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-
-</details>
 
 ## 使用
 
