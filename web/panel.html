@@ -126,6 +126,7 @@
             </div>
             <div class="project-location">
               <code id="project-path"></code>
+              <button id="open-path" class="path-open" type="button" aria-label="在 DSH 中打开工作目录" title="在 DSH 中打开工作目录"><svg class="icon" aria-hidden="true"><use href="#icon-folder"/></svg><span>打开</span></button>
               <button id="copy-path" class="path-copy icon-button" type="button" aria-label="复制工作目录" title="复制工作目录"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg></button>
             </div>
           </header>
@@ -226,6 +227,7 @@
           <label for="session-select">选择要导出的 DSH 会话</label>
           <select id="session-select"></select>
           <p id="session-path" class="muted"></p>
+          <div id="session-source-record"></div>
         </div>
         <p id="dialog-status" role="status"></p>
         <details id="export-output" class="export-output" hidden>
@@ -234,11 +236,40 @@
         </details>
       </div>
       <footer class="dialog-actions">
+        <label id="export-trace-option" class="export-trace-option" hidden>
+          <input type="checkbox" id="export-trace">
+          <span>附带来源记录（工具名与结果摘录）</span>
+        </label>
         <a id="export-download" class="secondary" download hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>下载 Markdown</a>
-        <button id="export" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出 Markdown</button>
+        <button id="export" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出本机版</button>
+        <button id="export-share" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出分享版</button>
         <button id="recover-draft" class="secondary" type="button" hidden>打开已创建的会话</button>
+        <button id="skill-undo" class="secondary" type="button" hidden>恢复上一版</button>
+        <button id="skill-deactivate" class="secondary" type="button" hidden>停用技能</button>
+        <button id="skill-apply" class="primary" type="button" hidden><span id="skill-apply-label">启用技能</span><svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
         <button id="history-import" class="primary" type="button" hidden><span id="history-import-label">迁入并继续</span><svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
         <button id="import" class="primary" type="button" hidden>打开新对话<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+      </footer>
+    </div>
+  </dialog>
+
+  <dialog id="activate-dialog" aria-labelledby="activate-title">
+    <div class="dialog-inner">
+      <header class="dialog-heading">
+        <span class="project-mark"><svg class="icon" aria-hidden="true"><use href="#icon-skill"/></svg></span>
+        <div>
+          <h2 id="activate-title">确认启用技能</h2>
+          <p id="activate-note" class="muted">核对来源、项目范围和脚本后再继续。</p>
+        </div>
+        <button id="activate-close" class="secondary icon-button" type="button" aria-label="关闭" title="关闭"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+      </header>
+      <div class="dialog-content">
+        <div id="activate-body" class="dialog-text" data-format="handoff" tabindex="0"></div>
+        <p id="activate-status" role="status"></p>
+      </div>
+      <footer class="dialog-actions">
+        <button id="activate-text" class="secondary" type="button">仅文字继续</button>
+        <button id="activate-confirm" class="primary" type="button">确认启用并继续<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
       </footer>
     </div>
   </dialog>

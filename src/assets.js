@@ -7,6 +7,7 @@ const MAX_ASSET_BYTES = 96 * 1024;
 const MAX_ASSETS_PER_ROOT = 320;
 const proof = Symbol('asset location');
 const sensitiveName = /(?:^|[._ -])(?:api[-_ ]?keys?|access[-_ ]?tokens?|auth|credentials?|passwords?|secrets?|oauth)(?:[._ -]|$)/i;
+const openableReference = /\.(?:md|markdown|mdx|txt|rst|log|csv|tsv|jsonc?|ya?ml|toml|xml|css|tsx?|jsx|rs|go|java|kt|cs|c|cc|cpp|h|hh|hpp|swift|sql|pdf|png|jpe?g|gif|webp)$/i;
 const hubFolders = ['决策', '经验', '资料', '交接', '笔记'];
 const agentHomes = {
   antigravity: ['.gemini/antigravity', '.gemini/antigravity-cli'],
@@ -55,6 +56,10 @@ function sameFile(first, second) {
   return first.dev === second.dev && first.ino === second.ino;
 }
 
+function sourceChanged(message) {
+  return Object.assign(new Error(message), { code: 'ASSET_SOURCE_CHANGED' });
+}
+
 async function directory(file) {
   if (typeof file !== 'string' || !path.isAbsolute(file) || file === path.parse(file).root) return null;
   try {
@@ -76,36 +81,88 @@ async function children(root, child = '.') {
   }
 }
 
-async function located(file, root) {
+async function locateSource(file, root) {
+  if (typeof file !== 'string' || !path.isAbsolute(file)
+    || typeof root !== 'string' || !path.isAbsolute(root)) {
+    throw sourceChanged('Asset source is not an absolute path');
+  }
   const resolved = await realpath(file);
   if (!inside(root, resolved) || canonicalKey(file) !== canonicalKey(resolved)) {
-    throw new Error('Asset path changed or is outside its source root');
+    throw sourceChanged('Asset path changed or is outside its source root');
+  }
+  const directory = path.dirname(file);
+  const resolvedDirectory = await realpath(directory);
+  if (!inside(root, resolvedDirectory) || canonicalKey(directory) !== canonicalKey(resolvedDirectory)) {
+    throw sourceChanged('Asset directory changed or is outside its source root');
+  }
+  const directoryInfo = await lstat(directory, { bigint: true });
+  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
+    throw sourceChanged('Asset directory is not a regular directory');
   }
   const info = await lstat(file, { bigint: true });
-  if (!info.isFile() || info.nlink > 1n) throw new Error('Asset is not a regular, unlinked file');
-  return info;
+  if (!info.isFile() || info.nlink > 1n) throw sourceChanged('Asset is not a regular, unlinked file');
+  return { root, file, directory, fileInfo: info, directoryInfo };
+}
+
+export async function authorizeProjectReference(root, documentFile, href) {
+  let relative;
+  try { relative = decodeURIComponent(href.split(/[?#]/, 1)[0]); } catch { /* Invalid URL encoding. */ }
+  if (!relative || /^[\/]/.test(relative) || /[\\:\u0000-\u001f]/.test(relative)) {
+    return { path: href, error: '文件链接格式无效。' };
+  }
+  const target = path.resolve(path.dirname(documentFile), relative);
+  if (!inside(root, documentFile) || !inside(root, target)) {
+    return { path: target, error: '文件不在项目范围内。' };
+  }
+  const name = path.basename(target);
+  if (sensitiveName.test(name)) {
+    return { path: target, error: '当前文件类型无法从正文链接打开。' };
+  }
+  try {
+    const revealOnly = !openableReference.test(name);
+    return { path: target, authorization: await locateSource(target, root), revealOnly };
+  } catch {
+    return { path: target, error: '文件已移动、不可访问或指向项目范围外。' };
+  }
 }
 
 async function recordAsset(root, file, meta) {
   try {
-    const info = await located(file, root);
-    const revision = `${info.ino}:${info.mtimeNs}:${info.size}`;
-    return { ...meta, file, revision, [proof]: { root, file, info } };
+    const source = await locateSource(file, root);
+    const { fileInfo } = source;
+    const revision = `${fileInfo.ino}:${fileInfo.mtimeNs}:${fileInfo.size}`;
+    return { ...meta, file, revision, [proof]: source };
   } catch {
     return null;
   }
 }
 
-export async function readAsset(item) {
+export async function verifyAssetSource(item) {
   const source = item?.[proof];
-  if (!source || source.file !== item.file) throw new Error('Asset source is unavailable');
-  const current = await located(source.file, source.root);
-  if (!sameFile(source.info, current)) throw new Error('Asset changed since discovery');
+  if (!source || source.file !== item.file) throw sourceChanged('Asset source is unavailable');
+  return verifySourceAuthorization(source);
+}
+
+export async function verifySourceAuthorization(authorization) {
+  if (!authorization || typeof authorization !== 'object') throw sourceChanged('Asset authorization is unavailable');
+  const current = await locateSource(authorization.file, authorization.root);
+  if (!sameFile(authorization.fileInfo, current.fileInfo)
+    || !sameFile(authorization.directoryInfo, current.directoryInfo)) {
+    throw sourceChanged('Asset changed since discovery');
+  }
+  return current;
+}
+
+export async function readAsset(item) {
+  const source = await verifyAssetSource(item);
   const handle = await open(source.file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const opened = await handle.stat({ bigint: true });
-    const confirmed = await located(source.file, source.root);
-    if (!sameFile(current, opened) || !sameFile(opened, confirmed)) throw new Error('Asset changed while opening');
+    const confirmed = await verifySourceAuthorization(source);
+    if (!sameFile(source.fileInfo, opened) || !sameFile(source.directoryInfo, confirmed.directoryInfo)
+      || !sameFile(opened, confirmed.fileInfo)) {
+      throw new Error('Asset changed while opening');
+    }
     const bytes = Buffer.alloc(MAX_ASSET_BYTES + 1);
     let length = 0;
     while (length < bytes.length) {

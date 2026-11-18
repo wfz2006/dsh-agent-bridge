@@ -1,4 +1,5 @@
 import { createReadStream } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +17,8 @@ const jsonlFile = /\.jsonl$/i;
 const compressedCodexFile = /\.jsonl\.zst$/i;
 const hasZstd = typeof zlib.createZstdDecompress === 'function';
 const conversationLimits = { messages: 600, characters: 160_000, messageLength: 24_000 };
+const traceItemLimit = 600;
+const traceTextLimit = 8_000;
 
 const agentLabels = {
   codex: 'Codex', claude: 'Claude Code', opencode: 'OpenCode', workbuddy: 'WorkBuddy',
@@ -543,16 +546,39 @@ function messageText(text) {
   return typeof text === 'string' ? stripRuntimeWrapper(text).trim() : '';
 }
 
-function appendMessage(result, role, text, timestamp) {
-  if (role !== 'user' && role !== 'assistant') return;
+function markSourcePartial(result) {
+  result.sourcePartial = true;
+  result.truncated = true;
+}
+
+function appendMessage(result, role, text, timestamp, { estimatedTime = false } = {}) {
+  if (role !== 'user' && role !== 'assistant') return false;
   const value = messageText(text);
-  if (!value) return;
+  if (!value) return false;
   for (const match of value.matchAll(/<skill>\s*<name>([^<]+)<\/name>/gi)) addSkill(result, match[1]);
-  if (value.startsWith('<skill>')) return;
+  if (value.startsWith('<skill>')) return false;
   const { limits } = result;
   if (limits) {
     const bounded = value.slice(0, limits.messageLength).replace(/[\uD800-\uDBFF]$/, '');
-    result.messages.push({ role, text: bounded, agent: result.agent, time: dateMillis(timestamp) });
+    const time = dateMillis(timestamp);
+    const stats = result.readStats;
+    if (role === 'user') stats.userMessages++;
+    else stats.assistantMessages++;
+    if (time > 0 && !estimatedTime) {
+      stats.timedMessages++;
+      stats.firstAt = Math.min(stats.firstAt ?? time, time);
+      stats.lastAt = Math.max(stats.lastAt ?? time, time);
+    }
+    const entry = { role, text: bounded, agent: result.agent, time };
+    if (result.trace) {
+      const ref = ++result.messageSeq;
+      if (role === 'user') {
+        result.turn++;
+        result.turnRef = ref;
+      }
+      entry.turnRef = result.turnRef;
+    }
+    result.messages.push(entry);
     result.characters += bounded.length;
     if (value.length > bounded.length) result.truncated = true;
     while (result.messages.length > limits.messages || result.characters > limits.characters) {
@@ -562,13 +588,86 @@ function appendMessage(result, role, text, timestamp) {
       result.truncated = true;
     }
   } else {
-    result.messages.push({ role, text: value.slice(0, maxMessageLength), agent: result.agent });
+    const entry = { role, text: value.slice(0, maxMessageLength), agent: result.agent };
+    result.messages.push(entry);
     if (result.messages.length > maxMessages) result.messages.shift();
   }
+  return true;
 }
 
 function addSkill(result, name) {
   if (typeof name === 'string' && /^[\p{L}\p{N}_:.\/-]{1,140}$/u.test(name.trim())) result.usedSkills.add(name.trim());
+}
+
+function traceValue(value) {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  try { return JSON.stringify(value); } catch { return ''; }
+}
+
+function cleanTraceText(value) {
+  return traceValue(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').trim();
+}
+
+function addTrace(result, item) {
+  if (!result.trace) return undefined;
+  const text = cleanTraceText(item.text);
+  const bounded = text.slice(0, traceTextLimit).replace(/[\uD800-\uDBFF]$/, '');
+  const entry = {
+    id: `${item.kind}-${item.callId ?? item.id ?? result.traceOrder}`,
+    order: result.traceOrder++,
+    kind: item.kind,
+    ...(item.name ? { name: item.name } : {}),
+    ...(item.callId ? { callId: item.callId } : {}),
+    text: bounded,
+    status: item.status,
+    ...(text.length > bounded.length ? { truncated: true } : {}),
+    ...(item.time ? { time: item.time } : {}),
+    turnRef: result.turnRef,
+    turn: result.turn,
+  };
+  const key = entry.kind === 'summary'
+    ? `summary\0${entry.id}`
+    : `${entry.kind}\0${entry.callId ?? entry.id}`;
+  if (result.traceKeys.has(key)) return entry;
+  result.traceKeys.add(key);
+  result.trace.push(entry);
+  while (result.trace.length > traceItemLimit) {
+    result.truncated = true;
+    const removed = result.trace.shift();
+    result.traceKeys.delete(removed.kind === 'summary'
+      ? `summary\0${removed.id}` : `${removed.kind}\0${removed.callId ?? removed.id}`);
+  }
+  return entry;
+}
+
+function traceCallId(value) {
+  if (typeof value !== 'string' || !value) return undefined;
+  if (value.length <= 200) return value;
+  return `${value.slice(0, 120)}…${createHash('sha256').update(value).digest('hex')}`;
+}
+
+function addSummary(result, text, time, id) {
+  const value = cleanTraceText(text);
+  if (!value) return;
+  addTrace(result, { kind: 'summary', text: value, status: 'ok', time: dateMillis(time), id });
+}
+
+function addToolCall(result, name, callId, input, time) {
+  if (typeof name !== 'string' || !name.trim()) return;
+  addTrace(result, {
+    kind: 'tool_call', name: name.trim().slice(0, 120),
+    callId: traceCallId(callId),
+    text: cleanTraceText(input), status: 'pending', time: dateMillis(time),
+  });
+}
+
+function addToolResult(result, callId, output, failed) {
+  if (!result.trace || typeof callId !== 'string' || !callId) return;
+  addTrace(result, {
+    kind: 'tool_result', callId: traceCallId(callId), text: cleanTraceText(output),
+    status: failed === true ? 'error' : 'ok',
+  });
 }
 
 function skillPaths(result, value) {
@@ -594,8 +693,26 @@ function textBlocks(content, result) {
   for (const block of content) {
     if (typeof block === 'string') texts.push(block);
     if (['text', 'input_text', 'output_text'].includes(block?.type) && typeof block.text === 'string') texts.push(block.text);
-    if (result && block?.type === 'tool_use') readTool(result, block.name, block.input);
-    if (result && block?.type === 'tool') readTool(result, block.tool ?? block.name, block.state?.input ?? block.input ?? block.args);
+    if (result && block?.type === 'tool_use') {
+      readTool(result, block.name, block.input);
+      addToolCall(result, block.name, block.id, block.input);
+    }
+    if (result && block?.type === 'tool_result') {
+      const value = Array.isArray(block.content)
+        ? block.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n')
+        : block.content;
+      addToolResult(result, block.tool_use_id, value, block.is_error === true);
+    }
+    if (result && block?.type === 'tool') {
+      const input = block.state?.input ?? block.input ?? block.args;
+      readTool(result, block.tool ?? block.name, input);
+      const callId = block.callID ?? block.callId ?? block.id;
+      addToolCall(result, block.tool ?? block.name, callId, input);
+      const state = block.state ?? {};
+      if (state.status === 'completed' || state.status === 'error') {
+        addToolResult(result, callId, state.output ?? state.result ?? state.error, state.status === 'error');
+      }
+    }
   }
   // A Codex user message can contain several independent input_text blocks.
   // Filter each one so an internal block never hides a neighboring prompt.
@@ -631,7 +748,7 @@ async function readGeminiHistory(descriptor, cwd, config, result) {
     const marker = await scopedFile(path.resolve(path.dirname(file), '..', '.project_root'), base);
     if (!marker || !await sameDirectory((await prefix(marker, 32 * 1024)).text.trim(), cwd)) continue;
     const { text, truncated } = await prefix(file, maxTranscriptBytes);
-    if (truncated) result.truncated = true;
+    if (truncated) markSourcePartial(result);
     const messages = json(text)?.messages ?? rowsFrom(text, truncated);
     if (!Array.isArray(messages)) continue;
     for (const row of messages) {
@@ -697,13 +814,15 @@ async function readCopilotHistory(descriptor, cwd, config, result) {
     const marker = json((await prefix(workspace, 32 * 1024)).text);
     if (!await sameDirectory(localDirectory(marker?.folder), cwd)) continue;
     const { text, truncated } = await prefix(file, maxTranscriptBytes);
-    if (truncated) result.truncated = true;
+    if (truncated) markSourcePartial(result);
     const requests = copilotRequests(text, truncated);
     for (const request of result.limits ? requests : requests.slice(-maxMessages)) {
       appendMessage(result, 'user', request?.message?.text, request?.timestamp);
       const response = Array.isArray(request?.response) ? request.response : [];
-      appendMessage(result, 'assistant', response.filter(item => !item?.kind || item.kind === 'markdownContent')
-        .map(item => item?.value?.value ?? item?.value ?? '').filter(value => typeof value === 'string').join(''), request?.timestamp);
+      const answer = response.filter(item => !item?.kind || item.kind === 'markdownContent')
+        .map(item => item?.value?.value ?? item?.value ?? '').filter(value => typeof value === 'string').join('');
+      // Copilot stores the request time. Use it for transcript order only.
+      appendMessage(result, 'assistant', answer, request?.timestamp, { estimatedTime: true });
       for (const item of response) {
         if (item?.kind === 'toolInvocationSerialized') readTool(result, item.toolId, item.parameters);
       }
@@ -776,21 +895,62 @@ async function* compressedRows(file) {
 
 function readCodexRow(result, row) {
   if (row === null || row.type === 'compacted' || row.isCompactSummary) {
-    if (result.limits) result.truncated = true;
+    if (result.limits) markSourcePartial(result);
     return;
   }
-  if (row.isSidechain || row.isMeta || row.type !== 'response_item') return;
+  if (row.isSidechain || row.isMeta) return;
   const payload = row.payload;
-  if (payload?.type === 'message') appendMessage(result, payload.role, textBlocks(payload.content, result), row.timestamp);
-  if (payload?.type === 'function_call') readTool(result, payload.name, payload.arguments);
-  if (payload?.type === 'custom_tool_call') readTool(result, payload.name, payload.input);
+  if (row.type === 'event_msg' && payload?.type === 'token_count' && result.readStats) {
+    // Codex repeats cumulative snapshots. The latest recorded total already
+    // includes earlier turns, and may be available even when only a tail was read.
+    const usage = payload.info?.total_token_usage;
+    if (Number.isSafeInteger(usage?.total_tokens) && usage.total_tokens >= 0) {
+      const tokens = { total: usage.total_tokens };
+      for (const name of ['input', 'output']) {
+        const value = usage[`${name}_tokens`];
+        if (Number.isSafeInteger(value) && value >= 0 && value <= tokens.total) tokens[name] = value;
+      }
+      result.readStats.tokens = tokens;
+    }
+    return;
+  }
+  if (row.type !== 'response_item') return;
+  if (payload?.type === 'message') {
+    appendMessage(result, payload.role, textBlocks(payload.content, result), row.timestamp);
+    return;
+  }
+  if (payload?.type === 'reasoning') {
+    // Only the visible summary is retained; encrypted reasoning has no text.
+    const summary = Array.isArray(payload.summary) ? payload.summary : [];
+    const text = summary.filter(item => item?.type === 'summary_text' && typeof item.text === 'string')
+      .map(item => item.text).join('\n\n');
+    if (text) addSummary(result, text, row.timestamp, payload.id);
+    return;
+  }
+  if (payload?.type === 'function_call' || payload?.type === 'custom_tool_call') {
+    readTool(result, payload.name, payload.arguments ?? payload.input);
+    addToolCall(result, payload.name, payload.call_id ?? payload.id, payload.arguments ?? payload.input, row.timestamp);
+    return;
+  }
+  if (payload?.type === 'function_call_output' || payload?.type === 'custom_tool_call_output') {
+    const output = payload.output ?? payload.content;
+    const text = Array.isArray(output)
+      ? output.filter(item => item?.type === 'input_text' && typeof item.text === 'string').map(item => item.text).join('\n')
+      : output;
+    const value = typeof text === 'string' ? text : '';
+    addToolResult(result, payload.call_id, value, payload.status === 'failed'
+      || /^(?:exit code: [1-9]|process exited with code [1-9])/im.test(value));
+  }
 }
 
 async function readCompressedCodex(file, cwd, result) {
   // Use a separate accumulator so a damaged file never contributes an
   // incomplete history or discards previously read project context.
   const local = { messages: [], usedSkills: new Set(), limits: result.limits,
-    characters: 0, truncated: false, agent: result.agent };
+    characters: 0, truncated: false, agent: result.agent,
+    trace: result.trace ? [] : undefined, traceKeys: result.trace ? new Set() : undefined,
+    traceOrder: 0, messageSeq: 0, turn: 0, turnRef: undefined,
+    readStats: result.readStats && { userMessages: 0, assistantMessages: 0, timedMessages: 0 } };
   let validated = false;
   for await (const row of compressedRows(file)) {
     if (!validated) {
@@ -802,7 +962,9 @@ async function readCompressedCodex(file, cwd, result) {
     readCodexRow(local, row);
   }
   if (result.limits) {
+    const trace = result.trace ? [...result.trace, ...local.trace] : undefined;
     Object.assign(result, local);
+    if (result.trace) result.trace = trace;
   } else {
     result.messages.push(...local.messages);
     if (result.messages.length > maxMessages) result.messages.splice(0, result.messages.length - maxMessages);
@@ -855,9 +1017,9 @@ async function readJsonlHistory(descriptor, cwd, config, result) {
 
   // Active transcripts may have a torn last row. Large transcripts keep the latest bounded tail.
   const { history } = transcript;
-  if (transcript.truncated) result.truncated = true;
+  if (transcript.truncated) markSourcePartial(result);
   for (const row of history) {
-    if (result.limits && row.isCompactSummary) result.truncated = true;
+    if (result.limits && row.isCompactSummary) markSourcePartial(result);
     if (row.isSidechain || row.isMeta || row.isCompactSummary) continue;
     if (descriptor.kind === 'codex') {
       readCodexRow(result, row);
@@ -932,7 +1094,7 @@ async function readDatabaseHistory(descriptor, cwd, config, result) {
   }
   for (const row of snapshot.legacy ?? []) appendMessage(result, row.role, textBlocks(row.parts, result), row.time);
   if (result.limits && (snapshot.messages ?? snapshot.projection ?? snapshot.legacy ?? []).length > result.limits.messages) {
-    result.truncated = true;
+    markSourcePartial(result);
   }
 }
 
@@ -946,8 +1108,30 @@ async function readHistory(archive, cwd, config, result) {
 }
 
 export async function readConversationHistory(archive, cwd, config) {
-  const result = { messages: [], usedSkills: new Set(), limits: conversationLimits, characters: 0, truncated: false };
+  const result = {
+    messages: [], usedSkills: new Set(), limits: conversationLimits, characters: 0, truncated: false,
+    trace: [], traceKeys: new Set(), traceOrder: 0, messageSeq: 0, turn: 0, turnRef: undefined,
+    readStats: { userMessages: 0, assistantMessages: 0, timedMessages: 0 },
+  };
   await readHistory(archive, cwd, config, result);
+  const calls = new Map();
+  for (const item of result.trace) {
+    if (item.kind !== 'tool_call') continue;
+    item.status = 'missing';
+    if (item.callId) calls.set(item.callId, item);
+  }
+  for (const item of result.trace) {
+    if (item.kind !== 'tool_result') continue;
+    const call = calls.get(item.callId);
+    item.turnRef = call?.turnRef;
+    if (!call) {
+      result.truncated = true;
+      continue;
+    }
+    call.status = item.status;
+    item.name = call.name;
+    item.turn = call.turn;
+  }
   if (result.messages[0]?.role === 'assistant' && result.removedQuestion) {
     // The latest retained replies may belong to a long turn whose question
     // fell out of the sliding budget. Keep that real question with its replies.
@@ -958,7 +1142,32 @@ export async function readConversationHistory(archive, cwd, config) {
     result.messages.unshift(question);
   }
   const start = result.messages.findIndex(message => message.role === 'user');
-  return { messages: start < 0 ? [] : result.messages.slice(start), truncated: result.truncated || start > 0 };
+  const retained = start < 0 ? [] : result.messages.slice(start);
+  // The last displayed reply in each source turn is its disclosure anchor.
+  // A turn without a reply is anchored to its own user message.
+  const indexOf = new Map(retained.map((message, index) => [message.turnRef, index]));
+  const trace = result.trace
+    .filter(item => item.turnRef !== undefined && indexOf.has(item.turnRef))
+    .map(({ turnRef, ...item }) => ({ ...item, messageIndex: indexOf.get(turnRef) }))
+    .sort((a, b) => a.turn - b.turn || a.order - b.order);
+  const byMessage = new Map()
+  for (const item of trace) {
+    if (!Number.isInteger(item.messageIndex)) continue;
+    byMessage.set(item.messageIndex, [...(byMessage.get(item.messageIndex) ?? []), item.id]);
+  }
+  const { userMessages, assistantMessages, timedMessages, firstAt, lastAt, tokens } = result.readStats;
+  const sourceStats = {
+    userMessages, assistantMessages, importedMessages: retained.length, partial: result.sourcePartial === true,
+    ...(timedMessages >= 2 && timedMessages === userMessages + assistantMessages ? { elapsedMs: lastAt - firstAt } : {}),
+    ...(tokens ? { tokens } : {}),
+  };
+  return {
+    messages: retained.map(({ turnRef, ...message }, index) => ({ ...message, ...(byMessage.has(index) ? { traceIds: byMessage.get(index) } : {}) })),
+    trace,
+    sourceStats,
+    usedSkills: [...result.usedSkills].sort(),
+    truncated: result.truncated || start > 0,
+  };
 }
 
 export async function readProjectHistory(project, config) {

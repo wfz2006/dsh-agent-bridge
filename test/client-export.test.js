@@ -4,31 +4,44 @@ import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 
 const source = await readFile(new URL('../src/client.js', import.meta.url), 'utf8');
+const packageData = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const origin = 'http://127.0.0.1:8300';
 const panelUrl = `${origin}/agent-bridge/panel`;
 
-function mount({ rows, events = () => { throw new Error('Unexpected history read'); }, services }) {
+test('client registrations use the installed package name', () => {
+  assert.ok(source.includes(`id: '${packageData.name}'`));
+});
+
+function mount({ rows, events = () => { throw new Error('Unexpected history read'); }, services, fetch }) {
   const replies = [];
   let onMessage;
   let renderPanel;
   let plugin;
+  const slots = new Map();
   const frame = { location: { href: panelUrl }, postMessage: (message) => replies.push(structuredClone(message)) };
   const window = {
     origin,
-    __ModuleLoader__: { load: ({ factory }) => { plugin = factory(() => ({
-      createElement() {},
-      useEffect: (effect) => effect(),
-      useRef: () => ({ current: { contentWindow: frame } }),
-    })); } },
+    __ModuleLoader__: { load: ({ factory }) => { plugin = factory(name => name === 'react-dom'
+      ? { createPortal: node => node }
+      : {
+        createElement() {},
+        useEffect: (effect) => effect(),
+        useRef: () => ({ current: { contentWindow: frame } }),
+        useState: init => [typeof init === 'function' ? init() : init, () => {}],
+        useCallback: fn => fn,
+      }); } },
     addEventListener: (_type, listener) => { onMessage = listener; },
   };
-  runInNewContext(source, { window, document: { baseURI: `${origin}/` }, URL, AbortController, AbortSignal });
+  runInNewContext(source, { window, document: { baseURI: `${origin}/` }, URL, AbortController, AbortSignal, fetch });
   plugin.apply({
     effect: (effect) => effect(),
     locale: { register() {}, bind: () => value => value },
     slots: {
       inject: (_slot, register) => register(),
-      register: (props, render) => { if (props.name === 'main') renderPanel = render; },
+      register: (props, render) => {
+        slots.set(props.name, render);
+        if (props.name === 'main') renderPanel = render;
+      },
     },
     sessions: { list: { getSnapshot: () => ({
       phase: 'ready', ids: rows.map(row => row.id), byId: Object.fromEntries(rows.map(row => [row.id, row])),
@@ -37,11 +50,13 @@ function mount({ rows, events = () => { throw new Error('Unexpected history read
     ...services,
   });
   renderPanel();
-  return async (type, data = {}, event = {}) => {
+  const send = async (type, data = {}, event = {}) => {
     replies.length = 0;
     await onMessage({ origin, source: frame, data: { type: `dsh-agent-bridge:${type}`, requestId: 'req-1', ...data }, ...event });
     return replies[0];
   };
+  send.slots = slots;
+  return send;
 }
 
 const project = { id: 'session-a', title: 'Project session', cwd: 'C:\\Code\\Project', updatedAt: 5 };
@@ -181,4 +196,53 @@ test('when the rollback fails, retry reuses the partial session instead of creat
   assert.equal(recovered.sessionId, 'new-1');
   assert.deepEqual(opened, ['new-1']);
   assert.equal(sessions.size, 1);
+});
+
+test('the panel can only ask the host to open a verified project path', async () => {
+  const opened = [];
+  const checks = [];
+  const ids = { projectId: '1'.repeat(24), referenceId: '01234567-0123-0123-0123-012345678901', bridgeNonce: '2'.repeat(64) };
+  const fetch = async (url, options) => {
+    assert.equal(url.href, `${origin}/agent-bridge/api`);
+    assert.equal(options.headers['X-DSH-Agent-Bridge'], ids.bridgeNonce);
+    checks.push(JSON.parse(options.body));
+    return { ok: true, json: async () => ({ path: 'D:\\Demo\\AGENTS.md' }) };
+  };
+  const send = mount({ rows: [], fetch, services: {
+    remote: { session: {
+      async canOpenWorkspacePath() { return { ok: true, value: true } },
+      async openWorkspacePath({ path, action }) {
+        opened.push([path, action]);
+        return { ok: action === 'reveal' };
+      },
+    } },
+  } });
+  assert.equal((await send('open-path', { path: 'D:\\Demo\\AGENTS.md' })).ok, false);
+  const revealed = await send('open-path', { ...ids, path: 'D:\\Unchecked.md' });
+  assert.equal(revealed.ok, true);
+  assert.equal(revealed.revealed, true);
+  assert.deepEqual(opened, [['D:\\Demo\\AGENTS.md', undefined], ['D:\\Demo\\AGENTS.md', 'reveal']]);
+  assert.deepEqual(checks, Array.from({ length: 2 }, () => ({
+    action: 'resolve-open-path', projectId: ids.projectId, referenceId: ids.referenceId,
+  })));
+  assert.equal((await send('open-path', { path: '' })).ok, false);
+  assert.equal((await send('open-path', { path: 'D:\\a\nb' })).ok, false);
+  assert.equal((await send('open-path', { path: 'D:\\Demo' }, { origin: 'https://unrelated.example' })), undefined);
+  assert.equal((await send('open-path', { path: 'D:\\Demo' }, { source: { location: { href: panelUrl } } })), undefined);
+  const refused = mount({ rows: [], services: { remote: { session: {
+    async canOpenWorkspacePath() { return { ok: true, value: false } },
+    async openWorkspacePath() { throw new Error('must not be called'); },
+  } } } });
+  const result = await refused('open-path', ids);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /不支持打开本机文件/);
+});
+
+test('the session header offers a read-only source record entry when the host exposes the slot', () => {
+  const send = mount({ rows: [] });
+  const trace = send.slots.get('conversation.session.header.actions');
+  assert.equal(typeof trace, 'function');
+  assert.match(source, /agent-bridge\/session-trace\?sessionId=/);
+  assert.match(source, /conversation\.session\.header\.actions/);
+  assert.match(source, /createPortal/);
 });

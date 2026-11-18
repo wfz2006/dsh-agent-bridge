@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
+import { saveSessionTrace } from './session-trace.js'
 
 export function nativeSessionServices(ctx) {
   const sessions = ctx.get?.('sessions')
@@ -83,6 +84,19 @@ export async function saveNativeSession(services, record, cwd) {
       record.stored = { header: prepared.header, events }
     } finally {
       await handle.close()
+    }
+  }
+  // Save the reviewed source snapshot before attaching the new DSH session.
+  const hasTrace = Array.isArray(record.trace) && record.trace.length > 0
+  if (!record.traceStored && record.config && (hasTrace || record.sourceStats)) {
+    try {
+      const saved = await saveSessionTrace(record.config, record.sessionId, record.trace, record.sourceStats)
+      record.traceStored = saved.saved === true
+    } catch {
+      throw Object.assign(
+        new Error('会话历史已写入，但来源记录暂时无法保存。可重试。'),
+        { status: 503 },
+      )
     }
   }
   if (!workspace.sessionIds.includes(record.sessionId)) {

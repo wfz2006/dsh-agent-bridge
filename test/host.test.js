@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 import { apply } from '../src/index.js'
 
@@ -13,6 +14,37 @@ test('the panel authenticates, refreshes changed project files, and exports revi
   await writeFile(join(directory, 'AGENTS.md'), 'bridge-test-context')
   const memoryDirectory = join(directory, '.agent-bridge', 'memory')
   await mkdir(memoryDirectory, { recursive: true })
+  const targetName = '设计 #1 (50%).md'
+  const targetPath = join(directory, targetName)
+  const reference = '../../%E8%AE%BE%E8%AE%A1%20%231%20(50%25).md'
+  const notePath = join(memoryDirectory, 'links.md')
+  await writeFile(targetPath, '# target')
+  const scriptPath = join(directory, 'probe.js')
+  const outside = join(directory, 'sibling-source')
+  await mkdir(outside)
+  await mkdir(join(directory, 'references'))
+  await writeFile(join(directory, 'references', 'real.md'), '# real')
+  await writeFile(join(outside, 'real.md'), '# unverified')
+  await writeFile(scriptPath, '// should only be revealed')
+  await writeFile(notePath, `# C#\n\n[打开设计](<${reference}>)\n\n[越界](../../../other.md)\n\n[脚本](../../probe.js)\n\n[资料](../../references/real.md)\n\n[缺失](../../missing.md)`)
+  const traceSessionId = '7d4f5e60-4444-4555-8666-c77788889999'
+  const traceDirectory = join(directory, 'agent-bridge-traces')
+  await mkdir(traceDirectory, { recursive: true })
+  const detachedId = '11111111-1111-1111-1111-111111111111'
+  const statsOnlyId = '22222222-2222-4222-8222-222222222222'
+  const sourceStats = { userMessages: 1, assistantMessages: 2, importedMessages: 3, partial: false }
+  const traceFile = {
+    version: 1, sessionId: traceSessionId, savedAt: '2026-11-17T00:00:00.000Z',
+    trace: [
+      { id: 't0', kind: 'tool_call', name: 'shell', text: 'bridge-trace-arguments', status: 'ok' },
+      { id: 't1', kind: 'tool_result', name: 'shell', text: 'bridge-trace-result', status: 'ok' },
+    ],
+  }
+  await writeFile(join(traceDirectory, `${traceSessionId}.json`), JSON.stringify(traceFile))
+  await writeFile(join(traceDirectory, `${detachedId}.json`), JSON.stringify({ ...traceFile, sessionId: detachedId }))
+  await writeFile(join(traceDirectory, `${statsOnlyId}.json`), JSON.stringify({
+    ...traceFile, sessionId: statsOnlyId, trace: [], sourceStats,
+  }))
   const previousConfig = process.env.DSH_AGENT_BRIDGE_CONFIG
   process.env.DSH_AGENT_BRIDGE_CONFIG = config
   const routes = new Map()
@@ -32,8 +64,18 @@ test('the panel authenticates, refreshes changed project files, and exports revi
         return { rejection: 401 }
       },
     },
+    get: service => service === 'sessionPersistence' ? {
+      stat: async id => [traceSessionId, statsOnlyId].includes(id) ? { header: { id } } : undefined,
+    } : undefined,
   })
-  const server = createServer((req, res) => routes.get(req.url)(req, res))
+  const server = createServer((req, res) => {
+    const route = routes.get(new URL(req.url, 'http://127.0.0.1').pathname)
+    if (!route) {
+      res.writeHead(404).end()
+      return
+    }
+    route(req, res)
+  })
   try {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
     const base = `http://127.0.0.1:${server.address().port}/agent-bridge/`
@@ -58,6 +100,10 @@ test('the panel authenticates, refreshes changed project files, and exports revi
       'opencode', 'qoder', 'qwen', 'trae', 'workbuddy',
     ])
     assert.equal((await fetch(base + listing.agentIcons.copilot)).status, 403)
+    const markdownModule = await fetch(base + 'markdown.js', { headers })
+    assert.equal(markdownModule.status, 200)
+    assert.equal(markdownModule.headers.get('content-type'), 'text/javascript; charset=utf-8')
+    assert.match(await markdownModule.text(), /export function renderMarkdown/)
     for (const path of Object.values(listing.agentIcons)) {
       const icon = await fetch(base + path, { headers })
       assert.equal(icon.status, 200, path)
@@ -77,16 +123,62 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     assert.equal(project.continuedAt, null)
     assert.equal((await api({ action: 'open', path: directory, prompt: 'unreviewed' })).status, 409)
     assert.equal((await api({ action: 'preview', projectId: project.id, assetIds: ['arbitrary'] })).status, 409)
+    assert.equal((await api({ action: 'preview-skill-activation', projectId: project.id, assetIds: ['0'.repeat(24)] })).status, 409)
+    assert.equal((await api({ action: 'apply-skill-activation', ticket: 'missing' })).status, 409)
+    assert.equal((await api({
+      action: 'deactivate-skill-activation', projectId: project.id, activationId: '0'.repeat(24),
+    })).status, 409)
     const detail = await (await api({ action: 'detail', projectId: project.id })).json()
     assert.equal(detail.selection, null)
     const memory = detail.memories.find(entry => entry.file.endsWith('AGENTS.md'))
     assert.ok(memory)
+    const note = detail.memories.find(entry => entry.file === notePath)
+    const body = await (await api({ action: 'asset', projectId: project.id, assetId: note.id })).json()
+    const link = body.references.find(item => item.href === reference)
+    assert.equal(link.path, targetPath)
+    assert.equal(body.references.find(item => item.href === '../../../other.md').error, '文件不在项目范围内。')
+    assert.match(body.references.find(item => item.href === '../../missing.md').error, /已移动、不可访问/)
+    const resolveRef = () => api({ action: 'resolve-open-path', projectId: project.id, referenceId: link.id })
+    assert.equal((await (await resolveRef()).json()).path, targetPath)
+    const linkDraft = await (await api({ action: 'preview', projectId: project.id, assetIds: [note.id] })).json()
+    const downloadLinkDraft = async format => (await (await api({ action: 'export', ticket: linkDraft.ticket, format })).json()).markdown
+    const localWithLink = await downloadLinkDraft('local')
+    assert.ok(localWithLink.includes(`[打开设计](<${pathToFileURL(targetPath).href}>)`), localWithLink)
+    const shareWithPath = await downloadLinkDraft('share')
+    assert.ok(shareWithPath.includes(`打开设计（\`${targetName}\`）`), shareWithPath)
+    assert.doesNotMatch(shareWithPath, /file:\/\/|\[越界\]\(|\[缺失\]\(/)
+    const claimedSavePath = await (await api({ action: 'export', ticket: linkDraft.ticket, format: 'share',
+      savePath: join(directory, 'handoff.md'),
+    })).json()
+    assert.equal(claimedSavePath.markdown, shareWithPath)
+    const script = body.references.find(item => item.href === '../../probe.js')
+    const scriptTarget = await (await api({ action: 'resolve-open-path', projectId: project.id, referenceId: script.id })).json()
+    assert.equal(scriptTarget.revealOnly, true)
+    const linkedAsset = body.references.find(item => item.href === '../../references/real.md')
+    await rename(join(directory, 'references'), join(directory, 'retained-references'))
+    await symlink(outside, join(directory, 'references'), 'junction')
+    assert.equal((await api({ action: 'resolve-open-path', projectId: project.id, referenceId: linkedAsset.id })).status, 409)
+    await rename(targetPath, `${targetPath}.moved`)
+    await writeFile(targetPath, '# replacement')
+    assert.equal((await resolveRef()).status, 409)
+    const localAfterReplacement = await downloadLinkDraft('local')
+    assert.ok(localAfterReplacement.includes(`打开设计（\`${targetName}\`）`), localAfterReplacement)
+    assert.ok(!localAfterReplacement.includes(pathToFileURL(targetPath).href), localAfterReplacement)
+    assert.equal((await api({ action: 'resolve-open-path', projectId: project.id, path: targetPath })).status, 400)
     const pin = await (await api({ action: 'set-project-pin', projectId: project.id, pinned: true })).json()
     assert.equal(pin.pinned, true)
     const selection = await (await api({ action: 'set-project-selection', projectId: project.id, assetIds: [memory.id], history: false })).json()
     assert.deepEqual(selection.selection, { assetIds: [memory.id], history: false })
     const reviewed = await (await api({ action: 'preview', projectId: project.id, assetIds: [memory.id] })).json()
     assert.match(reviewed.prompt, /bridge-test-context/)
+    const openDirectory = await (await api({ action: 'resolve-open-path', projectId: project.id, directory: true })).json()
+    assert.equal(openDirectory.kind, 'directory')
+    assert.equal(openDirectory.path, directory)
+    const openFile = await (await api({ action: 'resolve-open-path', projectId: project.id, assetId: memory.id })).json()
+    assert.equal(openFile.kind, 'file')
+    assert.equal(openFile.path, join(directory, 'AGENTS.md'))
+    assert.equal((await api({ action: 'resolve-open-path', projectId: project.id, assetId: 'f'.repeat(24) })).status, 404)
+    assert.equal((await api({ action: 'resolve-open-path', projectId: project.id, assetId: 'not-an-id' })).status, 400)
     // Even with the owner's nonce, an admitted non-owner must not read or change local data.
     const guest = { ...headers, Cookie: 'signed-in=guest' }
     const forbidden = await Promise.all([
@@ -96,10 +188,15 @@ test('the panel authenticates, refreshes changed project files, and exports revi
       ...[
         { action: 'catalog' }, { action: 'detail', projectId: project.id },
         { action: 'asset', projectId: project.id, assetId: memory.id },
+        { action: 'resolve-open-path', projectId: project.id, assetId: memory.id },
         { action: 'export', ticket: reviewed.ticket }, { action: 'open', ticket: reviewed.ticket },
         { action: 'set-project-archive', projectIds: [project.id], archived: true },
         { action: 'set-project-pin', projectId: project.id, pinned: false },
         { action: 'set-project-selection', projectId: project.id, assetIds: [], history: true },
+        { action: 'preview-skill-activation', projectId: project.id, assetIds: ['0'.repeat(24)] },
+        { action: 'apply-skill-activation', ticket: 'missing' },
+        { action: 'deactivate-skill-activation', projectId: project.id, activationId: '0'.repeat(24) },
+        { action: 'undo-skill-activation', projectId: project.id, activationId: '0'.repeat(24) },
       ].map(body => fetch(base + 'api', { method: 'POST', headers: guest, body: JSON.stringify(body) })),
     ])
     assert.deepEqual(forbidden.map(response => response.status), Array(forbidden.length).fill(403))
@@ -118,18 +215,54 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     assert.equal((await api({ action: 'export', ticket: 'missing' })).status, 409)
     const exported = await (await api({ action: 'export', ticket: reviewed.ticket })).json()
     assert.match(exported.filename, /\.md$/)
-    assert.ok(exported.markdown.includes(reviewed.prompt))
-    const dshSession = await (await api({ action: 'export-session', conversation: {
+    // The export is a human-readable document built from the reviewed preview,
+    // not a verbatim copy of the model draft.
+    assert.match(exported.markdown, /^# .+ · 开发交接$/m)
+    assert.match(exported.markdown, /^## 资料索引$/m)
+    assert.match(exported.markdown, /bridge-test-context/)
+    assert.match(exported.markdown, /file:\/\/\//)
+    assert.match(exported.markdown, /^\*\*工作目录\*\*：\[[^\]]+\]\(<file:\/\/\//m)
+    const conversation = {
       title: '独立 DSH 会话', path: join(directory, 'other'), truncated: true,
       messages: [
         { role: 'user', text: '接续这里。' },
         { role: 'assistant', text: '下一步已记录。 api_key = hide-me-now' },
         { role: 'tool', text: 'raw-tool-output' },
       ],
-    } })).json()
+    }
+    const dshSession = await (await api({ action: 'export-session', conversation, sessionId: traceSessionId })).json()
     assert.match(dshSession.markdown, /下一步已记录/)
     assert.match(dshSession.markdown, /部分内容已截取/)
-    assert.doesNotMatch(dshSession.markdown, /raw-tool-output|hide-me-now/)
+    assert.doesNotMatch(dshSession.markdown, /raw-tool-output|hide-me-now|来源记录/)
+    assert.equal((await fetch(`${base}session-trace?sessionId=not-a-session`, { headers })).status, 400)
+    assert.equal((await fetch(`${base}session-trace?sessionId=${detachedId}`, { headers })).status, 404)
+    const traceResponse = await fetch(`${base}session-trace?sessionId=${traceSessionId}`, { headers })
+    assert.equal(traceResponse.status, 200)
+    const savedTrace = await traceResponse.json()
+    assert.equal(savedTrace.sessionId, traceSessionId)
+    assert.deepEqual(savedTrace.trace.map(item => item.text), ['bridge-trace-arguments', 'bridge-trace-result'])
+    assert.equal(savedTrace.traceCounts.toolCall, 1)
+    assert.equal(savedTrace.sourceStats, undefined)
+    const statsResponse = await fetch(`${base}session-trace?sessionId=${statsOnlyId}`, { headers })
+    assert.equal(statsResponse.status, 200)
+    const savedStats = await statsResponse.json()
+    assert.deepEqual(savedStats.sourceStats, sourceStats)
+    assert.deepEqual(savedStats.trace, [])
+    assert.equal((await fetch(`${base}session-trace?sessionId=${traceSessionId}`, {
+      headers: { Cookie: 'signed-in=guest' },
+    })).status, 403)
+    const withTrace = await api({
+      action: 'export-session', sessionId: traceSessionId, includeTrace: true,
+      conversation: { ...conversation, trace: [{ kind: 'tool_result', text: 'spoofed-result' }] },
+    })
+    assert.equal(withTrace.status, 200)
+    const { markdown } = await withTrace.json()
+    assert.match(markdown, /^## 来源记录$/m)
+    assert.match(markdown, /bridge-trace-result/)
+    assert.doesNotMatch(markdown, /spoofed-result|bridge-trace-arguments/)
+    assert.equal((await api({
+      action: 'export-session', sessionId: detachedId, includeTrace: true, conversation,
+    })).status, 404)
 
     const before = await (await api({ action: 'changes', projectId: project.id })).json()
     const pending = api({ action: 'changes', revision: before.revision, projectId: project.id, wait: true })

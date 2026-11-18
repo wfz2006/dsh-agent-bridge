@@ -1,15 +1,29 @@
 import { describeProjectContext } from './project-context.js'
+import { isMarkdownFile, renderMarkdown } from './markdown.js'
 
 const byId = id => document.getElementById(id)
 const nonce = document.querySelector('meta[name=bridge-nonce]').content
 const dialog = byId('dialog')
+const activateDialog = byId('activate-dialog')
+const activateBody = byId('activate-body')
+const activateStatus = byId('activate-status')
+const activateConfirm = byId('activate-confirm')
+const activateText = byId('activate-text')
+const activateClose = byId('activate-close')
 const importButton = byId('import')
 const recoverDraftButton = byId('recover-draft')
 const exportButton = byId('export')
+const exportShareButton = byId('export-share')
+const exportTraceOption = byId('export-trace-option')
+const exportTrace = byId('export-trace')
 const exportDownload = byId('export-download')
+const skillUndo = byId('skill-undo')
+const skillDeactivate = byId('skill-deactivate')
+const skillApply = byId('skill-apply')
 const dialogClose = byId('dialog-close')
 const dialogText = byId('dialog-text')
 const sessionSelect = byId('session-select')
+const sessionSourceRecord = byId('session-source-record')
 const historySearch = byId('history-search')
 const historyResults = byId('history-results')
 const historyImport = byId('history-import')
@@ -56,6 +70,7 @@ const materialGroups = [
   ['used', '会话中提及的 Skills', '在这个项目的近期对话中有记录。'],
   ['notes', '其他项目笔记', '经验、决策和存档，可按需带入。'],
   ['skills', '其他项目 Skills', '放在项目目录里，按任务选用。'],
+  ['managed', '已启用的项目 Skills', '来源不可再扫描时，私有快照仍可管理和停用。'],
 ]
 const globalGroups = [
   ['guides', '通用指引'],
@@ -100,6 +115,7 @@ let dialogMode
 let dialogEpoch = 0
 let dialogBusy = false
 let nativeSessions = []
+let sessionTraceRequest
 let recentRevision = 0
 let recentKey = ''
 let historyProject
@@ -112,6 +128,15 @@ let draftRecovery
 let historyPreview = 0
 let downloadUrl
 let requestNumber = 0
+let dialogSkillCandidates = []
+let dialogSkillIds = new Set()
+let skillPreviewTicket
+let skillManagerAsset
+let skillManagerProject
+let previewInput
+let activationReview
+let activationSummary = ''
+let exportHasTrace = false
 
 const clockFormat = new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium', hourCycle: 'h23' })
 const historyDateFormat = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' })
@@ -124,6 +149,52 @@ const text = (tag, content, className) => {
   element.textContent = content
   if (className) element.className = className
   return element
+}
+
+function renderProjectMarkdown(source, projectId, references = []) {
+  const links = new Map(references.map(reference => [reference.href, reference]))
+  return renderMarkdown(source, document, href => {
+    const reference = links.get(href)
+    if (!reference) return undefined
+    const container = text('span', '', 'md-reference')
+    const label = text('button', '', 'md-link md-reference-open')
+    label.type = 'button'
+    label.title = reference.path
+    label.addEventListener('click', () => {
+      if (reference.id) void openPath({ projectId, label: label.textContent, referenceId: reference.id })
+      else status(reference.error, true, 'dialog-status')
+    })
+    const copy = text('button', '', 'path-copy')
+    copy.type = 'button'
+    copy.append(icon('copy'))
+    copy.title = '复制链接路径'
+    copy.setAttribute('aria-label', `复制链接路径 ${reference.path}`)
+    copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(reference.path)
+        status('链接路径已复制。', false, 'dialog-status')
+      } catch {
+        const path = text('code', reference.path, 'preview-source')
+        const selection = window.getSelection()
+        status('请手动复制链接路径。', true, 'dialog-status')
+        byId('dialog-status').append(' ', path)
+        const range = document.createRange()
+        range.selectNodeContents(path)
+        selection?.removeAllRanges()
+        selection?.addRange(range)
+      }
+    })
+    container.append(label, copy)
+    return { container, label }
+  })
+}
+
+function markdownBody(source, className, projectId, references) {
+  const body = document.createElement('div')
+  body.className = className
+  body.dataset.format = 'markdown'
+  body.append(renderProjectMarkdown(source, projectId, references))
+  return body
 }
 
 function icon(name, className = '') {
@@ -633,6 +704,69 @@ function matchesMaterial(asset, query) {
     .some(value => value?.toLowerCase().includes(query))
 }
 
+function actionableSkill(candidate) {
+  return Boolean(candidate?.allowed && ['enable', 'update', 'reuse-native'].includes(candidate.action))
+}
+
+function skillStatusNode(status) {
+  const node = text('span', status?.label || '仅可带入说明', 'skill-status')
+  node.dataset.state = status?.state || 'handoff'
+  node.title = status?.detail || status?.reason || ''
+  return node
+}
+
+function syncSkillChoiceButtons() {
+  const count = dialogSkillIds.size
+  if (historyImport.hidden === false) {
+    byId('history-import-label').textContent = importedSessionId
+      ? '打开已迁入会话'
+      : count ? `启用 ${count} 项并继续` : '迁入并继续'
+  }
+  if (importButton.hidden === false) {
+    importButton.replaceChildren(
+      document.createTextNode(count ? '启用并继续' : '打开新对话'),
+      icon('arrow'),
+    )
+  }
+}
+
+function renderSkillChoices(candidates, { history = false } = {}) {
+  dialogSkillCandidates = Array.isArray(candidates) ? candidates : []
+  dialogSkillIds = new Set()
+  if (!dialogSkillCandidates.length) return null
+  const panel = text('section', '', 'skill-choice-panel')
+  panel.setAttribute('aria-label', '沿用技能（可选）')
+  const heading = text('div', '', 'skill-choice-heading')
+  heading.append(
+    text('strong', '沿用技能（可选）'),
+    text('span', history ? '从历史记录匹配到本机技能；不会自动选择。' : '选中后由 DSH 原生技能目录调用。'),
+  )
+  const list = text('div', '', 'skill-choice-list')
+  for (const candidate of dialogSkillCandidates) {
+    const label = text('label', '', 'skill-choice')
+    const checkbox = document.createElement('input')
+    checkbox.type = 'checkbox'
+    checkbox.disabled = !actionableSkill(candidate)
+    checkbox.setAttribute('aria-label', `${candidate.name || candidate.dshName || '技能'}：${candidate.label}`)
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) dialogSkillIds.add(candidate.assetId)
+      else dialogSkillIds.delete(candidate.assetId)
+      label.classList.toggle('selected', checkbox.checked)
+      syncSkillChoiceButtons()
+    })
+    const detail = text('span', '', 'skill-choice-text')
+    detail.append(
+      text('span', candidate.name || candidate.dshName || '技能', 'skill-choice-name'),
+      text('span', [candidate.label, candidate.detail || candidate.reason].filter(Boolean).join(' · '), 'skill-choice-note'),
+    )
+    label.append(checkbox, detail)
+    list.append(label)
+  }
+  panel.append(heading, list)
+  syncSkillChoiceButtons()
+  return panel
+}
+
 function renderGlobalCount() {
   const assets = context.entries.filter(asset => asset.global)
   const query = assetSearch.value.trim().toLowerCase()
@@ -650,6 +784,7 @@ function makeMaterialRow(asset) {
   checkbox.className = 'asset-check'
   checkbox.id = `asset-${asset.id}`
   checkbox.checked = selected.has(asset.id)
+  checkbox.disabled = Boolean(asset.managedOnly)
   row.dataset.selected = String(checkbox.checked)
   checkbox.addEventListener('change', () => {
     if (checkbox.checked && selected.size >= 24) {
@@ -670,6 +805,12 @@ function makeMaterialRow(asset) {
   const title = text('span', name, 'asset-title')
   const meta = text('span', '', 'asset-meta')
   if (asset.agent) meta.append(agentLabel(asset.agent))
+  if (asset.kind === 'skill' && asset.handoff) {
+    meta.append(skillStatusNode(asset.handoff))
+    const note = asset.handoff.reason || (asset.handoff.sourceChanged
+      || asset.handoff.state === 'pending' || asset.handoff.manualOnly ? asset.handoff.detail : '')
+    if (note) meta.append(text('span', note, 'asset-status-note'))
+  }
   if (!asset.global && context.suggestedIds.includes(asset.id)) {
     meta.append(text('span', '建议带入', 'material-suggestion'))
   } else if (asset.global && asset.used) {
@@ -677,14 +818,40 @@ function makeMaterialRow(asset) {
   }
   label.append(title, meta)
   const button = text('button', '', 'asset-view')
-  button.append(document.createTextNode('查看'), icon('chevron'))
+  const manageable = asset.kind === 'skill' && asset.handoff
+    && detail?.skillNativeAvailable && (asset.managedOnly || asset.handoff.state !== 'native')
+  const action = asset.handoff?.action
+  const actionLabel = !manageable ? '查看'
+    : asset.managedOnly || asset.handoff?.state === 'active' ? '管理'
+      : action === 'enable' ? '启用'
+        : action === 'preview-update' ? '更新'
+          : '详情'
+  button.append(document.createTextNode(actionLabel), icon('chevron'))
   button.type = 'button'
   button.id = `asset-view-${asset.id}`
-  button.setAttribute('aria-label', `查看 ${name}`)
-  button.addEventListener('click', () => viewAsset(asset))
+  button.setAttribute('aria-label', `${actionLabel} ${name}`)
+  button.addEventListener('click', () => {
+    if (!manageable) viewAsset(asset)
+    else if (asset.managedOnly) openManagedSkill(asset)
+    else openSkillManager(asset)
+  })
   const marker = text('span', '', 'asset-icon')
   marker.append(icon(asset.kind))
-  row.append(checkbox, marker, label, button)
+  row.append(checkbox, marker, label)
+  // Global library entries are outside the selected project's asset list, so
+  // the Host cannot re-verify them for this project. Only project assets get
+  // an open action; every row keeps its checkbox and detail button.
+  if (!asset.global) {
+    const open = text('button', '', 'asset-open')
+    open.type = 'button'
+    open.append(icon('folder'))
+    open.id = `asset-open-${asset.id}`
+    open.setAttribute('aria-label', `在 DSH 中打开 ${name}`)
+    open.title = '在 DSH 中打开'
+    open.addEventListener('click', () => { void openPath({ label: name, assetId: asset.id }) })
+    row.append(open)
+  }
+  row.append(button)
   return row
 }
 
@@ -725,8 +892,48 @@ function renderAssets() {
 
 function applyDetail(project, loaded, preserve) {
   showProject(loaded.project ?? project)
+  const existingSkillIds = new Set(loaded.skills.map(skill => skill.id))
+  const managedOnly = (loaded.managedSkills ?? [])
+    .filter(item => !existingSkillIds.has(item.assetId))
+    .map(item => ({
+      id: item.assetId,
+      name: item.sourceName || item.dshName,
+      agent: 'dsh',
+      scope: 'project',
+      detail: 'Bridge 启用项',
+      file: item.sourceFile,
+      used: false,
+      managedOnly: true,
+      handoff: {
+        label: item.label,
+        state: item.state,
+        action: 'manage',
+        allowed: true,
+        current: item.state === 'active',
+        sourceChanged: item.sourceChanged,
+        sourceState: item.sourceState,
+        activationId: item.activationId,
+        dshName: item.dshName,
+        canUndo: item.canUndo,
+        registered: true,
+        discovered: item.discovered,
+        verified: item.verified,
+        invocation: item.invocation,
+        modelInvocable: item.modelInvocable,
+        userInvocable: item.userInvocable,
+        manualOnly: item.manualOnly,
+        disabled: item.disabled,
+        canOmitBody: item.canOmitBody,
+        detail: item.detail,
+        reason: item.detail,
+      },
+    }))
+  if (managedOnly.length) loaded = { ...loaded, skills: [...loaded.skills, ...managedOnly] }
   detail = loaded
   context = describeProjectContext(loaded)
+  for (const entry of context.entries) {
+    if (entry.managedOnly) entry.group = 'managed'
+  }
   if (!preserve) {
     const saved = projectSelections.get(project.id) ?? loaded.selection
     if (saved) {
@@ -737,7 +944,7 @@ function applyDetail(project, loaded, preserve) {
       includeHistory = false
     }
   }
-  const available = new Set(context.entries.map(item => item.id))
+  const available = new Set(context.entries.filter(item => !item.managedOnly).map(item => item.id))
   selected = new Set([...selected].filter(id => available.has(id)))
   historyOption.checked = includeHistory && detail.historyCount > 0
   historyOption.disabled = detail.historyCount === 0
@@ -1025,9 +1232,14 @@ function setDialogBusy(busy) {
   importButton.disabled = busy
   recoverDraftButton.disabled = busy
   exportButton.disabled = busy
+  exportShareButton.disabled = busy
+  exportTrace.disabled = busy
   sessionSelect.disabled = busy
   byId('history-back-button').disabled = busy
   historyImport.disabled = busy
+  skillApply.disabled = busy
+  skillUndo.disabled = busy
+  skillDeactivate.disabled = busy
 }
 
 function showDialog(mode, title, note, body, assetKind = 'memory') {
@@ -1035,16 +1247,30 @@ function showDialog(mode, title, note, body, assetKind = 'memory') {
   dialog.dataset.mode = mode
   ticket = undefined
   nativeSessions = []
+  sessionTraceRequest?.abort()
+  sessionSourceRecord.replaceChildren()
   historyProject = undefined
   historySessions = undefined
   historyChosenId = undefined
   historyTicket = undefined
   importedSessionId = undefined
   draftRecovery = undefined
+  dialogSkillCandidates = []
+  dialogSkillIds = new Set()
+  skillPreviewTicket = undefined
+  skillManagerAsset = undefined
+  skillManagerProject = undefined
+  previewInput = undefined
+  activationReview = undefined
+  activationSummary = ''
+  if (activateDialog.open) activateDialog.close()
   clearDownload()
   byId('dialog-title').textContent = title
   byId('dialog-note').textContent = note
-  byId('dialog-mark').replaceChildren(icon(mode === 'session' ? 'download' : mode === 'asset' ? assetKind : mode === 'history' ? 'history' : 'bridge'))
+  byId('dialog-mark').replaceChildren(icon(mode === 'session' ? 'download'
+    : mode === 'asset' ? assetKind
+      : mode === 'history' ? 'history'
+        : mode === 'skill' ? 'skill' : 'bridge'))
   dialogText.hidden = false
   dialogText.dataset.format = 'plain'
   dialogText.textContent = body
@@ -1056,7 +1282,13 @@ function showDialog(mode, title, note, body, assetKind = 'memory') {
   importButton.hidden = true
   recoverDraftButton.hidden = true
   exportButton.hidden = true
+  exportShareButton.hidden = true
+  exportTraceOption.hidden = true
+  exportTrace.checked = false
   historyImport.hidden = true
+  skillApply.hidden = true
+  skillUndo.hidden = true
+  skillDeactivate.hidden = true
   setDialogBusy(false)
   if (!dialog.open) dialog.showModal()
   clearTimeout(pollTimer)
@@ -1072,7 +1304,7 @@ function startHistoryDialog(title, note, body) {
   return epoch
 }
 
-const historyNote = '迁入用户与助手的文字消息。工具记录、附件和运行状态留在来源 Agent。'
+const historyNote = '迁入用户与助手的文字消息，并保留可读取的思考摘要与工具记录，只供查阅。'
 
 function openSourceConversation(session) {
   if (startHistoryDialog('继续旧对话', historyNote, '正在读取这条对话…') === undefined) return
@@ -1110,6 +1342,8 @@ function showHistoryResults() {
   historyTicket = undefined
   importedSessionId = undefined
   historyImport.hidden = true
+  dialogSkillCandidates = []
+  dialogSkillIds = new Set()
   byId('history-back').hidden = true
   byId('dialog-title').textContent = '查看全部对话'
   byId('dialog-note').textContent = '选择一条对话以预览历史消息。'
@@ -1120,6 +1354,126 @@ function showHistoryResults() {
   dialogText.closest('.dialog-content').scrollTop = 0
   const previous = historyChosenId && [...historyResults.querySelectorAll('button')].find(button => button.dataset.session === historyChosenId)
   ;(previous || historySearch).focus()
+}
+
+const traceKindNames = { summary: '思考摘要', tool_call: '工具调用', tool_result: '工具结果' }
+const traceStateNames = { missing: '未记录结果', error: '失败', pending: '待确认', truncated: '已截取' }
+
+function createTraceDisclosure(label, count) {
+  const details = document.createElement('details')
+  details.className = 'trace-disclosure'
+  details.append(text('summary', `${label} · ${count} 项`))
+  return details
+}
+
+// Source trace is read-only: it is shown next to the question it belongs to and
+// never replayed into the new session as a tool event.
+function traceDisclosure(items, turnLabel) {
+  const details = createTraceDisclosure(turnLabel ?? '来源记录', items.length)
+  const list = text('div', '', 'trace-list')
+  let turn
+  for (const item of items) {
+    if (!turnLabel && item.turn && item.turn !== turn) {
+      turn = item.turn
+      list.append(text('h4', `第 ${turn} 轮`, 'trace-turn'))
+    }
+    const row = text('article', '', 'trace-item')
+    row.dataset.kind = item.kind
+    const head = text('div', '', 'trace-head')
+    head.append(text('span', traceKindNames[item.kind] ?? item.kind, 'trace-kind'))
+    if (item.name) head.append(text('code', item.name, 'trace-name'))
+    if (item.callId) head.append(text('code', `调用 ${item.callId}`, 'trace-name'))
+    const state = traceStateNames[item.status]
+    if (state) {
+      const chip = text('span', state, 'trace-state')
+      chip.dataset.state = item.status
+      head.append(chip)
+    }
+    if (item.truncated && item.status !== 'truncated') head.append(text('span', '已截取', 'trace-state'))
+    if (item.time) head.append(text('time', historyDateFormat.format(new Date(item.time)), 'trace-time'))
+    row.append(head)
+    if (item.text) row.append(text('p', item.text, 'trace-text'))
+    else if (item.kind === 'tool_result') row.append(text('p', '未记录结果', 'trace-text trace-empty'))
+    if (item.text && item.kind === 'tool_result') {
+      const copy = text('button', '复制结果摘录', 'trace-copy')
+      copy.type = 'button'
+      copy.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(item.text)
+          copy.textContent = '已复制'
+          setTimeout(() => { copy.textContent = '复制结果摘录' }, 1600)
+        } catch {
+          status('无法访问剪贴板，请手动选择文字复制。', true, 'dialog-status')
+        }
+      })
+      row.append(copy)
+    }
+    list.append(row)
+  }
+  details.append(list)
+  return details
+}
+
+function sessionTraceDisclosure(items) {
+  const turns = new Map()
+  for (const item of items) {
+    const entries = turns.get(item.turn)
+    if (entries) entries.push(item)
+    else turns.set(item.turn, [item])
+  }
+  const details = createTraceDisclosure('来源记录', items.length)
+  const list = text('div', '', 'trace-list trace-turn-list')
+  for (const [turn, entries] of turns) {
+    list.append(traceDisclosure(entries, turn ? `第 ${turn} 轮` : '未标记轮次'))
+  }
+  details.append(list)
+  return details
+}
+
+const formatStatNumber = new Intl.NumberFormat('zh-CN').format
+
+function renderSourceStats(stats, counts = {}, { preview = false } = {}) {
+  const section = text('section', '', 'source-stats')
+  const title = '原对话统计'
+  section.setAttribute('aria-label', title)
+  section.append(text('h3', title))
+  const metrics = text('dl', '', 'source-stats-grid')
+  const notes = []
+  function addMetric(label, value) {
+    const metric = document.createElement('div')
+    metric.append(text('dt', label), text('dd', typeof value === 'number' ? formatStatNumber(value) : value))
+    metrics.append(metric)
+  }
+  if (stats) {
+    const total = stats.userMessages + stats.assistantMessages
+    addMetric('已读轮次', stats.userMessages)
+    addMetric('已读消息', total)
+    notes.push(`用户 ${formatStatNumber(stats.userMessages)} 条，助手 ${formatStatNumber(stats.assistantMessages)} 条`)
+    if (stats.importedMessages !== total) {
+      notes.push(`${preview ? '预览保留' : '已迁入'} ${formatStatNumber(stats.importedMessages)} 条消息`)
+    }
+  }
+  addMetric(preview ? '可带入工具调用' : '已保存工具调用', counts.toolCall ?? 0)
+  if (stats?.elapsedMs !== undefined) {
+    const seconds = Math.floor(stats.elapsedMs / 1000)
+    const hours = Math.floor(seconds / 3600)
+    const minutes = Math.floor(seconds / 60) % 60
+    const remainder = String(seconds % 60).padStart(2, '0')
+    addMetric('消息时间跨度', hours ? `${hours}:${String(minutes).padStart(2, '0')}:${remainder}` : `${minutes}:${remainder}`)
+  }
+  if (stats?.tokens) {
+    const { total, input, output } = stats.tokens
+    addMetric('源记录 Token', total)
+    if (input !== undefined && output !== undefined) notes.push(`输入 ${formatStatNumber(input)}，输出 ${formatStatNumber(output)}`)
+  }
+  if (counts.failed) notes.push(`${formatStatNumber(counts.failed)} 次失败`)
+  if (counts.missing) notes.push(`${formatStatNumber(counts.missing)} 次未记录结果`)
+  if (counts.summary) notes.push(`${formatStatNumber(counts.summary)} 段思考摘要`)
+  section.append(metrics)
+  if (notes.length) section.append(text('p', notes.join(' · ')))
+  if (stats?.partial) section.append(text('p', '消息与轮次仅统计已读取的部分原记录。'))
+  if (!stats) section.append(text('p', '旧版迁入的会话，统计来自当时保存的来源记录。'))
+  return section
 }
 
 async function previewSourceConversation(session) {
@@ -1148,19 +1502,31 @@ async function previewSourceConversation(session) {
     const title = text('h3', result.title, 'preview-lead')
     const source = text('p', '', 'preview-context history-source')
     source.append(agentLabel(session.agent), text('code', result.cwd || historyProject.cwd, 'preview-source'))
+    const skillChoices = renderSkillChoices(result.skillCandidates, { history: true })
+    const stats = renderSourceStats(result.sourceStats, result.traceCounts, { preview: true })
+    const traceByMessage = new Map()
+    for (const item of result.trace ?? []) {
+      if (!Number.isInteger(item.messageIndex)) continue
+      traceByMessage.set(item.messageIndex, [...(traceByMessage.get(item.messageIndex) ?? []), item])
+    }
     const summary = text('p', [
-      result.messages.length + ' 条文字消息',
       result.truncated ? '源记录或读取范围有限，部分历史未带入' : '',
       result.canImport ? '' : '原工作目录不可访问，当前可预览',
     ].filter(Boolean).join(' · '), 'preview-context')
     dialogText.dataset.format = 'history'
-    dialogText.replaceChildren(title, source, summary, ...result.messages.map(message => {
+    dialogText.replaceChildren(title, source, stats, ...(summary.textContent ? [summary] : []), ...(skillChoices ? [skillChoices] : []), ...result.messages.map((message, index) => {
       const row = text('section', '', 'history-message')
       row.dataset.role = message.role
-      row.append(text('h3', message.role === 'user' ? '用户' : '助手'), text('p', message.text, 'preview-body'))
+      const body = message.role === 'assistant'
+        ? markdownBody(message.text, 'preview-body')
+        : text('p', message.text, 'preview-body')
+      row.append(text('h3', message.role === 'user' ? '用户' : '助手'), body)
+      const items = traceByMessage.get(index)
+      if (items?.length) row.append(traceDisclosure(items))
       return row
     }))
     historyImport.hidden = !result.canImport
+    syncSkillChoiceButtons()
   } catch (error) {
     if (dialog.open && dialogEpoch === epoch && revision === historyPreview) dialogText.textContent = error.message
   }
@@ -1168,25 +1534,14 @@ async function previewSourceConversation(session) {
 
 async function importSourceConversation() {
   if (!historyTicket || dialogBusy) return
-  setDialogBusy(true)
-  status(importedSessionId ? '正在打开已迁入的会话…' : '正在迁入会话…', false, 'dialog-status')
-  try {
-    if (!importedSessionId) {
-      const result = await api('import-conversation', { ticket: historyTicket })
-      importedSessionId = result.sessionId
-    }
-    await requestParent('open-imported', { sessionId: importedSessionId })
-    dialog.close()
-    status('历史已迁入。打开会话即可继续。')
-  } catch (error) {
-    if (importedSessionId) byId('history-import-label').textContent = '打开已迁入会话'
-    status(error.message, true, 'dialog-status')
-  } finally {
-    setDialogBusy(false)
+  if (!importedSessionId && dialogSkillIds.size) {
+    await beginSkillActivation('history')
+    return
   }
+  await completeHandoff('history', [])
 }
 
-function renderHandoff({ intro, sections, footer }) {
+function renderHandoff({ intro, sections, footer, cwd }, skillCandidates = []) {
   const lead = text('div', '', 'preview-intro')
   const [heading, ...introLines] = intro.split('\n')
   lead.append(text('p', heading, 'preview-lead'))
@@ -1195,6 +1550,9 @@ function renderHandoff({ intro, sections, footer }) {
     if (metadata) {
       const row = text('div', '', 'preview-meta')
       row.append(text('span', metadata[1]), text('code', metadata[2]))
+      if (metadata[1] === '工作目录' && cwd) {
+        row.append(pathActions({ label: '工作目录', path: cwd, directory: true }))
+      }
       lead.append(row)
     } else if (line) lead.append(text('p', line, 'preview-context'))
   }
@@ -1203,13 +1561,28 @@ function renderHandoff({ intro, sections, footer }) {
   const content = sections.map(section => {
     const block = text('section', '', 'preview-section')
     block.append(text('h3', section.label))
-    if (section.file) block.append(text('code', section.file, 'preview-source'))
-    block.append(text('p', section.text.trim(), 'preview-body'))
+    if (section.file) {
+      const fileRow = text('div', '', 'preview-source-row')
+      fileRow.append(
+        text('code', section.file, 'preview-source'),
+        section.assetId
+          ? pathActions({ label: section.label, path: section.file, assetId: section.assetId })
+          : pathActions({ label: section.label, path: section.file }),
+      )
+      block.append(fileRow)
+    }
+    const source = section.text
+    const body = isMarkdownFile(section.file) || section.markdown
+      ? markdownBody(source, 'preview-body', current?.id, section.references)
+      : text('p', source, 'preview-body')
+    block.append(body)
     return block
   })
+  const skillChoices = renderSkillChoices(skillCandidates)
   dialogText.dataset.format = 'handoff'
-  dialogText.replaceChildren(lead, ...content)
+  dialogText.replaceChildren(lead, ...(skillChoices ? [skillChoices] : []), ...content)
   if (footer) dialogText.append(text('p', footer, 'preview-context'))
+  syncSkillChoiceButtons()
 }
 
 async function viewAsset(asset) {
@@ -1218,9 +1591,18 @@ async function viewAsset(asset) {
   try {
     const result = await api('asset', { projectId: project.id, assetId: asset.id })
     if (!dialog.open || dialogEpoch !== epoch) return
-    dialogText.textContent = result.text + (result.truncated ? '\n\n[预览已截取]' : '')
+    if (isMarkdownFile(asset.file)) {
+      dialogText.dataset.format = 'markdown'
+      dialogText.replaceChildren(renderProjectMarkdown(result.text, project.id, result.references))
+      if (result.truncated) dialogText.append(text('p', '[预览已截取，完整内容见来源文件。]', 'preview-context'))
+    } else {
+      dialogText.textContent = result.text + (result.truncated ? '\n\n[预览已截取]' : '')
+    }
   } catch (error) {
-    if (dialog.open && dialogEpoch === epoch) status(error.message, true, 'dialog-status')
+    if (dialog.open && dialogEpoch === epoch) {
+      dialogText.dataset.format = 'plain'
+      dialogText.textContent = error.message
+    }
   }
 }
 
@@ -1232,13 +1614,20 @@ async function preview() {
     : '原工作目录不可访问。可将现有交接资料导出为 Markdown。'
   const epoch = showDialog('handoff', `草稿预览 · ${project.name}`, note, '正在准备…')
   try {
-    const result = await api('preview', { projectId: project.id, assetIds: [...selected], history: historyOption.checked })
+    const input = { projectId: project.id, assetIds: [...selected], history: historyOption.checked }
+    previewInput = input
+    const result = await api('preview', input)
     if (!dialog.open || dialogEpoch !== epoch) return
     ticket = result.ticket
-    if (result.preview) renderHandoff(result.preview)
+    if (result.preview) renderHandoff(result.preview, result.skillCandidates)
     else dialogText.textContent = result.prompt
     importButton.hidden = result.canImport === false || !project.online
     exportButton.hidden = false
+    exportShareButton.hidden = false
+    exportHasTrace = Boolean(result.preview?.trace?.length)
+    exportTraceOption.hidden = !exportHasTrace
+    exportTrace.checked = false
+    syncSkillChoiceButtons()
     if (result.truncated) status('部分资料已截取。完整内容可在来源文件查看。', false, 'dialog-status')
   } catch (error) {
     if (dialog.open && dialogEpoch === epoch) status(error.message, true, 'dialog-status')
@@ -1265,16 +1654,178 @@ function requestParent(type, values, requestId = `bridge-${Date.now()}-${++reque
   })
 }
 
-async function importSession() {
+async function reloadCurrentDetail(preserve = true) {
+  if (!current || !detail) return false
+  const project = current
+  const revision = detailRevision
+  const loaded = await api('detail', { projectId: project.id })
+  if (revision !== detailRevision || current?.id !== project.id) return false
+  applyDetail(project, loaded, preserve)
+  return true
+}
+
+function appliedSkillSummary(result) {
+  const confirmed = result.items.filter(item => item.applied && item.verified && item.canOmitBody).length
+  const disabled = result.items.filter(item => item.applied && item.verified && item.disabled).length
+  const pending = result.items.filter(item => item.applied && !item.verified).length
+  const failed = result.items.filter(item => !item.applied).length
+  const parts = [
+    confirmed ? `已确认 ${confirmed} 项` : '',
+    disabled ? `已登记但当前不可调用 ${disabled} 项` : '',
+    pending ? `待 DSH 确认 ${pending} 项` : '',
+    failed ? `未启用 ${failed} 项` : '',
+  ].filter(Boolean)
+  return parts.length ? `${parts.join('，')}。` : '没有技能被更改。'
+}
+
+function setActivationBusy(busy) {
+  activateConfirm.disabled = busy
+  activateText.disabled = busy
+  activateClose.disabled = busy
+}
+
+function renderActivationReview(review) {
+  const selectedNames = new Map(context?.entries.map(entry => [entry.id, entry]) ?? [])
+  const panel = text('div', '', 'skill-manager')
+  const lead = text('div', '', 'preview-intro')
+  lead.append(text('p', `目标项目 · ${review.project.name}`, 'preview-lead'))
+  const root = review.projectRoot || detail?.skillProjectRoot || review.project.cwd
+  const rootRow = text('div', '', 'preview-meta')
+  rootRow.append(text('span', '启用范围'), text('code', root))
+  lead.append(rootRow, text('p', '确认后只登记允许的版本；冲突项和确认失败项仍保留文字摘录。', 'preview-context'))
+  panel.append(lead)
+  for (const item of review.items) {
+    const source = selectedNames.get(item.assetId)
+    const block = text('section', '', 'preview-section')
+    block.append(text('h3', `${item.name || item.dshName} → ${item.dshName}`))
+    const state = text('p', '', 'preview-context')
+    state.append(skillStatusNode(item))
+    block.append(state)
+    if (source?.file) block.append(text('code', source.file, 'preview-source'))
+    if (item.fileCount) {
+      block.append(text('p',
+        `${item.fileCount} 个文件 · ${item.resources?.scripts ?? 0} 个脚本 · ${item.resources?.references ?? 0} 个参考 · ${item.resources?.assets ?? 0} 个资源`,
+        'preview-context'))
+    }
+    if (item.scriptFiles?.length) block.append(text('p', `脚本：${item.scriptFiles.join('、')}`, 'preview-context'))
+    if (item.detail || item.reason) block.append(text('p', item.detail || item.reason, 'preview-context'))
+    panel.append(block)
+  }
+  activateBody.replaceChildren(panel)
+  const confirmable = review.items.filter(actionableSkill).length
+  const already = review.items.filter(item => item.verified && item.canOmitBody
+    && ['reuse-active', 'native'].includes(item.action)).length
+  activateConfirm.hidden = confirmable + already === 0
+  activateConfirm.replaceChildren(
+    document.createTextNode(confirmable ? `确认启用 ${confirmable} 项并继续`
+      : already ? '沿用已发现技能并继续' : '没有可启用项'),
+    icon('arrow'),
+  )
+  activateText.hidden = false
+  activateText.textContent = '仅文字继续'
+  activateStatus.textContent = ''
+}
+
+async function beginSkillActivation(purpose) {
+  const project = purpose === 'history' ? historyProject : current
+  if (!project || !dialogSkillIds.size) {
+    await completeHandoff(purpose, [])
+    return
+  }
+  try {
+    const preview = await api('preview-skill-activation', {
+      projectId: project.id, assetIds: [...dialogSkillIds],
+    })
+    activationReview = { ...preview, project, purpose }
+    activationSummary = ''
+    renderActivationReview(activationReview)
+    if (!activateDialog.open) activateDialog.showModal()
+  } catch (error) {
+    status(error.message, true, purpose === 'history' ? 'dialog-status' : 'dialog-status')
+  }
+}
+
+async function confirmSkillActivation() {
+  if (!activationReview || activateConfirm.disabled) return
+  setActivationBusy(true)
+  activateStatus.textContent = '正在保存完整技能包…'
+  try {
+    const previewConfirmed = activationReview.items.filter(item => item.verified && item.canOmitBody
+      && ['reuse-active', 'native'].includes(item.action)).map(item => item.assetId)
+    const actionable = activationReview.items.filter(actionableSkill)
+    let appliedItems = []
+    if (actionable.length) {
+      const applied = await api('apply-skill-activation', { ticket: activationReview.ticket })
+      appliedItems = applied.items
+      activationSummary = appliedSkillSummary(applied)
+    } else {
+      activationSummary = previewConfirmed.length ? '沿用已由 DSH 发现的技能。' : ''
+    }
+    const confirmedIds = [
+      ...previewConfirmed,
+      ...appliedItems.filter(item => item.applied && item.verified && item.canOmitBody).map(item => item.assetId),
+    ]
+    const purpose = activationReview.purpose
+    activationReview = undefined
+    activateDialog.close()
+    await completeHandoff(purpose, [...new Set(confirmedIds)])
+  } catch (error) {
+    activateStatus.textContent = error.message
+  } finally {
+    setActivationBusy(false)
+  }
+}
+
+async function continueWithTextOnly() {
+  if (!activationReview || activateText.disabled) return
+  const purpose = activationReview.purpose
+  activationReview = undefined
+  activationSummary = '未启用技能，继续使用文字交接。'
+  activateDialog.close()
+  await completeHandoff(purpose, [])
+}
+
+async function completeHandoff(purpose, confirmedSkillIds) {
+  if (purpose === 'history') {
+    if (!historyTicket || dialogBusy) return
+    setDialogBusy(true)
+    status(importedSessionId ? '正在打开已迁入的会话…' : '正在迁入会话…', false, 'dialog-status')
+    try {
+      if (!importedSessionId) {
+        const result = await api('import-conversation', { ticket: historyTicket })
+        importedSessionId = result.sessionId
+      }
+      await requestParent('open-imported', { sessionId: importedSessionId })
+      dialog.close()
+      status(`历史已迁入。打开会话即可继续。${activationSummary}`)
+    } catch (error) {
+      if (importedSessionId) byId('history-import-label').textContent = '打开已迁入会话'
+      status(error.message, true, 'dialog-status')
+    } finally {
+      setDialogBusy(false)
+    }
+    return
+  }
+
   if (!ticket || dialogBusy || importButton.hidden) return
   setDialogBusy(true)
   status(draftRecovery ? '正在重试填入草稿…' : '正在创建 DSH 会话…', false, 'dialog-status')
   try {
+    if (confirmedSkillIds.length && previewInput) {
+      try {
+        const revised = await api('preview', { ...previewInput, nativeSkillIds: confirmedSkillIds })
+        ticket = revised.ticket
+      } catch (error) {
+        activationSummary += ` ${error.message} 已保留技能正文。`
+        const revised = await api('preview', previewInput)
+        ticket = revised.ticket
+      }
+    }
     const { path, prompt } = await api('open', { ticket })
     await requestParent('open', { path, prompt, bridgeNonce: nonce }, ticket)
     ticket = undefined
     dialog.close()
-    status('DSH 会话已打开。交接草稿已填入输入框。')
+    status(`DSH 会话已打开。交接草稿已填入输入框。${activationSummary}`)
   } catch (error) {
     if (Object.hasOwn(error, 'recoverySessionId')) draftRecovery = error.recoverySessionId
     recoverDraftButton.hidden = !draftRecovery
@@ -1282,6 +1833,151 @@ async function importSession() {
   } finally {
     setDialogBusy(false)
   }
+}
+
+function renderSkillManager(result, asset) {
+  const item = result.items[0]
+  skillPreviewTicket = result.ticket
+  if (!item) {
+    dialogText.textContent = '没有收到技能状态。'
+    return
+  }
+  const panel = text('div', '', 'skill-manager')
+  const lead = text('div', '', 'preview-intro')
+  lead.append(text('p', item.name || asset.name, 'preview-lead'))
+  const state = text('p', '', 'preview-context')
+  state.append(skillStatusNode(item))
+  lead.append(state)
+  const meta = text('div', '', 'skill-manager-meta')
+  const addMeta = (label, value, code = false) => {
+    if (!value) return
+    const row = text('div', '')
+    row.append(text('span', label), code ? text('code', value) : document.createTextNode(value))
+    meta.append(row)
+  }
+  addMeta('DSH 名称', item.dshName || asset.name, true)
+  addMeta('启用范围', item.scopeRoot || detail?.skillProjectRoot)
+  addMeta('来源', asset.file, true)
+  if (item.fileCount) addMeta('包内容', `${item.fileCount} 个文件 · ${item.resources?.scripts ?? 0} 个脚本 · ${item.resources?.references ?? 0} 个参考 · ${item.resources?.assets ?? 0} 个资源`)
+  lead.append(meta)
+  if (item.detail || item.reason) lead.append(text('p', item.detail || item.reason, 'preview-context'))
+  panel.append(lead)
+  dialogText.dataset.format = 'handoff'
+  dialogText.replaceChildren(panel)
+
+  const canApply = actionableSkill(item)
+  skillApply.hidden = !canApply
+  skillApply.dataset.action = item.action
+  byId('skill-apply-label').textContent = item.action === 'update'
+    ? '更新并切换'
+    : item.action === 'reuse-native' ? '登记复用' : '启用技能'
+  skillDeactivate.hidden = !asset.handoff?.activationId
+  skillUndo.hidden = !(asset.handoff?.activationId && asset.handoff?.canUndo)
+}
+
+async function openSkillManager(asset) {
+  if (!current || dialog.open) return
+  const project = current
+  const epoch = showDialog('skill', `技能 · ${materialName(asset)}`, '核对 DSH 名称、启用范围和完整包内容。', '正在核对技能包…', 'skill')
+  skillManagerAsset = asset
+  skillManagerProject = project
+  try {
+    const result = await api('preview-skill-activation', { projectId: project.id, assetIds: [asset.id] })
+    if (!dialog.open || dialogEpoch !== epoch) return
+    renderSkillManager(result, asset)
+  } catch (error) {
+    if (dialog.open && dialogEpoch === epoch) dialogText.textContent = error.message
+  }
+}
+
+function openManagedSkill(asset) {
+  if (!current || dialog.open) return
+  const project = current
+  showDialog('skill', `技能 · ${materialName(asset)}`, '核对已保存登记；来源不可扫描时仍可停用。', '', 'skill')
+  skillManagerAsset = asset
+  skillManagerProject = project
+  renderSkillManager({
+    ticket: undefined,
+    items: [{
+      assetId: asset.id,
+      name: asset.name,
+      dshName: asset.handoff.dshName,
+      action: 'manage',
+      label: asset.handoff.label,
+      detail: asset.handoff.detail,
+      reason: asset.handoff.reason,
+      allowed: false,
+      current: true,
+      activationId: asset.handoff.activationId,
+      scopeRoot: detail?.skillProjectRoot,
+    }],
+  }, asset)
+}
+
+async function applyManagedSkill() {
+  if (!skillPreviewTicket || dialogBusy) return
+  setDialogBusy(true)
+  status('正在保存完整技能包…', false, 'dialog-status')
+  try {
+    const applied = await api('apply-skill-activation', { ticket: skillPreviewTicket })
+    const failed = applied.items.find(item => !item.applied)
+    if (failed) throw new Error(failed.reason || `${failed.name || '技能'} 未启用。`)
+    skillPreviewTicket = undefined
+    dialog.close()
+    await reloadCurrentDetail(true)
+    status(appliedSkillSummary(applied))
+  } catch (error) {
+    status(error.message, true, 'dialog-status')
+  } finally {
+    setDialogBusy(false)
+  }
+}
+
+async function deactivateManagedSkill() {
+  const asset = skillManagerAsset
+  const project = skillManagerProject
+  if (!asset?.handoff?.activationId || !project || dialogBusy) return
+  setDialogBusy(true)
+  try {
+    await api('deactivate-skill-activation', {
+      projectId: project.id, activationId: asset.handoff.activationId,
+    })
+    dialog.close()
+    await reloadCurrentDetail(true)
+    status('已停用当前项目的技能登记；来源文件和 DSH 其他目录未改动。')
+  } catch (error) {
+    status(error.message, true, 'dialog-status')
+  } finally {
+    setDialogBusy(false)
+  }
+}
+
+async function undoManagedSkill() {
+  const asset = skillManagerAsset
+  const project = skillManagerProject
+  if (!asset?.handoff?.activationId || !project || dialogBusy) return
+  setDialogBusy(true)
+  try {
+    await api('undo-skill-activation', {
+      projectId: project.id, activationId: asset.handoff.activationId,
+    })
+    dialog.close()
+    await reloadCurrentDetail(true)
+    status('已恢复上一版技能快照。')
+  } catch (error) {
+    status(error.message, true, 'dialog-status')
+  } finally {
+    setDialogBusy(false)
+  }
+}
+
+async function importSession() {
+  if (!ticket || dialogBusy || importButton.hidden) return
+  if (dialogSkillIds.size) {
+    await beginSkillActivation('draft')
+    return
+  }
+  await completeHandoff('draft', [])
 }
 
 async function recoverDraftSession() {
@@ -1319,13 +2015,35 @@ function selectedNativeSession() {
   return nativeSessions.find(session => session.id === sessionSelect.value)
 }
 
-function renderSessionPath() {
+async function updateNativeSession() {
+  sessionTraceRequest?.abort()
+  sessionSourceRecord.replaceChildren()
+  exportTrace.checked = false
+  exportTraceOption.hidden = true
   const session = selectedNativeSession()
   byId('session-path').textContent = session?.path ?? ''
+  if (!session) return
+  const request = new AbortController()
+  sessionTraceRequest = request
+  const url = `./session-trace?${new URLSearchParams({ sessionId: session.id })}`
+  try {
+    const response = await fetch(url, { signal: request.signal, headers: { Accept: 'application/json' } })
+    if (response.status === 404) return
+    if (!response.ok) throw new Error('无法读取来源记录。')
+    const { trace, sourceStats, traceCounts } = await response.json()
+    if (request.signal.aborted || !Array.isArray(trace) || (!trace.length && !sourceStats)) return
+    sessionSourceRecord.append(renderSourceStats(sourceStats, traceCounts))
+    if (trace.length) {
+      sessionSourceRecord.append(sessionTraceDisclosure(trace))
+      exportTraceOption.hidden = false
+    }
+  } catch {
+    if (!request.signal.aborted) sessionSourceRecord.append(text('p', '暂时无法读取来源记录。', 'muted'))
+  }
 }
 
 async function chooseNativeSession() {
-  showDialog('session', '导出 DSH 会话', '将会话中的用户与助手消息保存为 Markdown。', '正在读取 DSH 会话…')
+  showDialog('session', '导出 DSH 会话', '可查阅已保存的来源记录，或将会话保存为 Markdown。', '正在读取 DSH 会话…')
   setDialogBusy(true)
   try {
     const result = await requestParent('sessions', {})
@@ -1341,10 +2059,11 @@ async function chooseNativeSession() {
       const suffix = titles.get(session.title) > 1 && session.path ? ` · ${shortPath(session.path)}` : ''
       return new Option(title + suffix, session.id)
     }))
-    renderSessionPath()
+    void updateNativeSession()
     dialogText.hidden = true
     byId('session-choice').hidden = false
     exportButton.hidden = false
+    exportShareButton.hidden = false
   } catch (error) {
     dialogText.hidden = true
     status(error.message, true, 'dialog-status')
@@ -1353,24 +2072,63 @@ async function chooseNativeSession() {
   }
 }
 
-async function exportMarkdown() {
+async function exportMarkdown(format = 'local') {
   if (dialogBusy || exportButton.hidden) return
   setDialogBusy(true)
-  status('正在生成 Markdown…', false, 'dialog-status')
+  status(`正在生成${format === 'share' ? '分享版' : '本机版'} Markdown…`, false, 'dialog-status')
+  const includeTrace = exportTraceOption.hidden ? false : exportTrace.checked
   try {
     if (dialogMode === 'session') {
       const session = selectedNativeSession()
       if (!session) throw new Error('请选择要导出的 DSH 会话。')
       const result = await requestParent('session-export', { sessionId: session.id, path: session.path })
-      showDownload(await api('export-session', { conversation: result.conversation }))
+      showDownload(await api('export-session', { sessionId: session.id, conversation: result.conversation, format, includeTrace }))
     } else if (ticket) {
-      showDownload(await api('export', { ticket }))
+      showDownload(await api('export', { ticket, format, includeTrace }))
     }
   } catch (error) {
     status(error.message, true, 'dialog-status')
   } finally {
     setDialogBusy(false)
   }
+}
+
+// Paths are only opened after the Host re-checks them against the current
+// project. The panel never passes a raw path to the shell by itself.
+async function openPath({ projectId = current?.id, label, assetId, referenceId, directory = false }) {
+  if (!projectId) return
+  const statusId = dialog.open ? 'dialog-status' : 'status'
+  try {
+    const result = await requestParent('open-path', { projectId, directory, assetId, referenceId, bridgeNonce: nonce })
+    status(`已在 DSH 中${result.revealed ? '定位' : '打开'}${label ? `「${label}」` : ''}。`, false, statusId)
+  } catch (error) {
+    status(`${error.message} 可复制路径后手动打开。`, true, statusId)
+  }
+}
+
+function pathActions({ label, path, assetId, directory = false }) {
+  const group = text('span', '', 'path-actions')
+  const open = text('button', '', 'path-open')
+  open.type = 'button'
+  open.append(icon('folder'), text('span', '打开'))
+  open.setAttribute('aria-label', `在 DSH 中打开${label ? ` ${label}` : ''}`)
+  open.title = path || label || '打开'
+  open.addEventListener('click', () => { void openPath({ label, assetId, directory }) })
+  const copy = text('button', '', 'path-copy')
+  copy.type = 'button'
+  copy.append(icon('copy'))
+  copy.setAttribute('aria-label', `复制${label ? ` ${label}` : ''}路径`)
+  copy.title = '复制路径'
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(path ?? '')
+      status('路径已复制。')
+    } catch {
+      status('无法访问剪贴板，请手动选择路径复制。', true)
+    }
+  })
+  group.append(open, copy)
+  return group
 }
 
 async function copyProjectPath() {
@@ -1513,6 +2271,10 @@ historyOption.addEventListener('change', () => {
   void saveProjectSelection()
 })
 byId('copy-path').addEventListener('click', copyProjectPath)
+byId('open-path').addEventListener('click', () => {
+  if (!current) return
+  void openPath({ label: '工作目录', path: current.cwd, directory: true })
+})
 byId('preview').addEventListener('click', preview)
 byId('native-export').addEventListener('click', chooseNativeSession)
 browseHistory.addEventListener('click', chooseSourceConversation)
@@ -1532,7 +2294,7 @@ byId('history-more').addEventListener('click', () => {
 })
 historyImport.addEventListener('click', importSourceConversation)
 sessionSelect.addEventListener('change', clearDownload)
-sessionSelect.addEventListener('change', renderSessionPath)
+sessionSelect.addEventListener('change', updateNativeSession)
 dialogClose.addEventListener('click', () => dialog.close())
 dialog.addEventListener('click', event => {
   if (event.target !== dialog || dialogBusy) return
@@ -1543,13 +2305,26 @@ dialog.addEventListener('click', event => {
 dialog.addEventListener('cancel', event => { if (dialogBusy) event.preventDefault() })
 dialog.addEventListener('close', () => {
   ++dialogEpoch
+  if (!dialog.open) sessionTraceRequest?.abort()
+  if (activateDialog.open) activateDialog.close()
   clearDownload()
   liveState('正在恢复实时扫描')
   schedulePoll(0)
 })
 importButton.addEventListener('click', importSession)
 recoverDraftButton.addEventListener('click', recoverDraftSession)
-exportButton.addEventListener('click', exportMarkdown)
+skillApply.addEventListener('click', applyManagedSkill)
+skillUndo.addEventListener('click', undoManagedSkill)
+skillDeactivate.addEventListener('click', deactivateManagedSkill)
+activateConfirm.addEventListener('click', confirmSkillActivation)
+activateText.addEventListener('click', continueWithTextOnly)
+activateClose.addEventListener('click', () => { if (!activateConfirm.disabled) activateDialog.close() })
+activateDialog.addEventListener('cancel', event => { if (activateConfirm.disabled) event.preventDefault() })
+activateDialog.addEventListener('click', event => {
+  if (event.target === activateDialog && !activateConfirm.disabled) activateDialog.close()
+})
+exportButton.addEventListener('click', () => { void exportMarkdown('local') })
+exportShareButton.addEventListener('click', () => { void exportMarkdown('share') })
 document.addEventListener('visibilitychange', () => schedulePoll(0))
 for (const button of themeOptions) button.addEventListener('click', () => setTheme(button.dataset.themeChoice))
 let savedTheme

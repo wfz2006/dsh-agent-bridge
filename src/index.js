@@ -4,11 +4,14 @@ import { readFile } from 'node:fs/promises'
 import { createCatalog } from './catalog.js'
 import { loadConfig } from './config.js'
 import { nativeSessionServices, saveNativeSession } from './session-import.js'
+import { countTrace, isSessionId, readSessionTrace } from './session-trace.js'
+import { createSkillBridge } from './skill-provider.js'
 
 export const name = 'dsh-agent-bridge'
 export const inject = {
   connection: true, webServer: true,
   sessions: false, sessionPersistence: false, workspaceRegistry: false, sessionProjectionCache: false,
+  skills: false,
 }
 
 const prefix = '/agent-bridge'
@@ -59,12 +62,27 @@ async function readBody(req) {
 
 export function apply(ctx) {
   const services = () => nativeSessionServices(ctx)
+  const skillHandoff = ctx.get?.('skills') ? createSkillBridge(ctx) : undefined
+  async function loadSourceRecord(sessionId) {
+    if (!isSessionId(sessionId)) throw Object.assign(new Error('会话标识无效。'), { status: 400 })
+    const session = await ctx.get?.('sessionPersistence')?.stat?.(sessionId)
+    if (session?.header?.id !== sessionId) {
+      throw Object.assign(new Error('找不到这条 DSH 会话。'), { status: 404 })
+    }
+    const saved = await readSessionTrace(await loadConfig(), sessionId)
+    if (!saved?.trace?.length && !saved?.sourceStats) {
+      throw Object.assign(new Error('没有为这条会话保存来源记录。'), { status: 404 })
+    }
+    return { ...saved, traceCounts: countTrace(saved.trace) }
+  }
   const catalog = createCatalog(loadConfig, {
     importConversation(record, cwd) {
       const host = services()
       if (!host) throw Object.assign(new Error('当前 DSH 未提供会话迁入服务。'), { status: 409 })
       return saveNativeSession(host, record, cwd)
     },
+    skillHandoff,
+    loadSourceRecord,
   })
   ctx.effect(() => () => catalog.dispose())
   const nonce = randomBytes(32).toString('hex')
@@ -73,6 +91,8 @@ export function apply(ctx) {
     ['/panel.css', 'panel.css', 'text/css; charset=utf-8'],
     ['/panel.js', 'panel.js', 'text/javascript; charset=utf-8'],
     ['/project-context.js', 'project-context.js', 'text/javascript; charset=utf-8'],
+    ['/markdown.js', 'markdown.js', 'text/javascript; charset=utf-8'],
+    ['/vendor/markdown-it.mjs', 'vendor/markdown-it.mjs', 'text/javascript; charset=utf-8'],
     ['/geist-latin-wght-normal.woff2', 'geist-latin-wght-normal.woff2', 'font/woff2'],
   ]
   const agentIcons = Object.create(null)
@@ -132,5 +152,9 @@ export function apply(ctx) {
     }
     const result = await catalog.execute(input.action, input)
     json(res, 200, input.action === 'catalog' ? { ...result, agentIcons, nativeSessionImport } : result)
+  })
+  register('/session-trace', 'GET', async (req, res) => {
+    const sessionId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('sessionId') ?? ''
+    json(res, 200, await loadSourceRecord(sessionId))
   })
 }

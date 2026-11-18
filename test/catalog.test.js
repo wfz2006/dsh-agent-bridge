@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mergeProjects, makePrompt, redact } from '../src/catalog.js'
+import { conversationTrace, mergeProjects, makePrompt, redact } from '../src/catalog.js'
 
 test('keeps worktrees distinct and merges agent associations case-insensitively on Windows', () => {
   const projects = mergeProjects([
@@ -51,4 +51,34 @@ test('a reimported Markdown heading stays inside its original preview section', 
   assert.equal(preview.sections.length, 2)
   assert.match(preview.sections[0].text, /## Skill · 嵌套标题/)
   assert.ok(prompt.includes(preview.sections[0].text))
+})
+
+test('a source record is redacted and bounded before it can reach the preview', () => {
+  const trace = Array.from({ length: 260 }, (_, index) => ({
+    id: `tool_call-${index}`, kind: 'tool_call', name: 'shell', callId: `call-${index}`,
+    text: index === 259 ? 'api_key = super-secret-value' : `echo ${index}`, status: 'ok', messageIndex: 0,
+  }))
+  trace.push({ id: 'tool_result-long', kind: 'tool_result', callId: 'call-259', text: 'y'.repeat(9000), status: 'ok', messageIndex: 0 })
+  const { trace: items, indexOf } = conversationTrace(trace, 1)
+  assert.ok(items.length <= 200)
+  assert.equal(items.reduce((sum, item) => sum + item.text.length, 0) <= 48 * 1024 + 4 * 1024, true)
+  assert.equal(items.some(item => item.text.includes('super-secret-value')), false)
+  assert.equal(items.at(-1).id, 'tool_result-long')
+  assert.equal(items.at(-1).text.length, 4096)
+  assert.equal(items.at(-1).truncated, true)
+  assert.deepEqual([...indexOf.get(0)].sort(), items.map(item => item.id).sort())
+  // Later items are kept first, so the newest call and its result survive the budget.
+  assert.equal(items.some(item => item.id === 'tool_call-0'), false)
+  assert.equal(items.some(item => item.id === 'tool_call-259'), true)
+})
+
+test('source records outside the retained message window are dropped with their offset applied', () => {
+  const trace = [
+    { id: 'tool_call-old', kind: 'tool_call', callId: 'old', name: 'shell', text: 'old', status: 'ok', messageIndex: 0 },
+    { id: 'tool_call-new', kind: 'tool_call', callId: 'new', name: 'shell', text: 'new', status: 'ok', messageIndex: 5 },
+    { id: 'tool_call-unbound', kind: 'tool_call', callId: 'free', name: 'shell', text: 'free', status: 'ok' },
+  ]
+  const { trace: items, indexOf } = conversationTrace(trace, 3, 4)
+  assert.deepEqual(items.map(item => [item.id, item.messageIndex]), [['tool_call-new', 1]])
+  assert.deepEqual(indexOf.get(1), ['tool_call-new'])
 })

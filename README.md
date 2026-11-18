@@ -4,12 +4,12 @@
 
 **浏览本机其他 Agent 的项目、记忆和 Skills，在原工作目录继续开发。**
 
-[![Version](https://img.shields.io/badge/version-v0.8.2-2459D7?style=flat-square)](https://github.com/wfz2006/dsh-agent-bridge/tree/v0.8.2)
+[![Version](https://img.shields.io/badge/version-v0.9.0-2459D7?style=flat-square)](https://github.com/wfz2006/dsh-agent-bridge)
 [![DSH Plugin](https://img.shields.io/badge/DSH-plugin-4B6EF5?style=flat-square)](https://awesome-dsh-plugin.com/)
 [![npm](https://img.shields.io/npm/v/@wwwfz/dsh-agent-bridge?style=flat-square&label=npm)](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge)
-[![Tests](https://img.shields.io/badge/tests-41%2F41-2EA043?style=flat-square)](#卸载与构建)
+[![Tests](https://img.shields.io/badge/tests-106%2F106-2EA043?style=flat-square)](#卸载与构建)
 
-[npm 安装](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge) · [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [v0.8.2 更新](#v082-更新) · [快速开始](#快速开始) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
+[npm 安装](https://www.npmjs.com/package/@wwwfz/dsh-agent-bridge) · [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz) · [v0.9.0 更新](#v090-更新) · [快速开始](#快速开始) · [界面](#界面) · [支持来源](#支持来源) · [介绍页](https://wfz2006.github.io/dsh-agent-bridge/)
 
 <a href="https://wfz2006.github.io/dsh-agent-bridge/"><img src="docs/screenshots/v0.8.2/01-recent-conversations.png" width="920" alt="Agent Bridge：项目列表与继续旧对话"></a>
 
@@ -24,6 +24,13 @@
 | 导出交接 | 多 Agent 来源 | 本机只读 |
 | :--- | :--- | :--- |
 | 导出 Markdown 交接，或导出 DSH 会话记录。 | Codex、Claude Code、Copilot、OpenCode、Qoder、WorkBuddy、Gemini CLI、Qwen Code、Antigravity、TRAE。 | 通过本机已认证的 DSH Host 读取，源文件与 Agent 数据库只读访问。 |
+
+## v0.9.0 更新
+
+- **按项目启用完整 Skill 包**：继续旧对话或从项目资料开新对话时，可为当前本机项目启用确认过的 `SKILL.md`、`scripts/`、`references/` 和 `assets/`，由 DSH 原生 Skill 入口调用，不再只依赖正文摘录。
+- **启用前核对，启用后可撤销**：来源、目标项目、包内文件、脚本和同名冲突先进入确认预览；已有同款按内容指纹复用，同名不同内容保留原技能。来源变化只提示，更新需重新预览；停用只撤销当前项目登记。
+- **来源消失仍可管理**：私有快照与项目登记分开保存。原目录被移走后，面板仍保留「已启用的项目 Skills」入口，可继续使用快照或停用。
+- **状态不夸大**：区分「DSH 已发现」「可为此项目启用」「仅可带入说明」「同名，待核对」「待确认」和「当前模式不可调用」。只有服务端重新确认实际登记和调用策略后，才从草稿中省略技能正文；确认失败时保留文字路径。
 
 ## v0.8.2 更新
 
@@ -66,7 +73,7 @@ dsh web
 
 **方式二：离线安装包**
 
-1. 下载 [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)，或从 [v0.8.2 源码](https://github.com/wfz2006/dsh-agent-bridge/tree/v0.8.2) 运行 `npm pack` 构建。
+1. 下载 [最新公开安装包](https://github.com/wfz2006/dsh-agent-bridge/releases/latest/download/dsh-agent-bridge.tgz)，或从当前 0.9.0 工作树运行 `npm pack` 构建（该候选版本尚未发布）。
 2. 打开 **DSH Desktop → 插件 → 安装插件**，选择这个文件。
 3. **完全退出 DSH 后再打开**，侧栏会出现 **Agent 工作接续**。
 
@@ -82,7 +89,7 @@ dsh web
 
 </details>
 
-发行包只依赖 DSH 的运行时。v0.8.2 在 Windows 的官方 DSH Desktop 0.2.2-rc.3 验收；原生会话入口依赖对应的 DSH 客户端服务。macOS 和 Linux 的数据路径规则有测试覆盖，桌面运行时的实机验收以 Windows 为准。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+发行包只依赖 DSH 的运行时。v0.9.0 候选版已在隔离的 Windows 官方 DSH Desktop 0.2.2-rc.3 完成原生 Skill 验收；未替换日常 DSH 配置，当前也未发布。原生会话入口依赖对应的 DSH 客户端服务。macOS 和 Linux 的数据路径规则有测试覆盖，桌面运行时的实机验收以 Windows 为准。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ## 使用
 
@@ -98,13 +105,31 @@ dsh web
 
 面板打开时会自动监听 Agent 索引、会话和当前项目资料的文件变化，并在后台定时复扫。正在查看或导出资料时，列表会在关闭预览后更新；**刷新来源** 可立即复扫。
 
+资料预览将 `.md`、`.markdown` 和 `.mdx` 排版为标题、列表、代码块、表格和引用，其余文件按等宽纯文本展示。独立面板随包加载离线 `markdown-it`。交接草稿中的助手消息也按 Markdown 排版。原始 HTML 按文字展示。
+
+预览里的工作目录和资料来源提供 **打开** 与 **复制路径**。正文里的相对文件链接从原文档所在目录解析。点击时，Host 核对项目范围和文件身份，再通过 DSH 的 `openWorkspacePath` 打开。脚本和其他可能由系统直接运行的文件只定位。文件移动、换成越界链接或宿主无法打开时，面板会提示原因并保留复制路径。
+
 ### 继续旧对话
 
 在提供原生会话存储服务的 DSH 中打开一个项目，首屏会显示最近三条可供预览的来源对话。点击其中一条即可查看用户和助手的消息。选择 **迁入并继续** 后，DSH 会在原目录创建一条包含这些历史消息的新会话，输入下一句即可继续。
 
-迁入保留可读取的文字、顺序和消息角色。工具调用与结果、附件、隐藏推理和运行状态仍由原 Agent 保存。Codex 的 `.jsonl.zst` 会话、索引中尚未更新的压缩路径和大型历史都会参与发现；大型历史采用流式读取，按文字预算保留近期问答并在预览中标记截取。此功能在 Windows DSH Desktop 0.2.2-rc.3 验证。
+迁入保留可读取的文字、顺序和消息角色，并带入可核实的来源记录，包括 Codex 的可见思考摘要（`summary_text`）和工具调用，以及 Claude Code 的 `tool_use` / `tool_result`。结果按源调用 ID 归到调用所在回合。预览、迁入后的来源记录和显式导出都显示回合、工具名和调用 ID。缺失结果、有据可查的失败和长输出截取均有明确标记。
+
+预览和会话头部的 **来源记录** 都可查看 **原对话统计**。面板显示已读轮次、用户与助手消息数、保存的工具调用；源记录有足够时间戳或累计 Token 时，也会显示相应数据。统计在迁入时保存，继续聊天后仍可查阅同一份数据。
+
+来源记录只供查阅：不会作为可重放的工具事件写回 DSH，也不会触发 shell、MCP 或把旧权限带过去。迁入后 DSH 会话头部保留 **来源记录** 入口，重启后仍可查看；宿主没有提供会话头部槽时，可从 Agent Bridge 打开同一份记录。迁入时的实际工具执行数为 0，后续新问答走 DSH 正常流程。Codex 的 `.jsonl.zst` 会话、索引中尚未更新的压缩路径和大型历史都会参与发现；大型历史采用流式读取，按文字预算保留近期问答并在预览中标记截取。此功能在 Windows DSH Desktop 0.2.2-rc.3 验证。
 
 DSH 未能填入交接草稿时，尚未使用的空白会话会自动归档，重试会复用同一会话；如果会话已有草稿，插件不会覆盖它，可以直接打开原会话并手动补入交接资料。
+
+### 为本项目启用原生 Skill
+
+项目技能按可核实程度显示。**DSH 已发现**表示当前项目的原生技能目录中能读到这份定义；只有能确认实际生效副本和调用策略时，才在详情中说明模型或手动入口是否可用。**可为此项目启用**表示可以从完整包建立一份只对当前项目生效的私有快照；项目目录、其他 Agent 的用户级目录和 Codex 插件缓存中的目录技能包都按此路径处理，但全局资料仍默认折叠、不自动勾选。无法安全复制、包不完整或来源无法核实的技能才标为 **仅可带入说明**。未核实的同名技能显示 **同名，待核对**；等待 DSH 刷新时显示 **待确认**；模型与手动入口都关闭时显示 **当前模式不可调用**。没有可验证的当前会话或模式时，不把“已发现”写成“当前模式可调用”。
+
+在「继续旧对话」预览中，只有本条对话记录能对应到本机包时才显示「沿用技能（可选）」，候选默认全不选；没有候选时这一行收起。在项目草稿预览中，同一入口来自本次明确勾选的技能。选中后点「启用并继续」，插件先展示来源、目标项目、包内脚本和同名冲突，用户确认后才保存；确认失败或 DSH 未能确认时可改为仅文字继续，不需要重复创建会话。
+
+默认快照位于 DSH 私有目录 `~/.dsh/agent-bridge-skills/`（自定义 `DSH_HOME` 时随主目录变化），不写入项目仓库。登记状态保存在同目录的 `state.sqlite`；旧 `state.json` 首次成功迁移后保持原样，不会覆盖。只对按 DSH 规则确定的项目根生效：最近 `.git` 祖先；没有 `.git` 时使用工作目录。同名技能优先保留 DSH 已发现的原技能；只有实际包内容指纹一致时才复用，不同内容会拒绝覆盖，无法读取的外部或虚拟提供者不会当作同款。指向包外的链接、特殊文件和疑似凭证文件会阻止整包启用。预览后源文件发生变化、项目根移动或目录身份改变都会使本次确认失效。来源变化时继续保留当前已确认版本，并显示需要重新预览更新；更新后可恢复上一版。源目录被移除后，已启用的快照仍出现在独立管理入口，停用只撤销本项目登记，来源快照与其他 DSH 目录不受影响。
+
+启用成功表示 DSH 已把完整快照登记给当前项目可见范围，不代表脚本依赖、模式权限或宿主工具已经满足。脚本和 `references/`、`assets/` 会随包保留，但插件不会自动安装环境或执行脚本。仅手动技能不会进入模型侧入口。技能引用了来源 Agent 专有工具时，Bridge 只登记技能本身，不自动检查或探测该工具是否可用；实际调用可能因当前 DSH 的模型、权限、环境或依赖而失败。原生技能服务不可用时，原有文字摘录和 Markdown 导出仍可使用。
 
 ### 整理项目
 
@@ -114,12 +139,15 @@ DSH 未能填入交接草稿时，尚未使用的空白会话会自动归档，�
 
 ### 读取方式
 
-项目原有的 `.agents/skills` 和 `.dsh/skills` 由 DSH 原生发现。其他 Agent 的 Skill 以 `SKILL.md` 正文摘录和原路径带入，DSH 可在需要时读取同目录资源；导入预览会标记截取内容。插件通过本机已认证的 DSH Host 读取资料，面板、静态资源和 API 都要求 DSH 所有者身份；源文件与 Agent 数据库按只读方式访问。发送之后，当前会话所选的模型会收到草稿。
+项目原有的 `.agents/skills` 和 `.dsh/skills` 由 DSH 原生发现。其他 Agent 的用户级目录、共享目录和插件缓存 Skill 可在明确选中后复制为当前项目的 DSH 私有快照；只有包不完整、含包外链接或无法安全核实的技能才退回 `SKILL.md` 正文摘录和原路径。插件通过本机已认证的 DSH Host 读取资料，面板、静态资源和 API 都要求 DSH 所有者身份；源文件与 Agent 数据库按只读方式访问。发送之后，当前会话所选的模型会收到草稿。
 
 ## 导出交接
 
-- **导出 Markdown**：在 **用项目资料开新对话** 中勾选资料，打开 **预览草稿 → 导出 Markdown**。文件包含已选记忆、Skill 说明、来源和已选会话摘录。
-- **导出 DSH 会话**：用面板右上方的 **导出 DSH 会话** 选择本机 DSH 会话。文件包含原工作目录和最近的用户与助手消息；较长的会话会标记截取。
+- **导出 Markdown**：在 **用项目资料开新对话** 中勾选资料，打开 **预览草稿**，再选择 **导出本机版** 或 **导出分享版**。文件用同一份已预览资料排版：标题、来源与时间、工作目录、资料索引、各分区正文和最近对话；没有资料的分区不出现，较长内容标记截取。
+- **导出 DSH 会话**：用面板右上方的 **导出 DSH 会话** 选择本机 DSH 会话，可在会话下方展开已保存的 **来源记录**，也可选择本机版或分享版。文件包含原工作目录和最近的用户与助手消息。
+- **本机版与分享版**：本机版把可确认的本机来源写成 `file:` 链接，点击可在本机查看器打开；分享版不写宿主附加的绝对路径，只在知道 Markdown 保存位置时生成文档内相对链接，否则显示文件名或项目相对路径。两种格式都能离线阅读，`file:` 是否可点取决于外部查看器。
+- **项目交接正文链接**从原资料目录解析，并在下载前复核目标。本机版为有效文件写入编码后的 `file:` 链接。常规分享版显示项目相对路径，已知保存位置时可生成文档相对链接。失效与越界目标以文字保留，网页链接和代码块保持原样。
+- **来源记录**：导出面板里的「附带来源记录」默认关闭。勾选后才写入工具名与结果摘录，且只包含已在预览中脱敏和截取的内容。
 
 把下载的 Markdown 放进接收项目的 `.agent-bridge/handoffs/`，刷新后即可从「上次做到哪」中选用。原工作目录不可访问时，仍可导出尚可读取的归档资料。
 
@@ -187,7 +215,7 @@ Desktop 在插件管理页卸载 **dsh-agent-bridge**；Web 版运行：
 dsh plugin --profile web remove dsh-agent-bridge
 ```
 
-从源码运行 `npm test` 和 `npm pack`。项目没有第三方 npm 依赖，安装包包含插件代码、界面和本说明。
+从源码运行 `npm test` 和 `npm pack`。项目没有第三方 npm 依赖，安装包包含插件代码、界面、本说明和 `THIRD_PARTY_NOTICES.md`。可直接复用 DSH 官方加载接口和 MIT 许可的开源实现，相关来源和许可保留在第三方声明中。
 
 <div align="center">
 <sub>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 制作 · <a href="https://wfz2006.github.io/dsh-agent-bridge/">介绍页</a> · <a href="https://github.com/wfz2006/dsh-agent-bridge/issues">问题反馈</a></sub>
