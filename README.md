@@ -34,14 +34,10 @@ v0.10.0 重新整理了项目工作台和来源记录。迁入后可以在 DSH �
 
 ### DSH Web
 
-npm 当前发布版本为 v0.9.0。使用本仓库源码可构建 v0.10.0 安装包。
+npm 已发布 v0.10.0。在已安装 DSH CLI 的环境里运行。
 
 ```sh
-git clone https://github.com/wfz2006/dsh-agent-bridge.git
-cd dsh-agent-bridge
-npm install
-npm pack
-dsh plugin --profile web add ./wwwfz-dsh-agent-bridge-0.10.0.tgz
+dsh plugin --profile web add @wwwfz/dsh-agent-bridge@0.10.0
 dsh web
 ```
 
