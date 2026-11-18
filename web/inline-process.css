@@ -1,0 +1,22 @@
+[data-chat-flow-kind='agent-bridge-source-process']:not(:has(.bridge-inline-process)) {
+  display: none;
+}
+
+.bridge-inline-process {
+  min-width: 0;
+  margin-block: 4px 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.bridge-inline-process summary { cursor: pointer; }
+.bridge-inline-process article { margin-block: 10px; }
+.bridge-inline-process pre {
+  margin: 4px 0 0;
+  max-height: 18rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}

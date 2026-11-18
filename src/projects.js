@@ -4,8 +4,8 @@ import { open, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
+import { sourceJson, sourceJsonl, sourceValueLimit } from './conversation-readers.js';
 
-const maxSessions = 8_000;
 const maxMessages = 36;
 const maxMessageLength = 4_000;
 const maxTranscriptBytes = 12 * 1024 * 1024;
@@ -186,8 +186,9 @@ async function archivedProjects(file) {
     const deleted = fields.has('deleted_at') ? ' AND deleted_at IS NULL' : '';
     const machine = fields.has('machine') ? " AND machine IN ('', 'local')" : '';
     const title = fields.has('title') ? 'substr(title, 1, 200)' : 'NULL';
-    return db.prepare(`SELECT id, cwd, agent, ${sort} AS date, ${title} AS title FROM sessions WHERE cwd <> ''${deleted}${machine} ORDER BY ${sort} DESC LIMIT ?`)
-      .all(maxSessions).map(({ id, cwd, agent, date, title }) => ({ cwd, agent, archive: { kind: 'agentsview', agent, file, id, date, title } }));
+    const rows = db.prepare(`SELECT id, cwd, agent, ${sort} AS date, ${title} AS title FROM sessions WHERE cwd <> ''${deleted}${machine} ORDER BY ${sort} DESC`)
+      .iterate();
+    return Array.from(rows, ({ id, cwd, agent, date, title }) => ({ cwd, agent, archive: { kind: 'agentsview', agent, file, id, date, title } }));
   });
 }
 
@@ -206,7 +207,7 @@ async function codexProjects(root) {
         if (!['cwd', 'rollout_path', 'id'].every(field => fields.has(field))) return undefined;
         const sort = fields.has('updated_at') ? 'updated_at' : 'id';
         const title = fields.has('title') ? 'substr(title, 1, 200)' : 'NULL';
-        return db.prepare(`SELECT id, cwd, rollout_path, ${sort} AS date, ${title} AS title FROM threads WHERE cwd <> '' ORDER BY ${sort} DESC LIMIT ?`).all(maxSessions);
+        return db.prepare(`SELECT id, cwd, rollout_path, ${sort} AS date, ${title} AS title FROM threads WHERE cwd <> '' ORDER BY ${sort} DESC`).all();
       });
       if (indexed) break;
     } catch (error) {
@@ -226,12 +227,12 @@ async function codexProjects(root) {
       if (!byFile.has(key)) byFile.set(key, project);
     }
   }
-  // Files may be compressed or moved before SQLite catches up. Keep SQLite's
-  // titles when its path resolves, and discover compressed files independently.
+  // SQLite can lag an active or archived transcript. Keep its titles for
+  // resolved files and discover any additional plain or compressed transcripts.
   const byId = new Set([...byFile.values()].map(project => project.archive.id).filter(Boolean));
   const include = file => !byFile.has(pathKey(file))
-    && ((!indexed?.length && jsonlFile.test(file)) || (hasZstd && compressedCodexFile.test(file)));
-  const fallback = await scanJsonlProjects(root, 'codex', bases, 4, include, maxSessions - byFile.size);
+    && (jsonlFile.test(file) || (hasZstd && compressedCodexFile.test(file)));
+  const fallback = await scanJsonlProjects(root, 'codex', bases, 4, include);
   for (const project of fallback) {
     const { file, id } = project.archive;
     if (id && byId.has(id)) continue;
@@ -268,14 +269,15 @@ async function opencodeProjects(root) {
     if (!tables.length) throw new Error('未识别 OpenCode 会话表');
     const projects = tables.flatMap(table => {
       const title = columns(db, table).has('title') ? 'substr(title, 1, 200)' : 'NULL';
-      return db.prepare(`SELECT id, directory AS cwd, time_updated AS date, ${title} AS title FROM ${table} WHERE directory <> '' ORDER BY time_updated DESC LIMIT ?`)
-        .all(maxSessions).map(({ id, cwd, date, title }) => ({ cwd, agent: 'opencode', archive: { kind: 'opencode', file, id, table, date, title } }));
+      const rows = db.prepare(`SELECT id, directory AS cwd, time_updated AS date, ${title} AS title FROM ${table} WHERE directory <> '' ORDER BY time_updated DESC`).iterate();
+      return Array.from(rows, ({ id, cwd, date, title }) => ({ cwd, agent: 'opencode', archive: { kind: 'opencode', file, id, table, date, title } }));
     });
     const fields = columns(db, 'project');
     if (fields.has('worktree')) {
       const name = fields.has('name') ? 'name' : 'NULL';
-      projects.push(...db.prepare(`SELECT worktree AS cwd, ${name} AS name FROM project WHERE worktree <> '' LIMIT ?`).all(maxSessions)
-        .map(row => ({ ...row, agent: 'opencode' })));
+      for (const row of db.prepare(`SELECT worktree AS cwd, ${name} AS name FROM project WHERE worktree <> ''`).iterate()) {
+        projects.push({ ...row, agent: 'opencode' });
+      }
     }
     return projects;
   });
@@ -292,22 +294,19 @@ async function opencodeDatabase(root) {
   return undefined;
 }
 
-async function transcriptFiles(root, depth, limit, predicate) {
-  const files = [];
+async function* transcriptFiles(root, depth, predicate) {
   const stack = [{ root, depth }];
-  while (stack.length && files.length < limit) {
+  while (stack.length) {
     const current = stack.pop();
     const entries = await directories(current.root).catch(() => []);
     for (const entry of entries) {
       const file = path.join(current.root, entry.name);
-      if (entry.isFile() && predicate(entry.name, file)) files.push(file);
-      if (files.length >= limit) break;
+      if (entry.isFile() && predicate(entry.name, file)) yield file;
       if (entry.isDirectory() && current.depth > 0 && entry.name !== 'subagents') {
         stack.push({ root: file, depth: current.depth - 1 });
       }
     }
   }
-  return files;
 }
 
 async function nativeCwd(file, agent, rows) {
@@ -327,14 +326,11 @@ async function jsonlProjects(root, agent, children = ['projects'], depth = 1) {
   return scanJsonlProjects(root, agent, roots, depth, file => jsonlFile.test(file));
 }
 
-async function scanJsonlProjects(root, agent, roots, depth, include, limit = maxSessions) {
-  const files = [];
-  for (const target of roots) {
-    files.push(...await transcriptFiles(target, depth, limit - files.length, (_name, file) => include(file)));
-  }
+async function scanJsonlProjects(root, agent, roots, depth, include) {
   const result = [];
-  for (let offset = 0; offset < files.length; offset += 32) {
-    const batch = await Promise.all(files.slice(offset, offset + 32).map(async file => {
+  const batch = [];
+  async function flush() {
+    const rows = await Promise.all(batch.splice(0).map(async file => {
       try {
         const compressed = agent === 'codex' && compressedCodexFile.test(file);
         const { text, truncated, modified } = compressed ? await compressedPrefix(file) : await prefix(file, transcriptHeaderBytes);
@@ -347,8 +343,15 @@ async function scanJsonlProjects(root, agent, roots, depth, include, limit = max
         return cwd ? { cwd, agent, archive: { kind: agent, file, root, id, date: modified, title: title?.slice(0, 200) } } : undefined;
       } catch { return undefined; }
     }));
-    result.push(...batch.filter(Boolean));
+    result.push(...rows.filter(Boolean));
   }
+  for (const target of roots) {
+    for await (const file of transcriptFiles(target, depth, (_name, candidate) => include(candidate))) {
+      batch.push(file);
+      if (batch.length === 32) await flush();
+    }
+  }
+  if (batch.length) await flush();
   return result;
 }
 
@@ -362,28 +365,66 @@ function editorStores(root) {
   return dataDirectories(root, relatives);
 }
 
+async function copilotDatabase(root) {
+  const actual = await physicalPath(root);
+  if (!actual) return undefined;
+  if (path.basename(actual).toLowerCase() === 'session-store.db' && (await stat(actual)).isFile()) return actual;
+  for (const prefix of ['', 'User']) {
+    const file = await scopedFile(path.join(actual, prefix, 'globalStorage', 'github.copilot-chat', 'session-store.db'), actual);
+    if (file && (await stat(file)).isFile()) return file;
+  }
+}
+
+function copilotTables(db) {
+  const sessions = columns(db, 'sessions');
+  const turns = columns(db, 'turns');
+  return ['id', 'cwd'].every(field => sessions.has(field))
+    && ['id', 'session_id', 'turn_index', 'user_message', 'assistant_response', 'timestamp'].every(field => turns.has(field));
+}
+
+function copilotHostFilter(fields) {
+  return fields.has('host_type') ? " AND host_type = 'vscode'" : '';
+}
+
+async function copilotDbProjects(file, root) {
+  return withDatabase(file, db => {
+    if (!copilotTables(db)) throw new Error('Unrecognized Copilot session store');
+    const fields = columns(db, 'sessions');
+    const title = fields.has('summary') ? 'substr(summary, 1, 200)' : 'NULL';
+    const date = fields.has('updated_at') ? 'updated_at' : 'NULL';
+    const rows = db.prepare(`SELECT id, cwd, ${title} AS title, ${date} AS date FROM sessions WHERE cwd <> ''${copilotHostFilter(fields)} ORDER BY date DESC, id`)
+      .iterate();
+    return Array.from(rows, row => ({
+      cwd: localDirectory(row.cwd), agent: 'copilot',
+      archive: { kind: 'copilot', storage: 'sqlite', file, root, id: row.id, title: row.title, date: row.date },
+    }));
+  });
+}
+
 async function editorProjects(root, agent) {
   const stores = await editorStores(root);
-  if (!stores.length) throw missingStore();
-  const files = [];
-  for (const store of stores) {
-    files.push(...await transcriptFiles(store, 1, maxSessions - files.length, name => name === 'workspace.json'));
-  }
+  const database = agent === 'copilot' ? await copilotDatabase(root) : undefined;
+  if (!stores.length && !database) throw missingStore();
   const result = [];
-  for (const file of files) {
-    try {
-      const { text } = await prefix(file, 32 * 1024);
-      const value = json(text);
-      const cwd = localDirectory(value?.folder);
-      if (!cwd) continue;
-      result.push({ cwd, agent });
-      if (agent !== 'copilot') continue;
-      const sessions = await transcriptFiles(path.join(path.dirname(file), 'chatSessions'), 0, maxSessions, name => /\.jsonl?$/i.test(name));
-      for (const session of sessions) {
-        const info = await stat(session).catch(() => undefined);
-        if (info) result.push({ cwd, agent, archive: { kind: 'copilot', file: session, root, date: info.mtimeMs } });
-      }
-    } catch { continue; }
+  for (const store of stores) {
+    for await (const file of transcriptFiles(store, 1, name => name === 'workspace.json')) {
+      try {
+        const { text } = await prefix(file, 32 * 1024);
+        const value = json(text);
+        const cwd = localDirectory(value?.folder);
+        if (!cwd) continue;
+        result.push({ cwd, agent });
+        if (agent !== 'copilot') continue;
+        for await (const session of transcriptFiles(path.join(path.dirname(file), 'chatSessions'), 0, name => /\.jsonl?$/i.test(name))) {
+          const info = await stat(session).catch(() => undefined);
+          if (info) result.push({ cwd, agent, archive: { kind: 'copilot', file: session, root, date: info.mtimeMs } });
+        }
+      } catch { continue; }
+    }
+  }
+  if (database) {
+    try { for (const project of await copilotDbProjects(database, root)) result.push(project); }
+    catch (error) { if (!result.length) throw error; }
   }
   return result;
 }
@@ -391,14 +432,12 @@ async function editorProjects(root, agent) {
 async function geminiProjects(root) {
   const [base] = await transcriptDirectories(root, ['tmp']);
   if (!base) throw missingStore();
-  const files = await transcriptFiles(base, 1, maxSessions, name => name === '.project_root');
   const result = [];
-  for (const file of files) {
+  for await (const file of transcriptFiles(base, 1, name => name === '.project_root')) {
     const { text } = await prefix(file, 32 * 1024);
     const cwd = text.trim();
     result.push({ cwd, agent: 'gemini' });
-    const sessions = await transcriptFiles(path.join(path.dirname(file), 'chats'), 0, maxSessions, name => /^session-.+\.jsonl?$/i.test(name));
-    for (const session of sessions) {
+    for await (const session of transcriptFiles(path.join(path.dirname(file), 'chats'), 0, name => /^session-.+\.jsonl?$/i.test(name))) {
       const info = await stat(session).catch(() => undefined);
       if (info) result.push({ cwd, agent: 'gemini', archive: { kind: 'gemini', file: session, root, date: info.mtimeMs } });
     }
@@ -423,7 +462,7 @@ async function antigravityProjects(root) {
     const rows = await withDatabase(database, db => {
       const fields = columns(db, 'conversation_summaries');
       if (!fields.has('workspace_uris')) return [];
-      return db.prepare("SELECT workspace_uris FROM conversation_summaries WHERE workspace_uris NOT IN ('', '[]') LIMIT ?").all(maxSessions);
+      return db.prepare("SELECT workspace_uris FROM conversation_summaries WHERE workspace_uris NOT IN ('', '[]')").all();
     });
     for (const row of rows) {
       const uris = json(row.workspace_uris);
@@ -464,7 +503,7 @@ export async function scanProjects(config) {
     for (const file of candidates) {
       try {
         const rows = await load(file);
-        projects.push(...rows);
+        for (const row of rows) projects.push(row);
         found += rows.length;
         succeeded++;
       } catch (error) {
@@ -489,7 +528,7 @@ export async function scanProjects(config) {
       antigravity: antigravityProjects,
     }).map(([agent, load]) => scan(agent, agentLabels[agent], configuredRoots(config, agent), load, {
       trae: '支持工作区元数据；会话可从 AgentsView 读取已归档部分',
-      copilot: '支持 VS Code 工作区会话；其他版本可从 AgentsView 读取已归档部分',
+      copilot: '支持 VS Code 工作区会话及本机会话库；其他版本可从 AgentsView 读取已归档部分',
       antigravity: '支持工作区元数据和 CLI 提示记录；完整会话可从 AgentsView 读取已归档部分',
     }[agent])),
   ]);
@@ -546,7 +585,8 @@ function messageText(text) {
   return typeof text === 'string' ? stripRuntimeWrapper(text).trim() : '';
 }
 
-function markSourcePartial(result) {
+function markSourcePartial(result, reason = 'source-compacted') {
+  result.events?.push({ kind: 'gap', reason });
   result.sourcePartial = true;
   result.truncated = true;
 }
@@ -557,6 +597,17 @@ function appendMessage(result, role, text, timestamp, { estimatedTime = false } 
   if (!value) return false;
   for (const match of value.matchAll(/<skill>\s*<name>([^<]+)<\/name>/gi)) addSkill(result, match[1]);
   if (value.startsWith('<skill>')) return false;
+  if (result.events) {
+    if (role === 'user') result.turn++;
+    const time = dateMillis(timestamp);
+    result.events.push({
+      kind: 'message', role, text: stripRuntimeWrapper(text), turn: result.turn,
+      ...(time > 0 && !estimatedTime ? { time } : {}),
+      ...(result.sourceId ? { sourceId: result.sourceId } : {}),
+      ...(result.parentId ? { parentId: result.parentId } : {}),
+    });
+    return true;
+  }
   const { limits } = result;
   if (limits) {
     const bounded = value.slice(0, limits.messageLength).replace(/[\uD800-\uDBFF]$/, '');
@@ -610,6 +661,15 @@ function cleanTraceText(value) {
 }
 
 function addTrace(result, item) {
+  if (result.events) {
+    const { id, text, ...details } = item;
+    result.events.push({
+      ...details, text: traceValue(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' '),
+      ...(id ? { sourceId: id } : {}),
+      ...(item.kind !== 'tool_result' ? { turn: result.turn } : {}),
+    });
+    return undefined;
+  }
   if (!result.trace) return undefined;
   const text = cleanTraceText(item.text);
   const bounded = text.slice(0, traceTextLimit).replace(/[\uD800-\uDBFF]$/, '');
@@ -648,8 +708,8 @@ function traceCallId(value) {
 }
 
 function addSummary(result, text, time, id) {
-  const value = cleanTraceText(text);
-  if (!value) return;
+  const value = result.events ? traceValue(text) : cleanTraceText(text);
+  if (!value.trim()) return;
   addTrace(result, { kind: 'summary', text: value, status: 'ok', time: dateMillis(time), id });
 }
 
@@ -658,15 +718,17 @@ function addToolCall(result, name, callId, input, time) {
   addTrace(result, {
     kind: 'tool_call', name: name.trim().slice(0, 120),
     callId: traceCallId(callId),
-    text: cleanTraceText(input), status: 'pending', time: dateMillis(time),
+    text: result.events ? traceValue(input) : cleanTraceText(input), status: 'pending', time: dateMillis(time),
   });
 }
 
-function addToolResult(result, callId, output, failed) {
-  if (!result.trace || typeof callId !== 'string' || !callId) return;
+function addToolResult(result, callId, output, failed, time) {
+  if (!result.events && (!result.trace || typeof callId !== 'string' || !callId)) return;
   addTrace(result, {
-    kind: 'tool_result', callId: traceCallId(callId), text: cleanTraceText(output),
-    status: failed === true ? 'error' : 'ok',
+    kind: 'tool_result', callId: traceCallId(callId),
+    text: result.events ? traceValue(output) : cleanTraceText(output),
+    status: failed === 'incomplete' ? 'incomplete' : failed === true ? 'error' : 'ok',
+    ...(time === undefined ? {} : { time: dateMillis(time) }),
   });
 }
 
@@ -698,25 +760,122 @@ function textBlocks(content, result) {
       addToolCall(result, block.name, block.id, block.input);
     }
     if (result && block?.type === 'tool_result') {
-      const value = Array.isArray(block.content)
-        ? block.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n')
-        : block.content;
+      const value = result.events ? sourceToolOutput(result, block.content, block.tool_use_id)
+        : (Array.isArray(block.content)
+          ? block.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n')
+          : block.content);
       addToolResult(result, block.tool_use_id, value, block.is_error === true);
     }
     if (result && block?.type === 'tool') {
       const input = block.state?.input ?? block.input ?? block.args;
       readTool(result, block.tool ?? block.name, input);
       const callId = block.callID ?? block.callId ?? block.id;
-      addToolCall(result, block.tool ?? block.name, callId, input);
+      addToolCall(result, block.tool ?? block.name, callId, input, block.time?.created);
       const state = block.state ?? {};
       if (state.status === 'completed' || state.status === 'error') {
-        addToolResult(result, callId, state.output ?? state.result ?? state.error, state.status === 'error');
+        const output = state.output ?? state.result ?? state.content ?? state.error?.message ?? state.error;
+        const time = result.events ? block.time?.completed : undefined;
+        addToolResult(result, callId, result.events ? sourceToolOutput(result, output, callId) : output, state.status === 'error', time);
+        if (result.events && state.metadata?.truncated === true) markSourcePartial(result, 'source-tool-output-truncated');
       }
     }
   }
   // A Codex user message can contain several independent input_text blocks.
   // Filter each one so an internal block never hides a neighboring prompt.
   return texts.map(stripRuntimeWrapper).filter(value => value.trim()).join('\n');
+}
+
+function sourceAttachment(block) {
+  const type = block?.type;
+  if (!['input_image', 'image', 'file', 'input_file', 'document'].includes(type) && !block?.inlineData && !block?.fileData) return;
+  const source = block.source ?? block.inlineData ?? block.fileData ?? block;
+  const url = block.image_url?.url ?? block.image_url ?? block.url ?? source.fileUri ?? source.url;
+  const embedded = typeof url === 'string' ? /^data:([a-z\d.+-]+\/[a-z\d.+-]+);base64,([a-z\d+/=]+)$/i.exec(url) : undefined;
+  const encoded = embedded?.[2] ?? source.data ?? block.file_data;
+  const sourceType = embedded?.[1] ?? source.media_type ?? source.mimeType ?? source.mime ?? block.mime;
+  const mediaType = typeof sourceType === 'string' ? sourceType : undefined;
+  const originalName = block.filename ?? block.name ?? block.title;
+  const name = typeof originalName === 'string' && path.win32.basename(originalName)
+    || ((typeof type === 'string' && type.includes('image')) || mediaType?.startsWith('image/') ? '图片' : '附件');
+  const file = localDirectory(block.path ?? url);
+  if (typeof encoded === 'string' && /^[\da-z+/]+={0,2}$/i.test(encoded)) {
+    return { name, mediaType, data: Buffer.from(encoded, 'base64') };
+  }
+  if (file) return { name, mediaType, path: file };
+  return { name, mediaType, status: typeof url === 'string' ? 'remote-reference' : 'name-only' };
+}
+
+function sourceToolOutput(result, value, callId) {
+  if (!Array.isArray(value)) return value;
+  for (const attachment of value.map(sourceAttachment).filter(Boolean)) {
+    result.events.push({
+      kind: 'attachment', role: 'assistant', turn: result.turn, sourceId: result.sourceId,
+      callId: traceCallId(callId), ...attachment,
+    });
+  }
+  return textBlocks(value);
+}
+
+function sourceBlockText(block, functionParts) {
+  if (typeof block === 'string') return block;
+  if (block?.thought || typeof block?.text !== 'string') return undefined;
+  if (['text', 'input_text', 'output_text'].includes(block.type) || (functionParts && block.type === undefined)) return block.text;
+}
+
+function sourceReasoning(block) {
+  if (block?.type === 'thinking') return block.thinking;
+  if (block?.type === 'reasoning' || block?.thought === true) return block.text;
+}
+
+function readAssistantBlocks(result, blocks, timestamp, hints) {
+  let foundText = false;
+  let text = [];
+  const flush = () => {
+    if (text.length) foundText = appendMessage(result, 'assistant', text.join('\n'), timestamp, hints) || foundText;
+    text = [];
+  };
+  for (const block of blocks) {
+    const body = sourceBlockText(block, hints.functionParts);
+    if (body !== undefined) {
+      text.push(stripRuntimeWrapper(body));
+      continue;
+    }
+    const thought = sourceReasoning(block);
+    const attachment = sourceAttachment(block);
+    const tool = ['tool', 'tool_use', 'tool_result'].includes(block?.type)
+      || (hints.functionParts && (block?.functionCall || block?.functionResponse));
+    if (!thought && !tool && !attachment) continue;
+    flush();
+    if (typeof thought === 'string') addSummary(result, thought, timestamp, result.sourceId);
+    if (attachment) {
+      result.events.push({ kind: 'attachment', role: 'assistant', turn: result.turn, sourceId: result.sourceId, ...attachment });
+    }
+    if (tool) {
+      textBlocks([block], result);
+      if (hints.functionParts) readFunctionParts(result, [block], timestamp);
+    }
+  }
+  flush();
+  if (!foundText) appendMessage(result, 'assistant', hints.text, timestamp, hints);
+}
+
+function readSourceBlocks(result, role, content, timestamp, hints = {}) {
+  const blocks = Array.isArray(content) ? content : [];
+  if (role === 'assistant' && blocks.length) {
+    readAssistantBlocks(result, blocks, timestamp, hints);
+    return;
+  }
+  const attachments = blocks.map(sourceAttachment).filter(Boolean);
+  const added = appendMessage(result, role, hints.text ?? textBlocks(content), timestamp, hints);
+  const standalone = role === 'user' && attachments.length > 0 && !added;
+  if (standalone) result.turn++;
+  for (const [index, attachment] of attachments.entries()) {
+    result.events.push({
+      kind: 'attachment', role, turn: result.turn, sourceId: result.sourceId, ...attachment,
+      ...(standalone && index === 0 ? { standalone: true } : {}),
+    });
+  }
+  textBlocks(blocks, result);
 }
 
 function firstQuestion(rows, agent) {
@@ -739,7 +898,7 @@ function firstQuestion(rows, agent) {
   }
 }
 
-async function readGeminiHistory(descriptor, cwd, config, result) {
+async function allowedGemini(descriptor, cwd, config) {
   for (const root of configuredRoots(config, 'gemini')) {
     const [base] = await transcriptDirectories(root, ['tmp']);
     if (!base) continue;
@@ -747,18 +906,23 @@ async function readGeminiHistory(descriptor, cwd, config, result) {
     if (!file || path.basename(path.dirname(file)) !== 'chats' || !/^session-.+\.jsonl?$/i.test(path.basename(file))) continue;
     const marker = await scopedFile(path.resolve(path.dirname(file), '..', '.project_root'), base);
     if (!marker || !await sameDirectory((await prefix(marker, 32 * 1024)).text.trim(), cwd)) continue;
-    const { text, truncated } = await prefix(file, maxTranscriptBytes);
-    if (truncated) markSourcePartial(result);
-    const messages = json(text)?.messages ?? rowsFrom(text, truncated);
-    if (!Array.isArray(messages)) continue;
-    for (const row of messages) {
-      const message = row.message ?? row;
-      if (!['user', 'gemini', 'assistant'].includes(message.type)) continue;
-      const content = Array.isArray(message.content) ? message.content.map(block => block?.text ?? '').join('\n') : message.content;
-      appendMessage(result, message.type === 'gemini' ? 'assistant' : message.type, content, message.timestamp);
-      for (const tool of Array.isArray(message.toolCalls) ? message.toolCalls : []) readTool(result, tool.name, tool.args);
-    }
-    return;
+    return file;
+  }
+}
+
+async function readGeminiHistory(descriptor, cwd, config, result) {
+  const file = await allowedGemini(descriptor, cwd, config);
+  if (!file) return;
+  const { text, truncated } = await prefix(file, maxTranscriptBytes);
+  if (truncated) markSourcePartial(result);
+  const messages = json(text)?.messages ?? rowsFrom(text, truncated);
+  if (!Array.isArray(messages)) return;
+  for (const row of messages) {
+    const message = row.message ?? row;
+    if (!['user', 'gemini', 'assistant'].includes(message.type)) continue;
+    const content = Array.isArray(message.content) ? message.content.map(block => block?.text ?? '').join('\n') : message.content;
+    appendMessage(result, message.type === 'gemini' ? 'assistant' : message.type, content, message.timestamp);
+    for (const tool of Array.isArray(message.toolCalls) ? message.toolCalls : []) readTool(result, tool.name, tool.args);
   }
 }
 
@@ -781,30 +945,40 @@ function copilotRequests(text, truncated) {
   if (Array.isArray(snapshot?.requests)) return snapshot.requests;
   let state;
   for (const op of rowsFrom(text, truncated)) {
-    if (op.kind === 0) {
-      state = op.v;
-      continue;
-    }
-    if (!Array.isArray(op.k) || op.k[0] !== 'requests' || op.k.length > 8) continue;
-    const keys = op.k.map(String);
-    if (keys.some(key => ['__proto__', 'prototype', 'constructor'].includes(key))) continue;
-    const key = keys.pop();
-    let target = state;
-    for (const part of keys) target = target && Object.hasOwn(target, part) ? target[part] : undefined;
-    if (!target || typeof target !== 'object') continue;
-    if (Array.isArray(target) && (!/^\d+$/.test(key) || Number(key) >= target.length)) continue;
-    if (op.kind === 1) target[key] = op.v;
-    if (op.kind === 2 && Array.isArray(target[key]) && Array.isArray(op.v)) {
-      const current = target[key];
-      const index = Number.isInteger(op.i) ? Math.max(0, Math.min(op.i, current.length)) : current.length;
-      target[key] = current.slice(0, index).concat(op.v, current.slice(index + op.v.length));
-    }
-    if (op.kind === 3 && !Array.isArray(target)) delete target[key];
+    if (op.kind === 0) state = op.v;
+    else applyCopilotOp(state, op);
   }
   return Array.isArray(state?.requests) ? state.requests : [];
 }
 
-async function readCopilotHistory(descriptor, cwd, config, result) {
+function applyCopilotOp(state, op) {
+  if (!Array.isArray(op.k) || op.k[0] !== 'requests') return true;
+  if (op.k.length > 8) return false;
+  const keys = op.k.map(String);
+  if (keys.some(key => ['__proto__', 'prototype', 'constructor'].includes(key))) return false;
+  const key = keys.pop();
+  let target = state;
+  for (const part of keys) target = target && Object.hasOwn(target, part) ? target[part] : undefined;
+  if (!target || typeof target !== 'object') return false;
+  if (Array.isArray(target) && (!/^\d+$/.test(key) || Number(key) >= target.length)) return false;
+  if (op.kind === 1) {
+    target[key] = op.v;
+    return true;
+  }
+  if (op.kind === 2 && Array.isArray(target[key]) && Array.isArray(op.v)) {
+    const current = target[key];
+    const index = Number.isInteger(op.i) ? Math.max(0, Math.min(op.i, current.length)) : current.length;
+    target[key] = current.slice(0, index).concat(op.v, current.slice(index + op.v.length));
+    return true;
+  }
+  if (op.kind === 3 && !Array.isArray(target)) {
+    delete target[key];
+    return true;
+  }
+  return false;
+}
+
+async function allowedEditorChat(descriptor, cwd, config) {
   const stores = await Promise.all(configuredRoots(config, 'copilot').map(editorStores));
   for (const base of stores.flat()) {
     const file = await scopedFile(descriptor.file, base);
@@ -813,21 +987,34 @@ async function readCopilotHistory(descriptor, cwd, config, result) {
     if (!workspace) continue;
     const marker = json((await prefix(workspace, 32 * 1024)).text);
     if (!await sameDirectory(localDirectory(marker?.folder), cwd)) continue;
-    const { text, truncated } = await prefix(file, maxTranscriptBytes);
-    if (truncated) markSourcePartial(result);
-    const requests = copilotRequests(text, truncated);
-    for (const request of result.limits ? requests : requests.slice(-maxMessages)) {
-      appendMessage(result, 'user', request?.message?.text, request?.timestamp);
-      const response = Array.isArray(request?.response) ? request.response : [];
-      const answer = response.filter(item => !item?.kind || item.kind === 'markdownContent')
-        .map(item => item?.value?.value ?? item?.value ?? '').filter(value => typeof value === 'string').join('');
-      // Copilot stores the request time. Use it for transcript order only.
-      appendMessage(result, 'assistant', answer, request?.timestamp, { estimatedTime: true });
-      for (const item of response) {
-        if (item?.kind === 'toolInvocationSerialized') readTool(result, item.toolId, item.parameters);
-      }
+    return file;
+  }
+}
+
+function copilotText(item) {
+  if (item?.kind && item.kind !== 'markdownContent') return '';
+  const value = item?.value?.value ?? item?.value;
+  return typeof value === 'string' ? value : '';
+}
+
+function copilotAnswer(response) {
+  return response.map(copilotText).join('');
+}
+
+async function readCopilotHistory(descriptor, cwd, config, result) {
+  const file = await allowedEditorChat(descriptor, cwd, config);
+  if (!file) return;
+  const { text, truncated } = await prefix(file, maxTranscriptBytes);
+  if (truncated) markSourcePartial(result);
+  const requests = copilotRequests(text, truncated);
+  for (const request of result.limits ? requests : requests.slice(-maxMessages)) {
+    appendMessage(result, 'user', request?.message?.text, request?.timestamp);
+    const response = Array.isArray(request?.response) ? request.response : [];
+    // Copilot stores the request time. Use it for transcript order only.
+    appendMessage(result, 'assistant', copilotAnswer(response), request?.timestamp, { estimatedTime: true });
+    for (const item of response) {
+      if (item?.kind === 'toolInvocationSerialized') readTool(result, item.toolId, item.parameters);
     }
-    return;
   }
 }
 
@@ -895,11 +1082,24 @@ async function* compressedRows(file) {
 
 function readCodexRow(result, row) {
   if (row === null || row.type === 'compacted' || row.isCompactSummary) {
-    if (result.limits) markSourcePartial(result);
+    if (result.limits || result.events) markSourcePartial(result);
     return;
   }
-  if (row.isSidechain || row.isMeta) return;
+  if (row.isSidechain) {
+    if (result.events) markSourcePartial(result, 'unresolved-branch');
+    return;
+  }
+  if (row.isMeta) return;
   const payload = row.payload;
+  if (row.type === 'event_msg' && result.events) {
+    if (payload?.type === 'task_started') result.sourceTurn = payload.turn_id;
+    if (['turn_aborted', 'task_complete'].includes(payload?.type)) {
+      const turn = payload.turn_id ? result.sourceTurns.get(payload.turn_id) : result.turn;
+      if (turn) result.events.push({
+        kind: 'turn_end', turn, status: payload.type === 'turn_aborted' ? 'interrupted' : 'completed',
+      });
+    }
+  }
   if (row.type === 'event_msg' && payload?.type === 'token_count' && result.readStats) {
     // Codex repeats cumulative snapshots. The latest recorded total already
     // includes earlier turns, and may be available even when only a tail was read.
@@ -916,7 +1116,15 @@ function readCodexRow(result, row) {
   }
   if (row.type !== 'response_item') return;
   if (payload?.type === 'message') {
-    appendMessage(result, payload.role, textBlocks(payload.content, result), row.timestamp);
+    if (result.events && ['user', 'assistant'].includes(payload.role)) {
+      const previousTurn = result.turn;
+      readSourceBlocks(result, payload.role, payload.content, row.timestamp);
+      if (result.turn !== previousTurn && typeof result.sourceTurn === 'string') {
+        result.sourceTurns.set(result.sourceTurn, result.turn);
+      }
+    } else {
+      appendMessage(result, payload.role, textBlocks(payload.content, result), row.timestamp);
+    }
     return;
   }
   if (payload?.type === 'reasoning') {
@@ -934,12 +1142,13 @@ function readCodexRow(result, row) {
   }
   if (payload?.type === 'function_call_output' || payload?.type === 'custom_tool_call_output') {
     const output = payload.output ?? payload.content;
-    const text = Array.isArray(output)
-      ? output.filter(item => item?.type === 'input_text' && typeof item.text === 'string').map(item => item.text).join('\n')
-      : output;
+    const text = result.events ? traceValue(sourceToolOutput(result, output, payload.call_id))
+      : (Array.isArray(output)
+        ? output.filter(item => item?.type === 'input_text' && typeof item.text === 'string').map(item => item.text).join('\n')
+        : output);
     const value = typeof text === 'string' ? text : '';
     addToolResult(result, payload.call_id, value, payload.status === 'failed'
-      || /^(?:exit code: [1-9]|process exited with code [1-9])/im.test(value));
+      || /^(?:exit code: [1-9]|process exited with code [1-9])/im.test(value), ...(result.events ? [row.timestamp] : []));
   }
 }
 
@@ -994,7 +1203,7 @@ function parseTail(buffer) {
   };
 }
 
-async function readJsonlHistory(descriptor, cwd, config, result) {
+async function allowedJsonl(descriptor, config) {
   const codex = descriptor.kind === 'codex';
   const locations = codex ? codexLocations : ['projects'];
   const bases = (await Promise.all(configuredRoots(config, descriptor.kind)
@@ -1007,6 +1216,12 @@ async function readJsonlHistory(descriptor, cwd, config, result) {
       if (file) break;
     }
   }
+  return file;
+}
+
+async function readJsonlHistory(descriptor, cwd, config, result) {
+  const codex = descriptor.kind === 'codex';
+  const file = await allowedJsonl(descriptor, config);
   if (!file) return;
   if (codex && compressedCodexFile.test(file)) return readCompressedCodex(file, cwd, result);
   if (!jsonlFile.test(file)) return;
@@ -1038,7 +1253,8 @@ async function readJsonlHistory(descriptor, cwd, config, result) {
 
 async function allowedArchive(descriptor, config) {
   const candidates = descriptor.kind === 'agentsview' ? config.archiveFiles ?? []
-    : (await Promise.all(configuredRoots(config, 'opencode').map(opencodeDatabase))).filter(Boolean);
+    : (await Promise.all(configuredRoots(config, descriptor.kind)
+      .map(descriptor.kind === 'copilot' ? copilotDatabase : opencodeDatabase))).filter(Boolean);
   const actual = await physicalPath(descriptor.file);
   if (!actual) return undefined;
   for (const candidate of candidates) {
@@ -1104,7 +1320,439 @@ async function readHistory(archive, cwd, config, result) {
   if (['codex', 'claude', 'qoder', 'qwen', 'workbuddy'].includes(archive.kind)) await readJsonlHistory(archive, cwd, config, result);
   if (archive.kind === 'gemini') await readGeminiHistory(archive, cwd, config, result);
   if (archive.kind === 'antigravity') await readAntigravityHistory(archive, cwd, config, result);
-  if (archive.kind === 'copilot') await readCopilotHistory(archive, cwd, config, result);
+  if (archive.kind === 'copilot' && archive.storage === 'sqlite') {
+    for await (const event of readSourceEvents(archive, { config, sourceCwd: cwd })) {
+      if (event.kind === 'message') appendMessage(result, event.role, event.text, event.time);
+      if (event.kind === 'gap' && result.limits) markSourcePartial(result, event.reason);
+    }
+  } else if (archive.kind === 'copilot') await readCopilotHistory(archive, cwd, config, result);
+}
+
+function readSourceMessageRow(result, kind, row) {
+  if (kind === 'codex') {
+    readCodexRow(result, row);
+  } else if (row.isCompactSummary || (row.type === 'system' && row.subtype === 'compact_boundary')) {
+    markSourcePartial(result);
+  } else if (row.isSidechain) {
+    markSourcePartial(result, 'unresolved-branch');
+  } else if (!row.isMeta) {
+    if (kind === 'workbuddy') {
+      if (row.type === 'message') readSourceBlocks(result, row.role === 'human' ? 'user' : row.role, row.content, row.timestamp);
+      if (row.type === 'reasoning') {
+        const text = blocks => Array.isArray(blocks) ? blocks
+          .filter(block => block?.type === 'reasoning_text' && typeof block.text === 'string')
+          .map(block => block.text).join('\n\n') : '';
+        addSummary(result, text(row.content) || text(row.rawContent), row.timestamp, result.sourceId);
+      }
+      if (row.type === 'function_call') {
+        readTool(result, row.name, row.arguments);
+        addToolCall(result, row.name, row.callId ?? row.call_id ?? row.id, row.arguments, row.timestamp);
+      }
+      if (['function_call_output', 'function_call_result'].includes(row.type)) {
+        const blocks = Array.isArray(row.output) ? row.output : [row.output];
+        const output = blocks.length && blocks.every(block => block?.type === 'text' && typeof block.text === 'string')
+          ? blocks.map(block => block.text).join('\n') : row.output;
+        const status = row.status === 'incomplete' ? 'incomplete' : ['error', 'failed'].includes(row.status);
+        addToolResult(result, row.callId ?? row.call_id, output, status, row.timestamp);
+      }
+    } else if (kind === 'qwen' && Array.isArray(row.message?.parts)) {
+      const parts = row.message.parts;
+      if (row.type === 'user' || row.type === 'assistant') {
+        readSourceBlocks(result, row.type, parts, row.timestamp, {
+          functionParts: true,
+          text: parts.map(part => sourceBlockText(part, true)).filter(Boolean).join('\n'),
+        });
+      }
+      if (['user', 'tool_result'].includes(row.type)) readFunctionParts(result, parts, row.timestamp);
+    } else if (row.type === 'user' || row.type === 'assistant') {
+      readSourceBlocks(result, row.type, row.message?.content, row.timestamp);
+    }
+  }
+}
+
+function readFunctionParts(result, parts, time) {
+  for (const part of parts) {
+    if (part?.functionCall) {
+      const { name, id, args } = part.functionCall;
+      readTool(result, name, args);
+      addToolCall(result, name, id, args, time);
+    }
+    if (part?.functionResponse) {
+      const { id, response } = part.functionResponse;
+      const error = Boolean(response?.error);
+      const output = response && typeof response === 'object' && Object.keys(response).length === 1
+        ? response.error ?? response.output ?? response : response;
+      addToolResult(result, id, output, error, time);
+    }
+  }
+}
+
+function sourceIdentity(result, row, ordinal) {
+  result.sourceId = row.uuid ?? row.message?.id ?? row.payload?.id ?? row.id ?? `row:${ordinal}`;
+  result.parentId = row.parentUuid ?? row.message?.parentId;
+}
+
+async function* jsonlSourceEvents(archive, options, result) {
+  const { config, sourceCwd, signal } = options;
+  const file = await allowedJsonl(archive, config);
+  if (!file) {
+    yield { kind: 'gap', reason: compressedCodexFile.test(archive.file) && !hasZstd ? 'unsupported-compression' : 'source-unavailable' };
+    return;
+  }
+  let validated = false;
+  let ordinal = 0;
+  let pendingBytes = 0;
+  let pending = [];
+  for await (const { row, bytes, gap } of sourceJsonl(file, { compressed: compressedCodexFile.test(file), signal })) {
+    if (gap) {
+      yield { kind: 'gap', reason: gap };
+      continue;
+    }
+    ordinal++;
+    if (!validated) {
+      // Codex authenticates the session before any content can leave the reader.
+      const cwd = await nativeCwd(file, archive.kind, [row]);
+      if (!cwd) {
+        pendingBytes += bytes;
+        if (archive.kind === 'codex' || pendingBytes > sourceValueLimit || pending.length >= 65_536) {
+          yield { kind: 'gap', reason: 'source-metadata-missing' };
+          return;
+        }
+        pending.push([row, ordinal]);
+        continue;
+      }
+      if (!await sameDirectory(cwd, sourceCwd)
+        || (archive.kind === 'codex' && archive.id && row.payload?.id && row.payload.id !== archive.id)) {
+        yield { kind: 'gap', reason: 'source-mismatch' };
+        return;
+      }
+      validated = true;
+      for (const [earlier, sequence] of pending) {
+        sourceIdentity(result, earlier, sequence);
+        readSourceMessageRow(result, archive.kind, earlier);
+        yield* result.events.splice(0);
+      }
+      pending = [];
+    }
+    sourceIdentity(result, row, ordinal);
+    readSourceMessageRow(result, archive.kind, row);
+    yield* result.events.splice(0);
+  }
+  if (!validated && ordinal) yield { kind: 'gap', reason: 'source-metadata-missing' };
+}
+
+function* agentsViewEvents(db, id, result) {
+  const fields = columns(db, 'messages');
+  if (!['ordinal', 'role', 'session_id'].every(field => fields.has(field))
+    || (!fields.has('dialogue_text') && !fields.has('content'))) {
+    markSourcePartial(result, 'unsupported-source-schema');
+    return;
+  }
+  const content = fields.has('dialogue_text') ? 'dialogue_text' : 'content';
+  const system = fields.has('is_system') ? ' AND is_system = 0' : '';
+  const time = fields.has('timestamp') ? 'timestamp' : 'NULL';
+  for (const row of db.prepare(`SELECT ordinal, role, ${content} AS text, ${time} AS time FROM messages
+    WHERE session_id = ? AND role IN ('user','assistant')${system} ORDER BY ordinal`).iterate(id)) {
+    result.sourceId = `message:${row.ordinal}`;
+    appendMessage(result, row.role, row.text, row.time);
+    yield* result.events.splice(0);
+  }
+  const toolFields = columns(db, 'tool_calls');
+  if (!toolFields.has('session_id')) return;
+  if (toolFields.has('skill_name')) {
+    for (const row of db.prepare('SELECT DISTINCT skill_name FROM tool_calls WHERE session_id = ?').iterate(id)) {
+      addSkill(result, row.skill_name);
+    }
+  }
+  if (db.prepare('SELECT 1 FROM tool_calls WHERE session_id = ? LIMIT 1').get(id)) {
+    markSourcePartial(result, 'archive-tool-details-unavailable');
+  }
+}
+
+function mergeOpenCodeParts(content, rows, result) {
+  for (const row of rows) {
+    const data = json(row.data);
+    if (!data) {
+      markSourcePartial(result, 'malformed-record');
+      continue;
+    }
+    const part = { ...data, type: row.type, ...(row.call_id ? { callID: row.call_id } : {}) };
+    const current = content[row.ordinal];
+    if (!current || current.type !== part.type) {
+      content.push(part);
+      continue;
+    }
+    const sameText = part.text === undefined || current.text === undefined || part.text === current.text;
+    const sameCall = !part.callID || !current.callID || current.callID === part.callID;
+    if (!sameText || !sameCall) {
+      markSourcePartial(result, 'unresolved-source-projection');
+      continue;
+    }
+    content[row.ordinal] = { ...current, ...part, ...(part.state ? { state: { ...current.state, ...part.state } } : {}) };
+  }
+  return content;
+}
+
+function* openCodeEvents(db, id, result) {
+  const projection = columns(db, 'session_message');
+  const messages = columns(db, 'message');
+  const parts = columns(db, 'part');
+  // The normalized part table carries text and tool statuses directly. If
+  // both layouts exist and contain this session, never replay the projection
+  // as a second copy.
+  if (['id', 'session_id', 'data', 'time_created'].every(field => messages.has(field))
+    && ['session_id', 'message_id', 'data', 'time_created'].every(field => parts.has(field))
+    && db.prepare('SELECT 1 FROM message WHERE session_id = ? LIMIT 1').get(id)) {
+    const order = parts.has('id') ? 'time_created, id' : 'time_created';
+    const readParts = db.prepare(`SELECT data FROM part WHERE session_id = ? AND message_id = ? ORDER BY ${order}`);
+    for (const row of db.prepare('SELECT id, data, time_created AS time FROM message WHERE session_id = ? ORDER BY time, id').iterate(id)) {
+      const data = json(row.data);
+      result.sourceId = row.id;
+      result.parentId = data?.parentID;
+      const content = [];
+      for (const part of readParts.iterate(id, row.id)) {
+        const block = json(part.data);
+        if (block) content.push(block);
+        else markSourcePartial(result, 'malformed-record');
+      }
+      if (['user', 'assistant'].includes(data?.role)) readSourceBlocks(result, data.role, content, row.time);
+      else if (!data) markSourcePartial(result, 'malformed-record');
+      yield* result.events.splice(0);
+    }
+    if (['type', 'session_id'].every(field => projection.has(field))) {
+      const messageCount = db.prepare('SELECT count(*) AS count FROM message WHERE session_id = ?').get(id).count;
+      const projectionCount = db.prepare("SELECT count(*) AS count FROM session_message WHERE session_id = ? AND type IN ('user','assistant')").get(id).count;
+      if (projectionCount > messageCount) markSourcePartial(result, 'unresolved-source-projection');
+    }
+    return;
+  }
+  if (['type', 'session_id', 'data'].every(field => projection.has(field))) {
+    const seq = projection.has('seq') ? 'seq' : projection.has('time_created') ? 'time_created' : 'rowid';
+    const time = projection.has('time_created') ? 'time_created' : 'NULL';
+    const messageId = projection.has('id') ? 'id' : 'NULL';
+    const projectedParts = columns(db, 'session_part');
+    const readParts = projection.has('id') && ['session_id', 'message_id', 'ordinal', 'type', 'data'].every(field => projectedParts.has(field))
+      ? db.prepare(`SELECT ordinal, type, data, ${projectedParts.has('call_id') ? 'call_id' : 'NULL'} AS call_id FROM session_part
+        WHERE session_id = ? AND message_id = ? ORDER BY ordinal`) : undefined;
+    for (const row of db.prepare(`SELECT ${messageId} AS id, type, data, ${seq} AS seq, ${time} AS time FROM session_message
+      WHERE session_id = ? AND type IN ('user','assistant','skill','idle') ORDER BY seq, id`).iterate(id)) {
+      const data = json(row.data);
+      if (!data) markSourcePartial(result, 'malformed-record');
+      else if (row.type === 'skill') addSkill(result, data.name ?? data.skill);
+      else if (row.type === 'idle') {
+        const status = data.outcome === 'succeeded' ? 'completed'
+          : ['aborted', 'cancelled', 'failed', 'interrupted'].includes(data.outcome) ? 'interrupted' : undefined;
+        if (status && result.turn) result.events.push({ kind: 'turn_end', status, turn: result.turn });
+      }
+      else {
+        result.sourceId = row.id ?? data.id ?? `message:${row.seq}`;
+        const content = Array.isArray(data.content) ? [...data.content] : [];
+        if (readParts) mergeOpenCodeParts(content, readParts.iterate(id, row.id), result);
+        if (Array.isArray(data.files)) {
+          content.push(...data.files.filter(file => file && typeof file === 'object').map(file => ({ type: 'file', ...file })));
+        }
+        readSourceBlocks(result, row.type, content, row.time, {
+          text: data.text ?? (typeof data.content === 'string' ? data.content : undefined),
+        });
+      }
+      yield* result.events.splice(0);
+    }
+    return;
+  }
+  if (!messages.size || !parts.size) markSourcePartial(result, 'unsupported-source-schema');
+}
+
+function* copilotSqliteEvents(db, id, result) {
+  for (const row of db.prepare('SELECT id, user_message, assistant_response, timestamp FROM turns WHERE session_id = ? ORDER BY turn_index, id').iterate(id)) {
+    result.sourceId = `request:${row.id}`;
+    appendMessage(result, 'user', row.user_message, row.timestamp);
+    result.sourceId = `response:${row.id}`;
+    appendMessage(result, 'assistant', row.assistant_response, row.timestamp, { estimatedTime: true });
+    yield* result.events.splice(0);
+  }
+  markSourcePartial(result, 'source-dialogue-only');
+}
+
+async function* databaseSourceEvents(archive, options, result) {
+  const { sourceCwd, config, signal } = options;
+  const file = await allowedArchive(archive, config);
+  if (!file) {
+    yield { kind: 'gap', reason: 'source-unavailable' };
+    return;
+  }
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    db.exec('PRAGMA trusted_schema = OFF; PRAGMA busy_timeout = 1000; BEGIN');
+    let cwd;
+    let events;
+    if (archive.kind === 'agentsview') {
+      const fields = columns(db, 'sessions');
+      const deleted = fields.has('deleted_at') ? ' AND deleted_at IS NULL' : '';
+      const machine = fields.has('machine') ? " AND machine IN ('', 'local')" : '';
+      cwd = db.prepare('SELECT cwd FROM sessions WHERE id = ?' + deleted + machine).get(archive.id)?.cwd;
+      events = agentsViewEvents;
+    } else if (archive.kind === 'copilot' && copilotTables(db)) {
+      const host = copilotHostFilter(columns(db, 'sessions'));
+      cwd = localDirectory(db.prepare('SELECT cwd FROM sessions WHERE id = ?' + host).get(archive.id)?.cwd);
+      events = copilotSqliteEvents;
+    } else if (archive.kind === 'opencode' && opencodeTables(db).includes(archive.table)) {
+      cwd = db.prepare(`SELECT directory FROM ${archive.table} WHERE id = ?`).get(archive.id)?.directory;
+      events = openCodeEvents;
+    }
+    if (!events) {
+      yield { kind: 'gap', reason: 'unsupported-source-schema' };
+    } else if (!await sameDirectory(cwd, sourceCwd)) {
+      yield { kind: 'gap', reason: 'source-mismatch' };
+    } else {
+      for (const event of events(db, archive.id, result)) {
+        signal?.throwIfAborted();
+        yield event;
+      }
+      yield* result.events.splice(0);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function geminiEvent(result, row, index) {
+  const message = row?.message ?? row;
+  if (!['user', 'gemini', 'assistant'].includes(message?.type)) return;
+  sourceIdentity(result, row, index);
+  const role = message.type === 'gemini' ? 'assistant' : message.type;
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  readSourceBlocks(result, role, message.content, message.timestamp ?? row.timestamp, {
+    functionParts: true,
+    text: blocks.length ? blocks.map(block => sourceBlockText(block, true)).filter(Boolean).join('\n') : undefined,
+  });
+  if (role === 'user') readFunctionParts(result, blocks, message.timestamp);
+  for (const tool of Array.isArray(message.toolCalls) ? message.toolCalls : []) {
+    readTool(result, tool.name, tool.args);
+    addToolCall(result, tool.name, tool.id, tool.args, tool.timestamp ?? message.timestamp);
+    if (tool.result !== undefined || tool.error !== undefined) {
+      addToolResult(result, tool.id, tool.result ?? tool.error, tool.status === 'error' || Boolean(tool.error), tool.timestamp);
+    }
+  }
+}
+
+function* copilotEvent(result, requests) {
+  let index = 0;
+  for (const request of requests) {
+    index++;
+    result.sourceId = request?.requestId ?? request?.id ?? `request:${index}`;
+    const requestId = result.sourceId;
+    appendMessage(result, 'user', request?.message?.text, request?.timestamp);
+    const response = Array.isArray(request?.response) ? request.response : [];
+    result.sourceId = `${requestId}:response`;
+    let text = '';
+    const flush = () => {
+      appendMessage(result, 'assistant', text, request?.timestamp, { estimatedTime: true });
+      text = '';
+    };
+    for (const item of response) {
+      if (item?.kind === 'thinking') {
+        const value = item.value?.value ?? item.value;
+        if (typeof value === 'string' && value.trim()) {
+          flush();
+          addSummary(result, value, undefined);
+        }
+        continue;
+      }
+      if (item?.kind !== 'toolInvocationSerialized') {
+        text += copilotText(item);
+        continue;
+      }
+      flush();
+      const callId = item.toolCallId ?? item.invocationId;
+      readTool(result, item.toolId, item.parameters);
+      addToolCall(result, item.toolId ?? item.name, callId, item.parameters, request.timestamp);
+      if (item.resultDetails !== undefined || item.result !== undefined || item.error !== undefined) {
+        addToolResult(result, callId, item.resultDetails ?? item.result ?? item.error, Boolean(item.error));
+      }
+    }
+    flush();
+    yield* result.events.splice(0);
+  }
+}
+
+async function* editorSourceEvents(archive, { sourceCwd, config, signal }, result) {
+  const copilot = archive.kind === 'copilot';
+  const file = await (copilot ? allowedEditorChat : allowedGemini)(archive, sourceCwd, config);
+  if (!file) {
+    yield { kind: 'gap', reason: 'source-unavailable' };
+    return;
+  }
+  const jsonl = /\.jsonl$/i.test(file);
+  if (!jsonl) {
+    const { row, gap } = await sourceJson(file, signal);
+    if (gap) {
+      yield { kind: 'gap', reason: gap };
+    } else if (copilot && Array.isArray(row?.requests)) {
+      yield* copilotEvent(result, row.requests);
+    } else if (Array.isArray(row?.messages)) {
+      for (const [index, message] of row.messages.entries()) {
+        signal?.throwIfAborted();
+        geminiEvent(result, message, index + 1);
+        yield* result.events.splice(0);
+      }
+    } else {
+      yield { kind: 'gap', reason: 'unsupported-source-schema' };
+    }
+    return;
+  }
+  let state;
+  let index = 0;
+  let uncertain = false;
+  for await (const { row, gap } of sourceJsonl(file, { signal })) {
+    if (gap) {
+      yield { kind: 'gap', reason: gap };
+    } else if (copilot) {
+      if (row.kind === 0) state = row.v;
+      else if (!applyCopilotOp(state, row)) uncertain = true;
+    } else {
+      geminiEvent(result, row, ++index);
+      yield* result.events.splice(0);
+    }
+  }
+  if (copilot) {
+    if (uncertain) yield { kind: 'gap', reason: 'unsupported-incremental-edit' };
+    if (Array.isArray(state?.requests)) yield* copilotEvent(result, state.requests);
+    else yield { kind: 'gap', reason: 'unsupported-source-schema' };
+  }
+}
+
+export async function* readSourceEvents(archive, options) {
+  const { signal } = options;
+  const result = { events: [], usedSkills: new Set(), readStats: {}, turn: 0, sourceTurns: new Map() };
+  try {
+    signal?.throwIfAborted();
+    if (['codex', 'claude', 'qoder', 'qwen', 'workbuddy'].includes(archive?.kind)) {
+      yield* jsonlSourceEvents(archive, options, result);
+    } else if (['opencode', 'agentsview'].includes(archive?.kind) || archive?.kind === 'copilot' && archive.storage === 'sqlite') {
+      yield* databaseSourceEvents(archive, options, result);
+    } else if (['copilot', 'gemini'].includes(archive?.kind)) {
+      yield* editorSourceEvents(archive, options, result);
+    } else {
+      yield { kind: 'gap', reason: 'unsupported-source' };
+    }
+  } catch (error) {
+    signal?.throwIfAborted();
+    yield { kind: 'gap', reason: error.sourceReason ?? 'source-unreadable' };
+  }
+  const { tokens } = result.readStats;
+  if (result.usedSkills.size || tokens) {
+    yield { kind: 'metadata', usedSkills: [...result.usedSkills].sort(), ...(tokens ? { sourceStats: { tokens } } : {}) };
+  }
+}
+
+export async function probeConversation(archive, options) {
+  let reason;
+  for await (const event of readSourceEvents(archive, options)) {
+    if (event.role === 'user' && ['message', 'attachment'].includes(event.kind)) return { state: 'ready' };
+    if (event.kind === 'gap') reason ??= event.reason;
+  }
+  return reason ? { state: 'unknown', reason } : { state: 'empty' };
 }
 
 export async function readConversationHistory(archive, cwd, config) {

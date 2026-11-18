@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
+import { DatabaseSync } from 'node:sqlite'
 import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 import { apply } from '../src/index.js'
+import { approveConversation, finishConversation, stageConversation } from '../src/conversation-store.js'
 
 test('the panel authenticates, refreshes changed project files, and exports reviewed handoffs', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-bridge-http-'))
@@ -45,6 +47,27 @@ test('the panel authenticates, refreshes changed project files, and exports revi
   await writeFile(join(traceDirectory, `${statsOnlyId}.json`), JSON.stringify({
     ...traceFile, sessionId: statsOnlyId, trace: [], sourceStats,
   }))
+  const archiveId = '6d4f5e60-4444-4555-8666-c77788889999'
+  const previewId = '1a4f5e60-4444-4555-8666-c77788889999'
+  const previewSessionId = '1b4f5e60-4444-4555-8666-c77788889999'
+  const image = Buffer.from('89504e470d0a1a0a00000000', 'hex')
+  const document = Buffer.from('<html><p>attachment</p></html>')
+  const imageName = '中文 #1 (50%).png'
+  const documentName = '说明 #2 (50%).html'
+  const duplicateName = "第二份's.html"
+  async function* archiveEvents() {
+    yield { kind: 'message', role: 'user', turn: 7, text: 'Begin archive' }
+    yield { kind: 'tool_call', callId: 'archive-call', name: 'read', turn: 7, text: 'details' }
+    yield { kind: 'attachment', turn: 7, name: imageName, data: image }
+    yield { kind: 'attachment', turn: 7, name: documentName, data: document }
+    yield { kind: 'attachment', turn: 7, name: duplicateName, data: document }
+    yield { kind: 'message', role: 'assistant', turn: 7, text: '```csharp\r\nfirst\r\n\r\nlast\r\n```' }
+  }
+  const settings = { configFile: config }
+  await stageConversation(settings, { id: archiveId, sessionId: traceSessionId, sourceCwd: directory }, archiveEvents(), String)
+  await approveConversation(settings, archiveId)
+  await finishConversation(settings, archiveId)
+  await stageConversation(settings, { id: previewId, sessionId: previewSessionId, sourceCwd: directory }, archiveEvents(), String)
   const previousConfig = process.env.DSH_AGENT_BRIDGE_CONFIG
   process.env.DSH_AGENT_BRIDGE_CONFIG = config
   const routes = new Map()
@@ -104,6 +127,66 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     assert.equal(markdownModule.status, 200)
     assert.equal(markdownModule.headers.get('content-type'), 'text/javascript; charset=utf-8')
     assert.match(await markdownModule.text(), /export function renderMarkdown/)
+    const archiveUrl = base + `conversation-history?sessionId=${traceSessionId}`
+    assert.equal((await fetch(archiveUrl, { headers: { Cookie: 'signed-in=guest' } })).status, 403)
+    const fullHistory = await (await fetch(archiveUrl, { headers })).json()
+    assert.equal(fullHistory.history.messages, 2)
+    assert.equal(fullHistory.history.tools, 1)
+    const processUrl = base + `conversation-process?sessionId=${traceSessionId}`
+    assert.equal((await fetch(processUrl, { headers: { Cookie: 'signed-in=guest' } })).status, 403)
+    const processIndex = await (await fetch(processUrl, { headers })).json()
+    assert.deepEqual(processIndex.placements, [
+      { nativeTurn: 1, sourceTurn: 7, start: 0, anchor: 4, tail: false, after: 1, before: 6, calls: 1, count: 1 },
+    ])
+    assert.deepEqual((await (await fetch(processUrl + '&turn=7&after=2&before=6', { headers })).json()).items, [])
+    const processPage = await (await fetch(processUrl + '&turn=7', { headers })).json()
+    assert.deepEqual(processPage.items.map(({ kind, name, status }) => [kind, name, status]), [['tool_call', 'read', 'missing']])
+    assert.deepEqual((await (await fetch(processUrl + '&turn=1', { headers })).json()).items, [])
+    assert.equal((await fetch(processUrl + '&turn=0', { headers })).status, 400)
+    const attachment = fullHistory.items.find(item => item.name === imageName)
+    const attachmentLink = values => base + `conversation-attachment?${new URLSearchParams(values)}`
+    const dispositionName = response => decodeURIComponent(response.headers.get('content-disposition').split("filename*=UTF-8''")[1])
+    const filename = await fetch(attachmentLink({ sessionId: traceSessionId, attachmentId: attachment.attachmentId }), { headers })
+    assert.match(filename.headers.get('content-disposition'), /^attachment; filename="[a-f0-9]{12}\.png";/)
+    assert.equal(dispositionName(filename), imageName)
+    const imageResponse = await fetch(attachmentLink({ sessionId: traceSessionId, attachmentId: attachment.attachmentId, inline: 'true' }), { headers })
+    assert.equal(imageResponse.headers.get('content-type'), 'image/png')
+    assert.deepEqual(Buffer.from(await imageResponse.arrayBuffer()), image)
+    assert.match(imageResponse.headers.get('content-disposition'), /^inline;/)
+    assert.equal(dispositionName(imageResponse), imageName)
+    const file = fullHistory.items.find(item => item.name === documentName)
+    const secondFile = fullHistory.items.find(item => item.name === duplicateName)
+    assert.equal(file.attachmentId, secondFile.attachmentId)
+    for (const item of [file, secondFile]) {
+      const response = await fetch(attachmentLink({ sessionId: traceSessionId, attachmentId: item.attachmentId, seq: item.seq, inline: 'true', filename: 'ignored.html' }), { headers })
+      assert.equal(response.headers.get('content-type'), 'application/octet-stream')
+      assert.match(response.headers.get('content-disposition'), /^attachment;/)
+      assert.equal(dispositionName(response), item.name)
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), document)
+    }
+    const preview = attachmentLink({ snapshotId: previewId, attachmentId: attachment.attachmentId, seq: attachment.seq, inline: 'true' })
+    assert.equal((await fetch(preview, { headers: { Cookie: 'signed-in=guest' } })).status, 403)
+    const previewImage = await fetch(preview, { headers })
+    assert.equal(previewImage.status, 200)
+    assert.deepEqual(Buffer.from(await previewImage.arrayBuffer()), image)
+    assert.equal((await fetch(attachmentLink({ snapshotId: archiveId, attachmentId: attachment.attachmentId }), { headers })).status, 404)
+    assert.equal((await fetch(attachmentLink({ snapshotId: previewId, sessionId: traceSessionId, attachmentId: attachment.attachmentId }), { headers })).status, 400)
+    assert.equal((await fetch(attachmentLink({ snapshotId: previewId, attachmentId: attachment.attachmentId, seq: file.seq }), { headers })).status, 404)
+    const db = new DatabaseSync(join(directory, 'agent-bridge-history', 'history.sqlite'))
+    try {
+      db.prepare('UPDATE snapshots SET created=0 WHERE id=?').run(previewId)
+    } finally {
+      db.close()
+    }
+    assert.equal((await fetch(preview, { headers })).status, 404)
+    const downloadUrl = base + `conversation-export?sessionId=${traceSessionId}&format=share`
+    const response = await fetch(downloadUrl, { headers })
+    assert.match(response.headers.get('content-disposition'), /^attachment/)
+    const fullMarkdown = await response.text()
+    assert.ok(fullMarkdown.includes('```csharp\r\nfirst\r\n\r\nlast\r\n```'))
+    assert.ok(!fullMarkdown.includes('archive-call'))
+    assert.ok(!fullMarkdown.includes(directory))
+    assert.match(await (await fetch(downloadUrl + '&includeTrace=true', { headers })).text(), /archive-call/)
     for (const path of Object.values(listing.agentIcons)) {
       const icon = await fetch(base + path, { headers })
       assert.equal(icon.status, 200, path)

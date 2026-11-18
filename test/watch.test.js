@@ -48,6 +48,22 @@ test('database file changes invalidate the catalog while SQLite shared-memory an
   assert.equal(changes(), stopped);
 });
 
+test('native Copilot WAL and an older selected project transcript invalidate the conversation list', async t => {
+  const { root, monitor, expectChange } = await fixture(t);
+  const editor = path.join(root, 'Code');
+  const database = path.join(editor, 'User', 'globalStorage', 'github.copilot-chat', 'session-store.db');
+  const cwd = path.join(root, 'project');
+  const transcript = path.join(root, '.codex', 'sessions', '2025', '03', '19', 'old-session.jsonl');
+  await Promise.all([database, transcript].map(async file => {
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, '');
+  }));
+  await monitor.update({ agentRoots: { copilot: [editor] } }, [{ cwd, archives: [{ kind: 'codex', file: transcript }] }]);
+  await expectChange(() => writeFile(database + '-wal', 'new turn'));
+  await delay(55);
+  await expectChange(() => appendFile(transcript, 'updated old transcript'));
+});
+
 test('selected project detects a new bridge directory, subsequent memory and handoff edits, and a nested Skill', async t => {
   const { root, monitor, expectChange } = await fixture(t);
   const cwd = path.join(root, 'project');

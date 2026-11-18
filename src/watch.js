@@ -109,6 +109,11 @@ async function watchPlan(config, selected) {
   for (const archive of config.archiveFiles ?? []) file(archive, true);
   for (const project of selected) {
     const { cwd } = project;
+    for (const archive of [...(project.archives ?? [])]
+      .sort((left, right) => (Number(right.date) || Date.parse(right.date) || 0) - (Number(left.date) || Date.parse(left.date) || 0))
+      .slice(0, 12)) {
+      file(archive.file, archive.storage === 'sqlite' || ['opencode', 'agentsview'].includes(archive.kind));
+    }
     add(cwd, name => /^(?:agents|claude|gemini|qwen|memory)\.md$/i.test(name) || name === '.agent-bridge' || projectFolders.includes(name), 0);
     const bridge = path.join(cwd, '.agent-bridge');
     add(bridge, named('memory', 'handoffs'), 0);
@@ -150,7 +155,7 @@ async function watchPlan(config, selected) {
   for (const [provider, roots] of Object.entries(config.agentRoots ?? {})) {
     const agent = aliases[provider] ?? provider;
     for (const root of roots.slice(0, maxRootsPerAgent)) {
-      if (agent === 'opencode' && (await stat(root).catch(() => undefined))?.isFile()) {
+      if (['opencode', 'copilot'].includes(agent) && (await stat(root).catch(() => undefined))?.isFile()) {
         file(root, true);
         continue;
       }
@@ -184,6 +189,11 @@ async function watchPlan(config, selected) {
         const stores = path.basename(root).toLowerCase() === 'workspacestorage'
           ? [root] : [path.join(root, 'workspaceStorage'), path.join(root, 'User', 'workspaceStorage')];
         for (const store of stores) jobs.push(childTranscripts(store, ['workspace.json', 'chatSessions']));
+      }
+      if (agent === 'copilot') {
+        for (const base of [root, path.join(root, 'User')]) {
+          file(path.join(base, 'globalStorage', 'github.copilot-chat', 'session-store.db'), true);
+        }
       }
       for (const folder of ['memory', 'memories', 'memories_v2', 'agent-memory', 'knowledge', 'qoder-knowledge', 'diary']) {
         add(path.join(root, folder), matches(note), 2);

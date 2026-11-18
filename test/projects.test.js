@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createWriteStream } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +9,8 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
-import { readConversationHistory, readProjectHistory, scanProjects } from '../src/projects.js';
+import * as sources from '../src/projects.js';
+const { readConversationHistory, readProjectHistory, scanProjects } = sources;
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh-agent-projects-'));
@@ -49,6 +50,218 @@ function codexIndex(root, records) {
 }
 
 const dialogue = result => result.messages.map(({ role, text }) => [role, text]);
+
+test('native Qwen tool_result rows retain output and errors without creating user turns', async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'projects', 'workspace', 'chats', 'qwen.jsonl');
+  await writeJsonl(file, [
+    { type: 'user', cwd, message: { parts: [{ text: 'Qwen question' }] } },
+    { type: 'assistant', message: { parts: [
+      { functionCall: { id: 'qwen-call-a', name: 'read', args: {} } },
+      { functionCall: { id: 'qwen-call-b', name: 'read', args: {} } },
+    ] } },
+    { type: 'tool_result', message: { parts: [
+      { functionResponse: { id: 'qwen-call-b', name: 'read', response: { error: 'Unavailable' } } },
+      { functionResponse: { id: 'qwen-call-a', name: 'read', response: { output: 'First\n\nsecond' } } },
+    ] } },
+    { type: 'assistant', message: { parts: [{ text: 'Qwen answer' }] } },
+  ]);
+  const config = { agentRoots: { qwen: [root] } };
+  const events = await fullHistory({ kind: 'qwen', file }, cwd, config);
+  assert.deepEqual(events.filter(event => event.kind === 'message').map(event => [event.role, event.turn]),
+    [['user', 1], ['assistant', 1]]);
+  assert.deepEqual(events.filter(event => event.kind === 'tool_result').map(event => [event.callId, event.text, event.status]),
+    [['qwen-call-b', 'Unavailable', 'error'], ['qwen-call-a', 'First\n\nsecond', 'ok']]);
+});
+
+test('native WorkBuddy callId and function_call_result retain the matching output', async t => {
+  const { root, cwd } = await fixture(t);
+  const workbuddy = path.join(root, 'workbuddy');
+  const file = path.join(workbuddy, 'projects', 'workspace', 'native.jsonl');
+  await writeJsonl(file, [
+    { type: 'message', cwd, role: 'user', content: 'Question' },
+    { type: 'reasoning', cwd, id: 'reasoning-row', timestamp: '2026-11-18T00:00:00Z', content: [],
+      rawContent: [{ type: 'reasoning_text', text: 'Recorded WorkBuddy thinking.' },
+        { type: 'encrypted_content', text: 'Opaque source payload' }] },
+    { type: 'function_call', cwd, id: 'record-a', callId: 'call-a', name: 'read', arguments: '{}' },
+    { type: 'function_call_result', cwd, id: 'record-b', callId: 'call-a', name: 'read', output: [{ type: 'text', text: 'found' }], status: 'completed' },
+    { type: 'function_call', cwd, id: 'record-c', callId: 'call-b', name: 'read', arguments: '{}' },
+    { type: 'function_call_result', cwd, id: 'record-d', callId: 'call-b', name: 'read', output: { type: 'text', text: 'unfinished' }, status: 'incomplete' },
+    { type: 'message', cwd, role: 'assistant', content: 'Replied' },
+  ]);
+  const config = { agentRoots: { workbuddy: [workbuddy] } };
+  const { projects: [entry] } = await scanProjects(config);
+  const items = await fullHistory(entry.archive, cwd, config);
+  assert.deepEqual(items.filter(item => item.kind === 'summary').map(item => [item.turn, item.text]),
+    [[1, 'Recorded WorkBuddy thinking.']]);
+  assert.equal(items.find(item => item.kind === 'tool_call').callId, 'call-a');
+  assert.deepEqual(items.filter(item => item.kind === 'tool_result').map(({ callId, text, status }) => [callId, text, status]),
+    [['call-a', 'found', 'ok'], ['call-b', 'unfinished', 'incomplete']]);
+});
+
+async function fullHistory(archive, cwd, config) {
+  const events = [];
+  for await (const event of sources.readSourceEvents(archive, { sourceCwd: cwd, config })) events.push(event);
+  return events;
+}
+
+test('mixed Claude assistant blocks retain thinking, Markdown and tool positions from the same message', async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'projects', 'workspace', 'mixed.jsonl');
+  const markdown = ['# C#', '', '```csharp', 'int a = 1;', '', '', 'int b = 2;', '```'].join('\n');
+  await writeJsonl(file, [
+    { type: 'user', cwd, message: { content: 'Question' } },
+    { type: 'assistant', message: { content: [
+      { type: 'thinking', thinking: 'First recorded thought' },
+      { type: 'text', text: 'Looking at the project.' },
+      { type: 'tool_use', id: 'toolu_group', name: 'Read', input: { file_path: 'project.md' } },
+      { type: 'redacted_thinking', data: 'ENCRYPTED_DATA' },
+      { type: 'thinking', thinking: 'Second recorded thought' },
+      { type: 'text', text: markdown },
+    ] } },
+    { type: 'user', message: { content: [
+      { type: 'tool_result', tool_use_id: 'toolu_group', content: 'Project contents' },
+    ] } },
+  ]);
+  const events = await fullHistory({ kind: 'claude', file }, cwd, { agentRoots: { claude: [root] } });
+  assert.deepEqual(events.filter(item => item.kind !== 'metadata').map(item => [item.kind, item.text]), [
+    ['message', 'Question'],
+    ['summary', 'First recorded thought'],
+    ['message', 'Looking at the project.'],
+    ['tool_call', '{"file_path":"project.md"}'],
+    ['summary', 'Second recorded thought'],
+    ['message', markdown],
+    ['tool_result', 'Project contents'],
+  ]);
+});
+
+test('Codex discovers plain files missing from a populated index', async t => {
+  const { root, cwd } = await fixture(t);
+  const first = path.join(root, 'sessions', 'listed.jsonl');
+  const other = path.join(root, 'archived_sessions', 'unlisted.jsonl');
+  await writeJsonl(first, [codexMeta(cwd, 'indexed'), codexRow('user', 'Indexed')]);
+  await writeJsonl(other, [codexMeta(cwd, 'unindexed'), codexRow('user', 'Unindexed')]);
+  codexIndex(root, [['indexed', cwd, first, 1_794_009_600, 'Indexed']]);
+  const result = await scanProjects({ agentRoots: { codex: [root] } });
+  assert.deepEqual(result.projects.map(item => item.archive.id).sort(), ['indexed', 'unindexed']);
+});
+
+test('database-backed discovery reaches sessions beyond the former 8000-row cutoff', async t => {
+  const { root, cwd } = await fixture(t);
+  const store = path.join(root, 'opencode.db');
+  const db = new DatabaseSync(store);
+  db.exec('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER); BEGIN');
+  const insert = db.prepare('INSERT INTO session_v2 VALUES (?, ?, ?)');
+  for (let index = 0; index <= 8_000; index++) insert.run('archive-' + index, cwd, index);
+  db.exec('COMMIT');
+  db.close();
+  const { projects } = await scanProjects({ agentRoots: { opencode: [store] } });
+  assert.equal(projects.length, 8_001);
+  assert.ok(projects.some(project => project.archive?.id === 'archive-0'));
+});
+
+test('full Codex readers preserve the first turn and oversized CRLF messages in plain and compressed files', zstdOptions, async t => {
+  const { root, cwd } = await fixture(t);
+  const plain = path.join(root, 'sessions', 'full.jsonl');
+  const compressed = path.join(root, 'sessions', 'full-copy.jsonl.zst');
+  const long = '  ```csharp\r\n' + '中🧪 '.repeat(70_000) + '\r\n\r\n```\n';
+  function* transcript(id) {
+    yield jsonl(codexMeta(cwd, id));
+    yield jsonl(codexRow('user', 'First'));
+    for (let position = 0; position < 620; position++) {
+      yield jsonl(codexRow('assistant', position === 309 ? long : 'x'.repeat(21_000)));
+    }
+    yield jsonl(codexRow('assistant', 'Last'));
+  }
+  await mkdir(path.dirname(plain));
+  await pipeline(Readable.from(transcript('plain')), createWriteStream(plain));
+  await writeZstd(compressed, transcript('compressed'));
+  const config = { agentRoots: { codex: [root] } };
+  const { projects } = await scanProjects(config);
+  let reference;
+  for (const { archive } of projects) {
+    const options = { sourceCwd: cwd, config };
+    assert.deepEqual(await sources.probeConversation(archive, options), { state: 'ready' });
+    const events = await fullHistory(archive, cwd, config);
+    const messages = events.filter(event => event.kind === 'message');
+    assert.equal(messages.length, 622);
+    assert.equal(messages[0].text, 'First');
+    assert.equal(messages[310].text, long);
+    assert.equal(messages.at(-1).text, 'Last');
+    assert.equal(events.some(event => event.kind === 'gap'), false);
+    const texts = messages.map(message => message.text);
+    if (reference) assert.deepEqual(texts, reference);
+    reference = texts;
+  }
+});
+
+test('full archive source probe distinguishes an image-only user, metadata, and a torn record', async t => {
+  const { root, cwd } = await fixture(t);
+  const config = { agentRoots: { codex: [root] } };
+  const file = path.join(root, 'sessions', 'photo.jsonl');
+  await writeJsonl(file, [codexMeta(cwd, 'photo'), { type: 'response_item', payload: {
+    type: 'message', role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,AAEC' }],
+  } }]);
+  const archive = { file, kind: 'codex', id: 'photo' };
+  const options = { config, sourceCwd: cwd };
+  assert.deepEqual(await sources.probeConversation(archive, options), { state: 'ready' });
+  const [image] = await fullHistory(archive, cwd, config);
+  assert.equal(image.kind, 'attachment');
+  assert.equal(image.role, 'user');
+  assert.equal(image.turn, 1);
+  assert.equal(image.standalone, true);
+  assert.deepEqual(image.data, Buffer.from([0, 1, 2]));
+  await writeJsonl(file, [codexMeta(cwd, 'photo'), codexRow('user', '<environment_context>setup</environment_context>')]);
+  assert.deepEqual(await sources.probeConversation(archive, options), { state: 'empty' });
+  await writeFile(file, jsonl(codexMeta(cwd, 'photo')) + '{');
+  assert.deepEqual(await sources.probeConversation(archive, options), { state: 'unknown', reason: 'malformed-record' });
+  assert.deepEqual(await sources.probeConversation(archive, { ...options, sourceCwd: root }), { state: 'unknown', reason: 'source-mismatch' });
+});
+
+test('full Codex archives preserve explicit source turn interruption despite assistant text', async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'sessions', 'turn-status.jsonl');
+  const config = { agentRoots: { codex: [root] } };
+  await writeJsonl(file, [
+    codexMeta(cwd, 'turn-status'),
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-a' } },
+    codexRow('user', 'A'), codexRow('assistant', 'Looking'),
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-b' } },
+    codexRow('user', 'B'), codexRow('assistant', 'Done'),
+    { type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-a' } },
+    { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-b' } },
+  ]);
+  const events = await fullHistory({ kind: 'codex', id: 'turn-status', file }, cwd, config);
+  assert.deepEqual(events.filter(event => event.kind === 'turn_end').map(event => [event.turn, event.status]),
+    [[1, 'interrupted'], [2, 'completed']]);
+});
+
+test('a source snapshot excludes appends made after the first message was read', async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'sessions', 'growing.jsonl');
+  const config = { agentRoots: { codex: [root] } };
+  const archive = { kind: 'codex', file, id: 'growing' };
+  await writeJsonl(file, [codexMeta(cwd, 'growing'), codexRow('user', 'At open'), codexRow('assistant', 'Already present')]);
+  const reader = sources.readSourceEvents(archive, { config, sourceCwd: cwd });
+  assert.equal((await reader.next()).value.text, 'At open');
+  await appendFile(file, jsonl(codexRow('user', 'Appended later')));
+  const retained = [];
+  for await (const event of reader) retained.push(event);
+  assert.deepEqual(retained.map(event => event.text), ['Already present']);
+  assert.equal((await fullHistory(archive, cwd, config)).at(-1).text, 'Appended later');
+});
+
+test('a corrupt compressed source never claims complete history', zstdOptions, async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'sessions', 'truncated.jsonl.zst');
+  const config = { agentRoots: { codex: [root] } };
+  const archive = { kind: 'codex', file };
+  await writeZstd(file, [codexMeta(cwd, 'truncated'), codexRow('user', 'Retained question')].map(jsonl));
+  const bytes = await readFile(file);
+  await writeFile(file, bytes.subarray(0, bytes.length - 2));
+  const events = await fullHistory(archive, cwd, config);
+  assert.ok(events.some(event => event.kind === 'gap' && event.reason === 'corrupt-compressed-source'));
+});
 
 test('Codex finds compressed sessions and archives without a SQLite index', zstdOptions, async t => {
   const { root, cwd } = await fixture(t);
@@ -253,7 +466,116 @@ test('VS Code history reconstructs workspace requests and ignores foreign record
   });
   const history = await readConversationHistory(project.archive, cwd, config);
   assert.deepEqual(history.sourceStats, { userMessages: 1, assistantMessages: 1, importedMessages: 2, partial: false });
+  const full = await fullHistory(project.archive, cwd, config);
+  assert.deepEqual(full.filter(event => event.kind === 'message').map(event => event.text), ['Build the bridge', 'Bridge built']);
   assert.equal(Object.prototype.tainted, undefined);
+});
+
+test('Gemini full archive retains text, explicit tool IDs and known multipart attachment references', async t => {
+  const { root, cwd } = await fixture(t);
+  const gemini = path.join(root, '.gemini');
+  const temp = path.join(gemini, 'tmp', 'workspace');
+  const chat = path.join(temp, 'chats', 'session-example.json');
+  await mkdir(path.dirname(chat), { recursive: true });
+  await writeFile(path.join(temp, '.project_root'), cwd);
+  await writeFile(chat, JSON.stringify({ messages: [
+    { id: 'u', type: 'user', content: [{ text: 'Inspect' }, { fileData: { mimeType: 'image/png', fileUri: 'https://example.invalid/photo.png' } }] },
+    { id: 'a', type: 'gemini', content: 'The answer', toolCalls: [{ name: 'read_file', id: 'gemini-call', args: {},
+      result: 'File contents', status: 'success' }] },
+  ] }));
+  const config = { agentRoots: { gemini: [gemini] } };
+  const { projects } = await scanProjects(config);
+  const events = await fullHistory(projects.find(item => item.archive).archive, cwd, config);
+  assert.deepEqual(events.map(event => [event.kind, event.status]), [
+    ['message', undefined], ['attachment', 'remote-reference'], ['message', undefined],
+    ['tool_call', 'pending'], ['tool_result', 'ok'],
+  ]);
+  assert.equal(events.at(-1).callId, 'gemini-call');
+});
+
+test('Copilot discovers and reads native session-store SQLite v3 independently of editor JSONL', async t => {
+  const { root, cwd } = await fixture(t);
+  const store = path.join(root, 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'session-store.db');
+  await mkdir(path.dirname(store), { recursive: true });
+  const db = new DatabaseSync(store);
+  db.exec(`
+    CREATE TABLE schema_version (version INTEGER);
+    INSERT INTO schema_version VALUES (3);
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, host_type TEXT, summary TEXT, updated_at TEXT);
+    CREATE TABLE turns (id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER, user_message TEXT, assistant_response TEXT, timestamp TEXT);
+    INSERT INTO turns VALUES (1, 'cp', 5, 'Later', NULL, '2026-11-18T12:00:00Z');
+    INSERT INTO turns VALUES (2, 'cp', 0, 'First', 'A full response', '2026-11-18T11:00:00Z');
+  `);
+  db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?)').run('cp', cwd, 'vscode', 'SQLite conversation', '2026-11-18T12:00:00Z');
+  db.close();
+  const config = { agentRoots: { copilot: [path.join(root, 'Code'), path.join(root, 'Code', 'User')] } };
+  const { projects } = await scanProjects(config);
+  const [archive] = projects.map(project => project.archive).filter(Boolean);
+  assert.equal(projects.filter(project => project.archive?.id === 'cp').length, 1);
+  assert.equal(archive.title, 'SQLite conversation');
+  assert.equal(archive.file, store);
+  const before = await readFile(store);
+  const events = await fullHistory(archive, cwd, config);
+  assert.deepEqual(events.filter(event => event.kind === 'message').map(({ role, text }) => [role, text]),
+    [['user', 'First'], ['assistant', 'A full response'], ['user', 'Later']]);
+  assert.equal(events.some(event => event.kind === 'gap' && event.reason === 'source-dialogue-only'), true);
+  assert.deepEqual(await readFile(store), before);
+  assert.deepEqual(await sources.probeConversation(archive, { sourceCwd: root, config }), { state: 'unknown', reason: 'source-mismatch' });
+});
+
+test('full OpenCode legacy archives retain all text and pair tool records by source call ID', async t => {
+  const { root, cwd } = await fixture(t);
+  const store = path.join(root, 'opencode.db');
+  const db = new DatabaseSync(store);
+  db.exec(`
+    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);
+    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER);
+    CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT, time_created INTEGER);
+  `);
+  db.prepare('INSERT INTO session VALUES (?, ?, ?)').run('legacy', cwd, 1);
+  const addMessage = db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)');
+  addMessage.run('u', 'legacy', '{"role":"user"}', 1);
+  addMessage.run('a', 'legacy', '{"role":"assistant"}', 2);
+  const addPart = db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)');
+  addPart.run('p', 'legacy', 'u', '{"type":"text","text":"Question"}', 1);
+  for (let index = 0; index < 108; index++) addPart.run(`text${index}`, 'legacy', 'a', JSON.stringify({ type: 'text', text: 'Part ' + index }), index);
+  addPart.run('tool', 'legacy', 'a', JSON.stringify({ type: 'tool', tool: 'read', callID: 'source-id',
+    state: { status: 'error', input: { path: 'example' }, error: 'Failed' } }), 109);
+  db.close();
+  const config = { agentRoots: { opencode: [store] } };
+  const { projects } = await scanProjects(config);
+  const [archive] = projects.map(project => project.archive).filter(Boolean);
+  const events = await fullHistory(archive, cwd, config);
+  assert.match(events.find(event => event.role === 'assistant').text, /Part 107$/);
+  assert.deepEqual(events.filter(event => event.kind.startsWith('tool_')).map(event => [event.kind, event.callId, event.status]),
+    [['tool_call', 'source-id', 'pending'], ['tool_result', 'source-id', 'error']]);
+});
+
+test('full OpenCode v2 supplements a message from same-session parts and preserves explicit idle outcome', async t => {
+  const { root, cwd } = await fixture(t);
+  const store = path.join(root, 'opencode.db');
+  const db = new DatabaseSync(store);
+  db.exec(`
+    CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER);
+    CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT);
+    CREATE TABLE session_part (session_id TEXT, message_id TEXT, ordinal INTEGER, type TEXT, call_id TEXT, data TEXT);
+    INSERT INTO session_message VALUES ('u', 'v2', 'user', 0, 1, '{"text":"Question","files":[]}');
+    INSERT INTO session_message VALUES ('a', 'v2', 'assistant', 1, 2, '{"content":[{"type":"text","text":"Answer"}]}');
+    INSERT INTO session_message VALUES ('end', 'v2', 'idle', 2, 3, '{"outcome":"succeeded"}');
+    INSERT INTO session_part VALUES ('v2', 'a', 0, 'text', NULL, '{"text":"Answer"}');
+    INSERT INTO session_part VALUES ('v2', 'a', 1, 'tool', 'v2-call', '{"name":"read","state":{"status":"completed","content":[{"type":"text","text":"Old result"}]},"time":{"created":1795010000000,"completed":1795010000040}}');
+    INSERT INTO session_part VALUES ('other', 'a', 2, 'text', NULL, '{"text":"Foreign text"}');
+  `);
+  db.prepare('INSERT INTO session_v2 VALUES (?, ?, ?)').run('v2', cwd, 1);
+  db.close();
+  const config = { agentRoots: { opencode: [store] } };
+  const { projects } = await scanProjects(config);
+  const [archive] = projects.map(project => project.archive).filter(Boolean);
+  const events = await fullHistory(archive, cwd, config);
+  assert.deepEqual(events.filter(event => event.kind === 'message').map(event => event.text), ['Question', 'Answer']);
+  assert.deepEqual(events.filter(event => event.kind === 'tool_result').map(event => [event.callId, event.text]), [['v2-call', 'Old result']]);
+  assert.deepEqual(events.filter(event => event.kind.startsWith('tool_')).map(event => event.time), [1795010000000, 1795010000040]);
+  assert.deepEqual(events.filter(event => event.kind === 'turn_end').map(event => [event.turn, event.status]), [[1, 'completed']]);
 });
 
 test('portable sources work without a manager and explicit empty roots disable discovery', async t => {

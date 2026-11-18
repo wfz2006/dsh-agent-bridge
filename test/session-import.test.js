@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { createCatalog } from '../src/catalog.js'
+import { approveConversation, stageConversation } from '../src/conversation-store.js'
 import { nativeSessionEvents, saveNativeSession } from '../src/session-import.js'
 import { readSessionTrace } from '../src/session-trace.js'
 
@@ -88,6 +90,71 @@ test('a reviewed conversation imports only that session, preserving repeated mes
   assert.deepEqual(await readFile(file), bytes)
 })
 
+
+test('conversation lists exclude indexed placeholders and fill recent slots with readable prompts', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-empty-history-'))
+  let catalog
+  t.after(async () => {
+    await catalog?.dispose()
+    await rm(root, { recursive: true, force: true })
+  })
+  const cwd = join(root, 'project')
+  const codex = join(root, 'codex')
+  const copilot = join(root, 'editor')
+  const editorWorkspace = join(copilot, 'workspaceStorage', 'project')
+  await Promise.all([
+    mkdir(cwd), mkdir(join(codex, 'sessions'), { recursive: true }),
+    mkdir(join(editorWorkspace, 'chatSessions'), { recursive: true }),
+  ])
+  const write = (file, rows) => writeFile(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  const message = (role, text) => ({ type: 'response_item', payload: { type: 'message', role, content: [{ type: 'text', text }] } })
+  const entries = [
+    ['metadata', 'Metadata only', [{ type: 'event_msg', payload: { type: 'task_started' } }]],
+    ['runtime', 'Runtime instructions', [message('developer', 'internal setup'), message('user', '<environment_context>runtime</environment_context>')]],
+    ['tool', 'Tool activity only', [{ type: 'response_item', payload: { type: 'function_call', name: 'shell', arguments: '{}' } }]],
+    ['assistant', 'Assistant without a question', [message('assistant', 'Hello')]],
+    ['waiting', 'Unanswered question', [message('user', 'Still waiting for an answer')]],
+    ['late', 'Question after setup', [message('developer', 'x'.repeat(110 * 1024)), message('user', 'Actual question after the scan header')]],
+    ['finished', 'Completed dialogue', [message('user', 'Question'), message('assistant', 'Answer')]],
+  ]
+  const index = new DatabaseSync(join(codex, 'state_5.sqlite'))
+  try {
+    index.exec('CREATE TABLE threads (id TEXT, cwd TEXT, rollout_path TEXT, updated_at INTEGER, title TEXT, has_user_event INTEGER)')
+    const insert = index.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, 0)')
+    for (const [offset, [id, title, messages]] of entries.entries()) {
+      const file = join(codex, 'sessions', `${id}.jsonl`)
+      await write(file, [{ type: 'session_meta', payload: { cwd, id } }, ...messages])
+      insert.run(id, cwd, file, 1_794_000_000 - offset, title)
+    }
+  } finally {
+    index.close()
+  }
+  await writeFile(join(editorWorkspace, 'workspace.json'), JSON.stringify({ folder: cwd }))
+  const editorEmpty = join(editorWorkspace, 'chatSessions', 'empty.jsonl')
+  await write(editorEmpty, [{ kind: 0, v: { requests: [] } }])
+  catalog = createCatalog(() => ({
+    home: root, configFile: join(root, 'agent-bridge.json'), workspaceHubRoots: [], archiveFiles: [],
+    agentRoots: { codex: [codex], copilot: [copilot] },
+  }), { importConversation: async () => assert.fail('listing must never import a session') })
+  const { projects: [project] } = await catalog.execute('catalog', {})
+  const input = { projectId: project.id }
+  const recent = await catalog.execute('list-conversations', { ...input, recent: true })
+  const history = await catalog.execute('list-conversations', input)
+  assert.deepEqual(history.sessions.map(({ title }) => title), ['Unanswered question', 'Question after setup', 'Completed dialogue'])
+  assert.deepEqual(recent, { sessions: history.sessions, total: 3 })
+  for (const session of history.sessions) {
+    const preview = await catalog.execute('preview-conversation', { ...input, sessionId: session.id })
+    assert.equal(preview.messages[0].role, 'user')
+  }
+
+  // Opening a new editor chat writes its header before the first prompt.
+  await write(editorEmpty, [{ kind: 0, v: { requests: [{ message: { text: 'New editor question' } }] } }])
+  await catalog.execute('catalog', { refresh: true })
+  const updated = await catalog.execute('list-conversations', { ...input, recent: true })
+  assert.equal(updated.total, 4)
+  assert.equal(updated.sessions[0].agent, 'copilot')
+})
+
 test('native history writes finished turns and retries workspace attachment without recreating the log', async () => {
   const messages = [
     { role: 'user', text: 'First', time: 100 },
@@ -131,6 +198,116 @@ function importServices(state) {
     workspaces: { async create() { return workspace } },
   }
 }
+
+test('reviewed archives seed native thinking and tools between the corresponding replies without admitting them to model history', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-native-process-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const config = { home: root, configFile: join(root, 'agent-bridge.json') }
+  const metadata = {
+    id: '11e14a96-001a-4f90-b877-c11639ed05f1',
+    sessionId: 'b77fa1ee-0dfc-4ad2-9e78-f55ac76c6852',
+    title: 'Native timeline',
+  }
+  const message = (turn, role, text) => ({ kind: 'message', turn, role, text })
+  const call = (callId, name) => ({ kind: 'tool_call', turn: 1, callId, name, text: '{}' })
+  const result = (callId, text, status = 'ok') => ({ kind: 'tool_result', callId, text, status })
+  const markdown = ['# C#', '', '```csharp', 'int a = 1;', '', '', 'int b = 2;', '```'].join('\n')
+  const record = await stageConversation(config, metadata, [
+    message(1, 'user', 'A'),
+    message(1, 'assistant', 'Checking A'),
+    { kind: 'summary', turn: 1, text: 'Visible thinking' },
+    result('early', 'Result logged before its call'),
+    call('first', 'read-alpha'),
+    call('early', 'read-beta'),
+    result('first', 'Result from alpha'),
+    call('late', 'read-gamma'),
+    call('missing', 'read-delta'),
+    message(1, 'assistant', markdown),
+    { kind: 'turn_end', turn: 1, status: 'interrupted' },
+    message(2, 'user', 'B'),
+    result('late', 'Result logged during B', 'error'),
+    { kind: 'summary', turn: 2, text: 'Thinking for B' },
+    message(2, 'assistant', 'Answer B'),
+  ], value => value)
+  assert.equal(await approveConversation(config, record.id), 1)
+  const state = { writes: 0, attachments: 0 }
+  await saveNativeSession(importServices(state), { ...record, config }, process.cwd())
+  const rendered = state.events.flatMap(event => {
+    if (event.type === 'user/message' && event.surfaceOp === 'append') return event.data.content.map(block => block.text)
+    if (event.type === 'assistant/message') return event.data.message.content
+      .filter(block => block.type === 'text' || block.type === 'reasoning').map(block => block.text)
+    if (event.type === 'tool/call') return [event.data.name]
+    return []
+  })
+  assert.deepEqual(rendered, ['A', 'Checking A', 'Visible thinking', 'read-alpha', 'read-beta', 'read-gamma',
+    'read-delta', markdown, 'B', 'Thinking for B', 'Answer B'])
+  const dispatched = new Map(state.events.filter(event => event.type === 'tool/call').map(event => [event.data.callId, event]))
+  const results = state.events.filter(event => event.type === 'tool/result')
+  assert.deepEqual(results.map(event => event.data.message.content[0].text), [
+    'Result logged before its call', 'Result from alpha', 'Result logged during B',
+  ])
+  for (const event of results) {
+    const start = dispatched.get(event.data.message.toolCallId)
+    assert.equal(start.data.turn, 1)
+    assert.equal(event.data.turn, start.data.turn)
+    assert.equal(event.data.step, start.data.step)
+    assert.deepEqual(event.sourceEventSeqs, [start.seq])
+    assert.ok(event.seq > start.seq)
+  }
+  assert.equal(results.at(-1).data.message.isError, true)
+  assert.deepEqual(state.events.find(event => event.type === 'turn/end').data.reason, {
+    kind: 'aborted', reason: { kind: 'legacy' },
+  })
+  const modelSurface = []
+  for (const event of state.events) {
+    if (event.surfaceOp === 'append') modelSurface.push(event)
+    else if (event.surfaceOp?.op === 'replace') {
+      const start = modelSurface.findIndex(item => item.seq === event.surfaceOp.startSeq)
+      const end = modelSurface.findIndex(item => item.seq === event.surfaceOp.endSeq)
+      assert.ok(start >= 0 && end >= start)
+      modelSurface.splice(start, end - start + 1, event)
+    }
+  }
+  assert.deepEqual(modelSurface.flatMap(event => (event.data.message ?? event.data).content),
+    ['A', 'Checking A', markdown, 'B', 'Answer B'].map(text => ({ type: 'text', text })))
+})
+
+test('native user attachments are rendered from reviewed bytes and the resumed model receives only the question', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-native-attachments-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const config = { home: root, configFile: join(root, 'agent-bridge.json') }
+  const png = Buffer.from('89504e470d0a1a0a', 'hex')
+  const file = Buffer.from('项目文件\n')
+  const record = await stageConversation(config, {
+    id: 'b9dd0ae3-6da8-49b3-bb1e-57cf1a9af6c4', sessionId: '759127b3-094c-4fec-877a-798f51bcc4f5', title: 'Attachments',
+  }, [
+    { kind: 'message', turn: 1, role: 'user', text: 'Review the attachments.' },
+    { kind: 'attachment', turn: 1, role: 'user', name: '图 #1 (50%).png', data: png },
+    { kind: 'attachment', turn: 1, role: 'user', name: '文档 #2 %.txt', data: file },
+    { kind: 'attachment', turn: 1, role: 'user', name: '旧草稿.txt', status: 'name-only' },
+    { kind: 'message', turn: 1, role: 'assistant', text: 'Reviewed.' },
+  ], value => value)
+  assert.equal(await approveConversation(config, record.id), 1)
+  const state = { writes: 0, attachments: 0 }
+  const services = { ...importServices(state), attachments: {
+    async saveImage({ data, mediaType, name }) {
+      assert.deepEqual(data, png)
+      return { attachmentId: 'image-id', mediaType, bytes: data.length, name, width: 1, height: 1 }
+    },
+    async saveFile({ data, name }) {
+      assert.deepEqual(data, file)
+      return { attachmentId: 'file-id', bytes: data.length, name }
+    },
+  } }
+  await saveNativeSession(services, { ...record, config }, process.cwd())
+  const user = state.events.filter(event => event.type === 'user/message')
+  assert.deepEqual(user[0].data.content.filter(block => block.attachment)
+    .map(block => [block.type, block.attachment.name]), [['image', '图 #1 (50%).png'], ['file', '文档 #2 %.txt']])
+  assert.ok(user[0].data.content.some(block => block.text?.includes('旧草稿.txt')))
+  assert.equal(user[1].surfaceOp.startSeq, user[0].seq)
+  assert.equal(user[1].surfaceOp.endSeq, user[0].seq)
+  assert.deepEqual(user[1].data.content, [{ type: 'text', text: 'Review the attachments.' }])
+})
 
 const trace = [
   { id: 't1', kind: 'summary', text: '先核对现场。', status: 'ok', messageIndex: 0 },

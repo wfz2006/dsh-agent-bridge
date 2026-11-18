@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="blue">
+<html lang="zh-CN" class="bridge-ui" data-theme="white">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="bridge-nonce" content="__DSH_BRIDGE_NONCE__">
   <title>Agent 接续</title>
   <link rel="stylesheet" href="./panel.css">
+  <link rel="stylesheet" href="./reader.css">
   <script type="module" src="./panel.js"></script>
 </head>
 <body>
@@ -42,11 +43,13 @@
       <div class="toolbar">
         <p class="live-status"><span id="live-state" data-state="loading">正在连接实时扫描</span><time id="last-scan" hidden></time></p>
         <div class="toolbar-actions">
-          <div class="theme-picker" role="group" aria-label="主题">
-            <button class="theme-option" data-theme-choice="blue" type="button" aria-pressed="true" title="蓝色主题"><span class="theme-swatch" aria-hidden="true"></span><span class="sr-only">蓝色</span></button>
-            <button class="theme-option" data-theme-choice="white" type="button" aria-pressed="false" title="白色主题"><span class="theme-swatch" aria-hidden="true"></span><span class="sr-only">白色</span></button>
-            <button class="theme-option" data-theme-choice="black" type="button" aria-pressed="false" title="黑色主题"><span class="theme-swatch" aria-hidden="true"></span><span class="sr-only">黑色</span></button>
-          </div>
+          <label class="theme-picker">
+            <span class="sr-only">界面外观</span>
+            <select id="appearance" aria-label="界面外观">
+              <optgroup label="浅色"><option value="white">纸白</option><option value="mist">雾蓝</option></optgroup>
+              <optgroup label="深色"><option value="blue">夜蓝</option><option value="black">深灰</option></optgroup>
+            </select>
+          </label>
           <button class="secondary" id="native-export" type="button"><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出 DSH 会话</button>
           <button class="secondary icon-button" id="refresh" type="button" aria-label="刷新来源" title="刷新来源"><svg class="icon button-icon" aria-hidden="true"><use href="#icon-refresh"/></svg></button>
         </div>
@@ -60,47 +63,50 @@
           <h2>项目</h2>
           <div class="project-list-actions">
             <span id="project-count"></span>
+            <button id="project-switch" class="secondary" type="button" aria-expanded="false" aria-controls="project-browser">切换项目</button>
             <button id="project-manage" class="secondary project-manage" type="button" aria-pressed="false" aria-controls="project-bulk project-list"><svg class="icon" aria-hidden="true"><use href="#icon-project-manage"/></svg>整理</button>
           </div>
         </div>
-        <div class="project-controls">
-          <div class="field">
-            <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
-            <label class="sr-only" for="project-search">搜索项目</label>
-            <input id="project-search" type="search" placeholder="搜索项目或路径" autocomplete="off">
-            <kbd class="key-hint" aria-hidden="true">/</kbd>
-            <button class="clear-search icon-button" id="clear-project-search" type="button" aria-label="清除项目搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
-          </div>
-          <div id="agent-picker" class="agent-picker">
-            <button id="agent-filter" class="agent-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options" aria-label="筛选 Agent，当前为全部 Agent">
-              <span id="agent-trigger-mark" class="agent-trigger-mark"><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg></span>
-              <span id="agent-trigger-label" class="agent-trigger-label">全部 Agent</span>
-              <svg class="icon select-chevron" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
-            </button>
-            <div id="agent-popover" class="agent-popover" hidden>
-              <div id="agent-options" class="agent-options" role="listbox" aria-label="Agent 来源" tabindex="-1"></div>
+        <div id="project-browser">
+          <div class="project-controls">
+            <div class="field">
+              <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
+              <label class="sr-only" for="project-search">搜索项目</label>
+              <input id="project-search" type="search" placeholder="搜索项目或路径" autocomplete="off">
+              <kbd class="key-hint" aria-hidden="true">/</kbd>
+              <button class="clear-search icon-button" id="clear-project-search" type="button" aria-label="清除项目搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+            </div>
+            <div id="agent-picker" class="agent-picker">
+              <button id="agent-filter" class="agent-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-options" aria-label="筛选 Agent，当前为全部 Agent">
+                <span id="agent-trigger-mark" class="agent-trigger-mark"><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg></span>
+                <span id="agent-trigger-label" class="agent-trigger-label">全部 Agent</span>
+                <svg class="icon select-chevron" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
+              </button>
+              <div id="agent-popover" class="agent-popover" hidden>
+                <div id="agent-options" class="agent-options" role="listbox" aria-label="Agent 来源" tabindex="-1"></div>
+              </div>
+            </div>
+            <div class="project-filters" aria-label="项目状态">
+              <button class="filter-button" data-project-state="all" type="button" aria-pressed="true">全部</button>
+              <button class="filter-button" data-project-state="online" type="button" aria-pressed="false">可接续</button>
+              <button class="filter-button" data-project-state="offline" type="button" aria-pressed="false">离线</button>
+              <button class="filter-button" data-project-state="archived" type="button" aria-pressed="false">已归档</button>
+            </div>
+            <div id="project-bulk" class="project-bulk" hidden>
+              <label class="project-bulk-select"><input id="project-select-visible" type="checkbox">全选当前结果</label>
+              <button id="project-bulk-action" class="secondary project-bulk-action" type="button" disabled>归档所选</button>
             </div>
           </div>
-          <div class="project-filters" aria-label="项目状态">
-            <button class="filter-button" data-project-state="all" type="button" aria-pressed="true">全部</button>
-            <button class="filter-button" data-project-state="online" type="button" aria-pressed="false">可接续</button>
-            <button class="filter-button" data-project-state="offline" type="button" aria-pressed="false">离线</button>
-            <button class="filter-button" data-project-state="archived" type="button" aria-pressed="false">已归档</button>
+          <div id="project-feedback" class="project-feedback" hidden>
+            <p id="project-feedback-text" role="status" aria-live="polite"></p>
+            <button id="project-undo" class="secondary project-undo" type="button" hidden>撤销</button>
           </div>
-          <div id="project-bulk" class="project-bulk" hidden>
-            <label class="project-bulk-select"><input id="project-select-visible" type="checkbox">全选当前结果</label>
-            <button id="project-bulk-action" class="secondary project-bulk-action" type="button" disabled>归档所选</button>
-          </div>
+          <div id="project-list" class="project-list"></div>
+          <details class="sources">
+            <summary><svg class="icon" aria-hidden="true"><use href="#icon-layers"/></svg><span id="sources-heading">本机来源</span><svg class="icon source-chevron" aria-hidden="true"><use href="#icon-chevron"/></svg></summary>
+            <div id="sources-list"></div>
+          </details>
         </div>
-        <div id="project-feedback" class="project-feedback" hidden>
-          <p id="project-feedback-text" role="status" aria-live="polite"></p>
-          <button id="project-undo" class="secondary project-undo" type="button" hidden>撤销</button>
-        </div>
-        <div id="project-list" class="project-list"></div>
-        <details class="sources">
-          <summary><svg class="icon" aria-hidden="true"><use href="#icon-layers"/></svg><span id="sources-heading">本机来源</span><svg class="icon source-chevron" aria-hidden="true"><use href="#icon-chevron"/></svg></summary>
-          <div id="sources-list"></div>
-        </details>
       </aside>
 
       <section class="detail" aria-label="项目资料">
@@ -108,7 +114,6 @@
         <div id="project-detail" hidden>
           <header class="project-heading">
             <div class="project-identity">
-              <span class="project-mark"><svg class="icon" aria-hidden="true"><use href="#icon-folder"/></svg></span>
               <div class="project-title-block">
                 <h2 id="project-name" tabindex="-1"></h2>
                 <div id="project-meta" class="chips"></div>
@@ -135,7 +140,6 @@
               <span class="continue-mark"><svg class="icon" aria-hidden="true"><use href="#icon-history"/></svg></span>
               <div>
                 <h3 id="continue-heading" tabindex="-1">继续旧对话</h3>
-                <p>选一条对话，把历史消息迁入 DSH 继续聊。</p>
               </div>
             </header>
             <p id="recent-status" class="recent-status" role="status"></p>
@@ -216,6 +220,10 @@
           <p id="history-empty" class="recent-status" role="status"></p>
           <ul id="history-results" class="conversation-list" aria-label="来源对话"></ul>
           <button id="history-more" class="secondary" type="button" hidden>显示更多</button>
+          <details id="history-unavailable" class="source-archive" hidden>
+            <summary id="history-unavailable-count"></summary>
+            <ul id="history-unavailable-results"></ul>
+          </details>
         </div>
         <div id="history-back" class="history-back" hidden>
           <button id="history-back-button" class="text-action" type="button">

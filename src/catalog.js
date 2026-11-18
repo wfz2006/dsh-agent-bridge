@@ -1,13 +1,17 @@
 import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { realpath, stat } from 'node:fs/promises'
+import { open, realpath, stat } from 'node:fs/promises'
 import path, { win32 } from 'node:path'
 import { promisify } from 'node:util'
 import { authorizeProjectReference, listProjectAssets, readAsset, verifyAssetSource, verifySourceAuthorization } from './assets.js'
-import { dateMillis, readConversationHistory, readProjectHistory, scanProjects } from './projects.js'
+import { dateMillis, probeConversation, readProjectHistory, readSourceEvents, scanProjects } from './projects.js'
+import {
+  approveConversation, discardConversation, finishConversation, readConversationSnapshot,
+  readHistoryPage, readPendingConversation, rebindConversation, stageConversation,
+} from './conversation-store.js'
 import { createSourceMonitor } from './watch.js'
 import { makeExport } from './export.js'
-import { countTrace, normalizeTrace } from './session-trace.js'
+import { countTrace, isSessionId, normalizeTrace } from './session-trace.js'
 import { isMarkdownFile, relativeMarkdownLinks } from '../web/markdown.js'
 import {
   ProjectArchiveError, readProjectSelection, readProjectState, writeProjectArchive,
@@ -19,7 +23,6 @@ const limit = 32_000
 const fallbackScanInterval = 15_000
 const ticketLifetime = 10 * 60_000
 const catalogId = /^[0-9a-f]{24}$/
-const conversationTicketLimit = 12
 const traceBudget = { items: 200, bytes: 48 * 1024, resultBytes: 4 * 1024 }
 
 class RequestError extends Error {
@@ -215,6 +218,51 @@ async function currentDirectory(cwd) {
   return null
 }
 
+async function conversationDirectory(cwd) {
+  if (typeof cwd !== 'string' || cwd.length > 4096 || !path.isAbsolute(cwd) || /[\u0000-\u001f]/u.test(cwd)) return
+  const canonical = await currentDirectory(cwd)
+  if (!canonical || canonical === path.parse(canonical).root) return
+  const info = await stat(canonical, { bigint: true }).catch(() => undefined)
+  if (info?.isDirectory()) return { path: canonical, identity: `${info.dev}:${info.ino}` }
+}
+
+async function readConversationAttachment(project, archive, item) {
+  if (!item.path) return
+  const candidate = path.isAbsolute(item.path) ? path.normalize(item.path) : path.resolve(project.cwd, item.path)
+  let withinScope = false
+  for (const root of [project.cwd, path.join(path.dirname(archive.file), 'attachments')]) {
+    if (!root || !path.isAbsolute(root)) continue
+    const relative = path.relative(root, candidate)
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue
+    withinScope = true
+    const href = relative.split(path.sep).map(encodeURIComponent).join('/')
+    const proof = await authorizeProjectReference(root, path.join(root, '.conversation'), href)
+    if (!proof.authorization) continue
+    const handle = await open(candidate, 'r').catch(() => undefined)
+    if (!handle) continue
+    try {
+      const initial = await handle.stat({ bigint: true })
+      const current = await verifySourceAuthorization(proof.authorization)
+      if (initial.dev !== current.fileInfo.dev || initial.ino !== current.fileInfo.ino) continue
+      if (initial.size > 32n * 1024n * 1024n) return { details: { status: 'attachment-too-large' } }
+      const bytes = Buffer.alloc(Number(initial.size))
+      let offset = 0
+      while (offset < bytes.length) {
+        const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset)
+        if (!bytesRead) break
+        offset += bytesRead
+      }
+      const end = await handle.stat({ bigint: true })
+      await verifySourceAuthorization(proof.authorization)
+      if (offset === bytes.length && end.size === initial.size && end.mtimeNs === initial.mtimeNs && end.ctimeNs === initial.ctimeNs) {
+        return { bytes, details: { name: redact(path.basename(candidate)) } }
+      }
+    } catch { /* Source identity changed during the read. */ }
+    finally { await handle.close() }
+  }
+  return { details: { status: withinScope ? 'attachment-unavailable' : 'outside-project' } }
+}
+
 function sortProjects(a, b) {
   return Number(b.online) - Number(a.online)
     || (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')
@@ -330,7 +378,7 @@ export function createCatalog(loadConfig, { importConversation, skillHandoff, lo
       const online = new Set([...resolved.values()].filter(Boolean).map(value => pathKey(value)))
       for (const project of projects) {
         project.online = online.has(pathKey(project.cwd))
-        if (watched.has(project.cwd)) watched.set(project.cwd, { cwd: project.cwd, projectIds: project.projectIds })
+        if (watched.has(project.cwd)) watched.set(project.cwd, { cwd: project.cwd, projectIds: project.projectIds, archives: project.archives })
       }
       projects.sort(sortProjects)
       const fingerprint = keyFor(projects, result.sources)
@@ -338,7 +386,7 @@ export function createCatalog(loadConfig, { importConversation, skillHandoff, lo
       const changed = refresh || snapshot?.epoch !== scanEpoch || snapshot?.fingerprint !== fingerprint
         || snapshot?.stateFingerprint !== stateFingerprint
       details.clear()
-      snapshot = { config, projects, sources: result.sources, scannedAt: Date.now(), fingerprint, stateFingerprint, epoch: scanEpoch }
+      snapshot = { config, projects, sources: result.sources, scannedAt: Date.now(), fingerprint, stateFingerprint, epoch: scanEpoch, conversationLists: new Map() }
       await monitor.update(config, [...watched.values()])
       if (changed) {
         revision++
@@ -422,7 +470,7 @@ export function createCatalog(loadConfig, { importConversation, skillHandoff, lo
     const pending = (async () => {
       if (!watched.has(project.cwd)) {
         if (watched.size >= 4) watched.delete(watched.keys().next().value)
-        watched.set(project.cwd, { cwd: project.cwd, projectIds: project.projectIds })
+        watched.set(project.cwd, { cwd: project.cwd, projectIds: project.projectIds, archives: project.archives })
         await monitor.update(config, [...watched.values()])
       }
       const [{ memories, skills }, history] = await Promise.all([
@@ -666,98 +714,132 @@ export function createCatalog(loadConfig, { importConversation, skillHandoff, lo
     return { path: source.file, kind: 'file', name: item.name }
   }
 
-  async function listConversations(projectId, recent) {
-    const current = await scan()
-    const project = requireProject(current, projectId)
+  async function readableConversations(project, config) {
     const archives = project.archives
       .filter(canReadConversation)
       .sort((a, b) => dateMillis(b.date) - dateMillis(a.date))
-    const seen = new Set()
-    const sessions = []
+    const unique = new Map()
     for (const archive of archives) {
       const id = conversationId(archive)
-      if (seen.has(id)) continue
-      seen.add(id)
-      if (recent && sessions.length === 3) continue
-      sessions.push({
-        id, agent: archive.agent ?? archive.kind, date: dateMillis(archive.date),
-        title: conversationTitle(archive.title), archivedSource: archive.kind === 'agentsview',
-      })
+      if (!unique.has(id)) unique.set(id, archive)
     }
-    return recent ? { sessions, total: seen.size } : { sessions }
+    const candidates = [...unique]
+    const sessions = []
+    for (let offset = 0; offset < candidates.length; offset += 8) {
+      const batch = await Promise.all(candidates.slice(offset, offset + 8).map(async ([id, archive]) => {
+        const probe = await probeConversation(archive, { sourceCwd: project.cwd, config })
+        if (probe.state === 'empty') return undefined
+        return {
+          id, agent: archive.agent ?? archive.kind, date: dateMillis(archive.date),
+          title: conversationTitle(archive.title), archivedSource: archive.kind === 'agentsview',
+          ...(probe.state === 'unknown' ? { unavailable: true, reason: probe.reason } : {}),
+        }
+      }))
+      sessions.push(...batch.filter(Boolean))
+    }
+    return sessions
   }
 
-  async function previewConversation({ projectId, sessionId }) {
+  async function listConversations(projectId, recent, cursor) {
+    const current = await scan()
+    const project = requireProject(current, projectId)
+    const { conversationLists, config } = current
+    if (!conversationLists.has(projectId)) {
+      conversationLists.set(projectId, readableConversations(project, config))
+    }
+    const sessions = await conversationLists.get(projectId)
+    const ready = sessions.filter(session => !session.unavailable)
+    const unavailable = sessions.filter(session => session.unavailable)
+    if (recent) return { sessions: ready.slice(0, 3), total: ready.length,
+      ...(unavailable.length ? { unavailable: unavailable.slice(0, 20) } : {}) }
+    const marker = keyFor(ready.map(({ id }) => id))
+    const parsed = typeof cursor === 'string' && /^([0-9a-f]{24}):(\d{1,9})$/.exec(cursor)
+    if (cursor && (!parsed || parsed[1] !== marker)) throw new RequestError('会话列表已更新，请从第一页重新打开。', 409)
+    const offset = parsed ? Number(parsed[2]) : 0
+    const end = offset + 100
+    return { sessions: ready.slice(offset, end), ...(end < ready.length ? { nextCursor: `${marker}:${end}` } : {}),
+      ...(!offset && unavailable.length ? { unavailable: unavailable.slice(0, 100) } : {}) }
+  }
+
+  async function previewConversation({ projectId, sessionId, targetCwd, snapshotId, signal }) {
     if (!isCatalogId(sessionId)) throw new RequestError('会话标识无效。')
     const current = await scan()
     const project = requireProject(current, projectId)
     const { config } = current
     const archive = project.archives.find(item => canReadConversation(item) && conversationId(item) === sessionId)
-    if (!archive) throw new RequestError('找不到这条会话，请刷新项目。', 404)
-    const history = await readConversationHistory(archive, project.cwd, config).catch(() => {
-      throw new RequestError('会话已移动或无法读取，请刷新后重试。', 409)
-    })
-    if (!history.messages.length) throw new RequestError('这条会话没有可迁入的文字问答。', 409)
-    const messages = history.messages.map(({ role, text, time }) => ({ role, text: redact(text), time }))
-    const { trace, indexOf, truncated: traceTruncated } = conversationTrace(history.trace ?? [], messages.length)
+    const previous = snapshotId && await readConversationSnapshot(config, snapshotId)
+    if (snapshotId && (!previous || previous.projectId !== projectId || previous.sourceId !== sessionId || previous.state !== 'preview')) {
+      throw new RequestError('会话预览已变化，请重新打开。', 409)
+    }
+    if (!archive && !previous) throw new RequestError('找不到这条会话，请刷新项目。', 404)
+    const target = await conversationDirectory(targetCwd ?? project.cwd)
+    if (targetCwd !== undefined && !target) throw new RequestError('目标目录不可访问，请选择本机工作目录。', 409)
+    const ready = target && await readPendingConversation(config, projectId, sessionId, target.path)
+    const metadata = {
+      id: randomUUID(), sessionId: randomUUID(), projectId, sourceId: sessionId,
+      sourceCwd: project.cwd, targetCwd: target?.path, targetIdentity: target?.identity,
+      title: previous?.title ?? conversationTitle(archive.title, 80),
+    }
+    const record = ready ?? (previous
+      ? await rebindConversation(config, previous, metadata)
+      : await stageConversation(config, metadata, readSourceEvents(archive, { config, sourceCwd: project.cwd, signal }), redact,
+        item => readConversationAttachment(project, archive, item)))
+    if (!record) throw new RequestError('会话预览已变化，请重新打开。', 409)
+    const messages = record.messages.map(({ role, text, time }) => ({ role, text, time }))
+    const { trace, indexOf, truncated: traceTruncated } = conversationTrace(record.trace, messages.length)
     for (let index = 0; index < messages.length; index++) {
       if (indexOf.has(index)) messages[index].traceIds = indexOf.get(index)
     }
     const traceCounts = countTrace(trace)
-    const { sourceStats } = history
-    const title = conversationTitle(archive.title || messages[0].text, 80) || '迁入的 Agent 会话'
-    const path = await currentDirectory(project.cwd)
-    const canImport = Boolean(path && pathKey(path) === pathKey(project.cwd))
-    const ticket = randomUUID()
-    for (const [key, record] of conversationTickets) {
-      if (!record.pending && Date.now() - record.created > ticketLifetime) conversationTickets.delete(key)
-    }
-    if (canImport && conversationTickets.size >= conversationTicketLimit) {
-      const oldest = [...conversationTickets].find(([, record]) => !record.pending)
-      if (!oldest) throw new RequestError('其他会话正在迁入，请稍后重试。', 409)
-      conversationTickets.delete(oldest[0])
-    }
-    if (canImport) conversationTickets.set(ticket, {
-      created: Date.now(), projectId, sessionId: randomUUID(), path, config, messages, title, trace, sourceStats,
-    })
-    const entry = await detail(projectId)
+    const { sourceStats, history } = record
+    const title = record.title || conversationTitle(messages[0]?.text, 80) || '迁入的 Agent 会话'
+    const canImport = Boolean(target && messages.length && record.targetIdentity === target.identity)
     const skillCandidates = skillHandoff
-      ? await skillHandoff.conversationCandidates(project, history.usedSkills, entry.skills)
+      && (!target || pathKey(target.path) === pathKey(project.cwd))
+      ? await skillHandoff.conversationCandidates(project, record.usedSkills, (await detail(projectId)).skills)
       : []
     return {
-      title, messages, ticket: canImport ? ticket : null, canImport, cwd: project.cwd,
-      truncated: history.truncated || traceTruncated, skillCandidates, trace, traceCounts, sourceStats,
+      title, messages, ticket: canImport ? record.id : null, canImport, cwd: project.cwd,
+      sourceCwd: project.cwd, targetCwd: target?.path, history, resumePending: record.state === 'approved',
+      truncated: record.truncated || traceTruncated, skillCandidates, trace, traceCounts, sourceStats,
     }
   }
 
   async function commitConversation(ticket) {
-    const record = conversationTickets.get(ticket)
-    if (!record || Date.now() - record.created > ticketLifetime) {
-      throw new RequestError('会话预览已过期，请重新打开。', 409)
-    }
-    if (record.result) return record.result
-    if (record.pending) return record.pending
-    record.pending = (async () => {
-      const cwd = await currentDirectory(record.path)
-      if (!cwd || pathKey(cwd) !== pathKey(record.path)) {
-        throw new RequestError('原工作目录已变化，请刷新项目。', 409)
+    if (!isSessionId(ticket)) throw new RequestError('会话预览已过期，请重新打开。', 409)
+    if (conversationTickets.has(ticket)) return conversationTickets.get(ticket)
+    const pending = (async () => {
+      const config = await loadConfig()
+      const record = await readConversationSnapshot(config, ticket)
+      if (!record?.targetCwd || !record.messages.length) throw new RequestError('会话预览已过期或不能迁入，请重新打开。', 409)
+      if (record.state === 'done') return { sessionId: record.sessionId }
+      const target = await conversationDirectory(record.targetCwd)
+      if (!target || pathKey(target.path) !== pathKey(record.targetCwd) || target.identity !== record.targetIdentity) {
+        throw new RequestError('目标目录已变化，请重新选择目录。', 409)
       }
+      if (record.state === 'preview' && !await approveConversation(config, ticket)) {
+        throw new RequestError('会话预览已过期或正在迁入，请重新打开。', 409)
+      }
+      record.config = config
+      record.title ||= conversationTitle(record.messages[0].text, 80) || '迁入的 Agent 会话'
+      record.trace = conversationTrace(record.trace, record.messages.length).trace
+      let result
       try {
-        record.result = await importConversation(record, cwd)
+        result = await importConversation(record, target.path)
+        await finishConversation(config, ticket, record.nativeTimeline)
       } catch (error) {
         if (error.status) throw error
         const message = record.stored ? '会话历史已写入，暂时无法加入工作区。可重试打开。' : '无法将会话写入 DSH。请检查工作区和会话存储后重试。'
         throw new RequestError(message, 503)
       }
-      delete record.messages
-      delete record.stored
       try {
         await writeProjectContinuation(record.config, record.projectId)
         await synchronizeProjectState()
       } catch { /* A saved session remains usable even if the recents index cannot be updated. */ }
-      return record.result
-    })().finally(() => { delete record.pending })
-    return record.pending
+      return result
+    })().finally(() => conversationTickets.delete(ticket))
+    conversationTickets.set(ticket, pending)
+    return pending
   }
 
   async function exportSession({ conversation, format, includeTrace, sessionId }) {
@@ -801,6 +883,17 @@ export function createCatalog(loadConfig, { importConversation, skillHandoff, lo
       if (action === 'set-project-pin') return setProjectPin(input)
       if (action === 'set-project-selection') return setProjectSelection(input)
       if (action === 'record-project-continuation') return recordProjectContinuation(input.ticket)
+      if (action === 'conversation-history' || action === 'discard-conversation-preview') {
+        const config = await loadConfig()
+        const id = input.snapshotId ?? input.ticket
+        if (action === 'discard-conversation-preview') {
+          await discardConversation(config, id)
+          return {}
+        }
+        const page = await readHistoryPage(config, id, input.cursor, input.turn)
+        if (!page) throw new RequestError('来源历史已过期，请重新打开预览。', 404)
+        return page
+      }
       if (action === 'preview-skill-activation') {
         if (!skillHandoff) throw new RequestError('当前 DSH 未提供原生技能启用服务。', 409)
         if (!isCatalogId(input.projectId) || !Array.isArray(input.assetIds)
@@ -843,7 +936,7 @@ export function createCatalog(loadConfig, { importConversation, skillHandoff, lo
       }
       if (action === 'list-conversations' || action === 'preview-conversation' || action === 'import-conversation') {
         if (!importConversation) throw new RequestError('当前 DSH 未提供会话迁入服务。', 409)
-        if (action === 'list-conversations') return listConversations(input.projectId, input.recent === true)
+        if (action === 'list-conversations') return listConversations(input.projectId, input.recent === true, input.cursor)
         if (action === 'preview-conversation') return previewConversation(input)
         return commitConversation(input.ticket)
       }

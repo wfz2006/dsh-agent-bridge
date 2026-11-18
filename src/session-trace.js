@@ -4,7 +4,7 @@ import path from 'node:path'
 
 const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const kinds = new Set(['summary', 'tool_call', 'tool_result'])
-const states = new Set(['ok', 'error', 'missing', 'pending', 'truncated'])
+const states = new Set(['ok', 'error', 'missing', 'pending', 'truncated', 'incomplete'])
 const maxTraceItems = 200
 const maxTraceBytes = 96 * 1024
 

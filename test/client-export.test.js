@@ -246,3 +246,61 @@ test('the session header offers a read-only source record entry when the host ex
   assert.match(source, /conversation\.session\.header\.actions/);
   assert.match(source, /createPortal/);
 });
+
+test('quoting saved history appends to the selected DSH draft without submitting', async () => {
+  const binding = { ctx: {} };
+  const actions = [];
+  let outcome = 'applied';
+  const send = mount({
+    rows: [project],
+    services: {
+      sessions: {
+        list: { getSnapshot: () => ({ phase: 'ready', ids: [project.id], byId: { [project.id]: project } }) },
+        retain: (id) => {
+          actions.push(['retain', id]);
+          return { binding, ready: Promise.resolve(), release: () => actions.push(['release', id]) };
+        },
+      },
+      conversation: { input: { requestDraftInitialization: (current, options) => {
+        assert.equal(current, binding);
+        actions.push(['draft', structuredClone(options)]);
+        return outcome;
+      } } },
+      uiWorkspace: { openSession: (id) => actions.push(['open', id]) },
+    },
+  });
+
+  assert.equal((await send('quote-history', { sessionId: other.id, text: 'outside' })).ok, false);
+  assert.deepEqual(actions, []);
+  assert.equal((await send('quote-history', { sessionId: project.id, text: '早期结果\n\n末行' })).ok, true);
+  assert.deepEqual(actions, [
+    ['retain', project.id],
+    ['draft', { prompt: '> 早期结果\n> \n> 末行\n\n', whenDraftExists: 'append' }],
+    ['release', project.id],
+    ['open', project.id],
+  ]);
+
+  outcome = 'preserved';
+  actions.length = 0;
+  const previous = await send('quote-history', { sessionId: project.id, text: '仍有草稿' });
+  assert.equal(previous.ok, false);
+  assert.match(previous.error, /已有草稿/);
+  assert.equal(actions.some(([action]) => action === 'open'), false);
+});
+
+test('history directory browsing uses the DSH picker and lets the user cancel without opening a workspace', async () => {
+  let selected = other.cwd;
+  let calls = 0;
+  const send = mount({
+    rows: [],
+    services: { uiWorkspace: { pickDirectory: async () => { calls++; return selected; } } },
+  });
+  assert.equal(await send('pick-history-directory', {}, { origin: 'https://foreign.example' }), undefined);
+  assert.equal(calls, 0);
+  assert.equal((await send('pick-history-directory')).path, other.cwd);
+  selected = null;
+  const cancelled = await send('pick-history-directory');
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.path, null);
+  assert.equal(calls, 2);
+});

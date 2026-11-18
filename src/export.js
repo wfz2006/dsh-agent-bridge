@@ -118,6 +118,38 @@ function fenceSafe(text) {
   return `${text}${/\r$|\n$/.test(text) ? '' : eol}${fence.markup}`
 }
 
+export async function* sourceHistoryMarkdown(record, pages, { format, includeTrace }) {
+  yield `# 外部会话来源历史\n\n${escapeProse(record.title || '迁入的 Agent 会话')}\n\n`
+  if (format === 'local' && record.sourceCwd) {
+    yield `来源目录 ${fileLink(shortName(record.sourceCwd), directoryUrl(record.sourceCwd))}\n\n`
+  }
+  if (!record.history.complete) yield '部分来源内容不可恢复，原因见下方记录。\n\n'
+  let current
+  function render(item) {
+    if (!item) return ''
+    const turn = item.turn ? ` · 第 ${item.turn} 轮` : ''
+    if (item.kind === 'message') {
+      return `## ${item.role === 'user' ? '用户' : '助手'}${turn}\n\n${fenceSafe(item.text)}\n\n`
+    }
+    if (item.kind === 'attachment') return `附件 ${escapeProse(item.name)}（${item.status === 'saved' ? '本机档案已保存' : item.status}）${turn}\n\n`
+    if (item.kind === 'gap') return `来源缺失（${escapeProse(item.reason)}）\n\n`
+    if (item.kind === 'turn_end') return `回合状态 ${item.status}${turn}\n\n`
+    if (!includeTrace) return ''
+    const label = { summary: '公开摘要', tool_call: '工具调用', tool_result: '工具结果' }[item.kind]
+    return label ? `### ${label}${turn}\n\n${escapeProse([item.name, item.callId, item.status].filter(Boolean).join(' · '))}\n\n${fenceSafe(item.text ?? '')}\n\n` : ''
+  }
+  for await (const page of pages) {
+    for (const item of page.items) {
+      if (current?.seq === item.seq) current.text += item.text
+      else {
+        yield render(current)
+        current = item
+      }
+    }
+  }
+  yield render(current)
+}
+
 function fileStamp(date) {
   return date.toISOString().slice(0, 19).replace(/[-:]/g, '') + 'Z'
 }

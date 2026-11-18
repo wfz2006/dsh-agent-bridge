@@ -32,7 +32,7 @@ const agentFilter = byId('agent-filter')
 const agentPicker = byId('agent-picker')
 const agentPopover = byId('agent-popover')
 const agentOptions = byId('agent-options')
-const themeOptions = [...document.querySelectorAll('[data-theme-choice]')]
+const appearance = byId('appearance')
 const themeKey = 'dsh-agent-bridge.theme'
 const projectSearch = byId('project-search')
 const assetSearch = byId('asset-search')
@@ -120,9 +120,14 @@ let recentRevision = 0
 let recentKey = ''
 let historyProject
 let historySessions
+let historyUnavailable = []
+let historyCursor
+let historyPaging = false
 let historyLimit = 30
 let historyChosenId
 let historyTicket
+let historySnapshotId
+let historyImportStarted = false
 let importedSessionId
 let draftRecovery
 let historyPreview = 0
@@ -237,11 +242,9 @@ function agentLabel(agent, className = '', label = agentName(agent)) {
 }
 
 function setTheme(value, remember = true) {
-  const theme = ['blue', 'white', 'black'].includes(value) ? value : 'blue'
+  const theme = ['white', 'mist', 'blue', 'black'].includes(value) ? value : 'white'
   document.documentElement.dataset.theme = theme
-  for (const button of themeOptions) {
-    button.setAttribute('aria-pressed', String(button.dataset.themeChoice === theme))
-  }
+  appearance.value = theme
   if (remember) {
     try { localStorage.setItem(themeKey, theme) } catch { /* Theme is still applied to this panel. */ }
   }
@@ -470,10 +473,11 @@ function renderArchiveControls(matches) {
   archiveAction.disabled = archiveBusy || detailLoading || !current
 }
 
-function projectRow(project, matches) {
+function projectRow(project, matches, showPath) {
   const button = document.createElement('button')
   button.type = 'button'
   button.className = 'project'
+  if (showPath) button.classList.add('project-show-path')
   button.id = `project-${project.id}`
   button.setAttribute('aria-pressed', String(current?.id === project.id))
   button.title = project.cwd
@@ -532,10 +536,16 @@ function renderProjects() {
   byId('project-count').textContent = matches.length === total ? `${total} 项` : `${matches.length} / ${total}`
   renderArchiveControls(matches)
   const items = []
+  const names = new Set()
+  const duplicateNames = new Set()
+  for (const project of matches) {
+    if (names.has(project.name)) duplicateNames.add(project.name)
+    names.add(project.name)
+  }
   for (const [label, group] of projectGroups(matches)) {
     if (!group.length) continue
     if (label) items.push(text('h3', label, 'project-group-heading'))
-    for (const project of group) items.push(projectRow(project, matches))
+    for (const project of group) items.push(projectRow(project, matches, duplicateNames.has(project.name)))
   }
   const focused = projectList.contains(document.activeElement) ? document.activeElement.id : ''
   const scroll = projectList.scrollTop
@@ -978,8 +988,16 @@ function showProject(project) {
   byId('project-detail').hidden = false
 }
 
+const projectSwitch = byId('project-switch')
+function expandProjectIndex(expand) {
+  projectSwitch.setAttribute('aria-expanded', String(expand))
+  projectSwitch.textContent = expand ? '收起项目' : '切换项目'
+}
+projectSwitch.addEventListener('click', () => expandProjectIndex(projectSwitch.getAttribute('aria-expanded') === 'false'))
+
 function revealProjectDetail() {
   if (!compactLayout.matches) return
+  if (!managingProjects) expandProjectIndex(false)
   const heading = byId('project-name')
   heading.focus({ preventScroll: true })
   heading.closest('.detail').scrollIntoView({ block: 'start', behavior: reducedMotion.matches ? 'instant' : 'smooth' })
@@ -1037,7 +1055,7 @@ async function loadRecentConversations(project) {
   }
   if (!recentKey) recentStatus.textContent = '正在查找最近对话…'
   try {
-    const { sessions, total } = await api('list-conversations', { projectId: project.id, recent: true })
+    const { sessions, total, hasMore, nextCursor, unavailable = [] } = await api('list-conversations', { projectId: project.id, recent: true })
     if (!isCurrent()) return
     const key = JSON.stringify(sessions)
     if (key !== recentKey) {
@@ -1047,11 +1065,15 @@ async function loadRecentConversations(project) {
         ?? byId('continue-heading')).focus({ preventScroll: true })
       recentKey = key
     }
-    recentStatus.textContent = sessions.length
-      ? (current.online ? '' : '原工作目录不可访问，暂时只能预览。')
-      : '这个项目还没有可迁入的对话。可以用项目资料开新对话。'
-    byId('browse-history-label').textContent = `查看全部 ${total ?? sessions.length} 条对话`
-    browseHistory.hidden = (total ?? sessions.length) <= sessions.length
+    const count = total ?? sessions.length
+    const scanning = Boolean(hasMore || nextCursor)
+    recentStatus.textContent = [
+      sessions.length ? (current.online ? '' : '原工作目录不可访问，可在预览中选择新的迁入目录。')
+        : scanning ? '已扫描的部分暂无可迁入对话。' : '这个项目还没有可迁入的对话。可以用项目资料开新对话。',
+      unavailable.length ? `${unavailable.length} 条来源无法读取。` : '',
+    ].filter(Boolean).join(' ')
+    byId('browse-history-label').textContent = scanning ? `查看对话（已确认 ${count} 条）` : `查看全部 ${count} 条对话`
+    browseHistory.hidden = count <= sessions.length && !scanning && !unavailable.length
   } catch {
     if (!isCurrent()) return
     recentStatus.textContent = recentList.childElementCount
@@ -1237,12 +1259,23 @@ function setDialogBusy(busy) {
   sessionSelect.disabled = busy
   byId('history-back-button').disabled = busy
   historyImport.disabled = busy
+  for (const field of dialogText.querySelectorAll('.history-target-form input, .history-target-form button')) field.disabled = busy
   skillApply.disabled = busy
   skillUndo.disabled = busy
   skillDeactivate.disabled = busy
 }
 
+function releaseHistoryPreview() {
+  const snapshotId = historySnapshotId
+  historySnapshotId = undefined
+  if (snapshotId && !historyImportStarted) {
+    void api('discard-conversation-preview', { snapshotId }, { keepalive: true }).catch(() => {})
+  }
+  historyImportStarted = false
+}
+
 function showDialog(mode, title, note, body, assetKind = 'memory') {
+  releaseHistoryPreview()
   dialogMode = mode
   dialog.dataset.mode = mode
   ticket = undefined
@@ -1251,6 +1284,10 @@ function showDialog(mode, title, note, body, assetKind = 'memory') {
   sessionSourceRecord.replaceChildren()
   historyProject = undefined
   historySessions = undefined
+  historyUnavailable = []
+  historyCursor = undefined
+  historyPaging = false
+  byId('history-unavailable').open = false
   historyChosenId = undefined
   historyTicket = undefined
   importedSessionId = undefined
@@ -1304,7 +1341,7 @@ function startHistoryDialog(title, note, body) {
   return epoch
 }
 
-const historyNote = '迁入用户与助手的文字消息，并保留可读取的思考摘要与工具记录，只供查阅。'
+const historyNote = '核对旧对话，再迁入 DSH 继续。工具记录可在来源历史中查阅。'
 
 function openSourceConversation(session) {
   if (startHistoryDialog('继续旧对话', historyNote, '正在读取这条对话…') === undefined) return
@@ -1315,9 +1352,11 @@ async function chooseSourceConversation() {
   const epoch = startHistoryDialog('查看全部对话', '选择一条对话以预览历史消息。', '正在读取对话列表…')
   if (epoch === undefined) return
   try {
-    const { sessions } = await api('list-conversations', { projectId: historyProject.id })
+    const { sessions, nextCursor, unavailable = [] } = await api('list-conversations', { projectId: historyProject.id })
     if (!dialog.open || dialogEpoch !== epoch) return
     historySessions = sessions
+    historyUnavailable = unavailable
+    historyCursor = nextCursor
     historySearch.value = ''
     historyLimit = 30
     showHistoryResults()
@@ -1326,18 +1365,67 @@ async function chooseSourceConversation() {
   }
 }
 
-function renderHistoryResults() {
+function historyMatches(sessions) {
   const query = historySearch.value.trim().toLowerCase()
+  return sessions.filter(session => [session.title, agentName(session.agent)].some(value => value?.toLowerCase().includes(query)))
+}
+
+function renderHistoryResults() {
   syncSearch(historySearch)
-  const matches = historySessions.filter(session => [session.title, agentName(session.agent)]
-    .some(value => value?.toLowerCase().includes(query)))
+  const matches = historyMatches(historySessions)
   historyResults.replaceChildren(...matches.slice(0, historyLimit).map(session => makeConversationRow(session, previewSourceConversation)))
-  byId('history-empty').textContent = matches.length ? '' : (query ? '没有找到匹配的对话。' : '这个项目暂无可迁入的对话。')
-  byId('history-more').hidden = matches.length <= historyLimit
+  byId('history-empty').textContent = matches.length ? ''
+    : historyCursor ? '已扫描的部分暂无匹配项，可继续扫描。'
+      : historySearch.value.trim() ? '没有找到匹配的对话。' : '这个项目暂无可迁入的对话。'
+  const more = byId('history-more')
+  const unavailable = historyMatches(historyUnavailable)
+  const moreLocally = Math.max(matches.length, unavailable.length) > historyLimit
+  more.hidden = !moreLocally && !historyCursor
+  more.disabled = historyPaging
+  more.textContent = historyPaging ? '正在扫描…' : moreLocally ? '显示更多' : '继续扫描'
+  byId('history-unavailable').hidden = unavailable.length === 0
+  byId('history-unavailable-count').textContent = `${unavailable.length} 条来源无法读取`
+  byId('history-unavailable-results').replaceChildren(...unavailable.slice(0, historyLimit).map(session => {
+    const row = text('li', '', 'preview-context')
+    row.append(text('strong', session.title || '未命名对话'), document.createTextNode(` · ${archiveIssue(session.reason)}`))
+    return row
+  }))
+}
+
+async function moreHistoryResults() {
+  if (historyPaging) return
+  const index = historyResults.childElementCount
+  if (Math.max(historyMatches(historySessions).length, historyMatches(historyUnavailable).length) <= historyLimit && historyCursor) {
+    const epoch = dialogEpoch
+    const cursor = historyCursor
+    historyPaging = true
+    status('', false, 'dialog-status')
+    renderHistoryResults()
+    try {
+      const page = await api('list-conversations', { projectId: historyProject.id, cursor })
+      if (!dialog.open || dialogEpoch !== epoch) return
+      const merge = (first, second) => [...new Map([...first, ...second].map(item => [item.id, item])).values()]
+      historySessions = merge(historySessions, page.sessions)
+      historyUnavailable = merge(historyUnavailable, page.unavailable ?? [])
+      historyCursor = page.nextCursor === cursor ? undefined : page.nextCursor
+    } catch (error) {
+      if (dialog.open && dialogEpoch === epoch) status(error.message, true, 'dialog-status')
+      return
+    } finally {
+      if (dialogEpoch === epoch) {
+        historyPaging = false
+        renderHistoryResults()
+      }
+    }
+  }
+  historyLimit += 30
+  renderHistoryResults()
+  historyResults.children[index]?.querySelector('button')?.focus()
 }
 
 function showHistoryResults() {
   if (!historySessions) return
+  releaseHistoryPreview()
   historyPreview++
   historyTicket = undefined
   importedSessionId = undefined
@@ -1356,8 +1444,11 @@ function showHistoryResults() {
   ;(previous || historySearch).focus()
 }
 
-const traceKindNames = { summary: '思考摘要', tool_call: '工具调用', tool_result: '工具结果' }
-const traceStateNames = { missing: '未记录结果', error: '失败', pending: '待确认', truncated: '已截取' }
+const traceKindNames = { summary: '思考摘要', tool_call: '工具调用', tool_result: '工具结果', turn_end: '回合结束' }
+const traceStateNames = {
+  missing: '未记录结果', error: '失败', pending: '待确认', truncated: '已截取', unmatched: '归属未知', incomplete: '未完成',
+  completed: '已完成', interrupted: '已中断',
+}
 
 function createTraceDisclosure(label, count) {
   const details = document.createElement('details')
@@ -1431,13 +1522,301 @@ function sessionTraceDisclosure(items) {
 }
 
 const formatStatNumber = new Intl.NumberFormat('zh-CN').format
+const archiveIssueLabels = {
+  'source-unavailable': '找不到会话来源。',
+  'source-unreadable': '无法读取部分来源记录。',
+  'source-mismatch': '来源的工作目录和项目不一致。',
+  'source-metadata-missing': '来源缺少用于核对会话身份的记录。',
+  'source-compacted': '来源已压缩早期历史，原文可能已不在源记录中。',
+  'source-dialogue-only': '来源只有已保存的问答，工具和附件记录可能缺失。',
+  'source-tool-output-truncated': '源记录中的工具输出已被截取。',
+  'archive-tool-details-unavailable': '归档缺少工具调用详情。',
+  'unresolved-branch': '无法确定部分分支的归属。',
+  'unresolved-source-projection': '有部分来源消息无法核对。',
+  'unsupported-source-schema': '当前版本不识别这份来源的存储结构。',
+  'unsupported-incremental-edit': '部分增量编辑无法恢复。',
+  'unsupported-source': '当前版本无法读取这类来源。',
+  'unsupported-compression': '当前 DSH 无法解压这份日志。',
+  'malformed-record': '有一条来源记录损坏或格式无法识别。',
+  'record-too-large': '有一条来源记录超过可读取的大小。',
+  'corrupt-compressed-source': '压缩日志不完整或已损坏。',
+  'source-changed': '读取期间，来源发生变化。',
+  'remote-reference': '此附件只有远程引用。',
+  'name-only': '来源只保存了附件名称。',
+  'outside-project': '附件不在可读取范围内。',
+  'attachment-unavailable': '附件已移动或无法访问。',
+  'attachment-too-large': '附件超过可保存的大小。',
+}
+
+function archiveIssue(code) {
+  return Object.hasOwn(archiveIssueLabels, code) ? archiveIssueLabels[code] : '部分来源记录无法读取。'
+}
+
+function archiveUrl(route, sessionId, values = {}) {
+  return `./${route}?${new URLSearchParams({ sessionId, ...values })}`
+}
+
+function archivedAttachment(item, { sessionId, snapshotId }) {
+  const row = text('div', '', 'archive-attachment')
+  const name = item.name || '附件'
+  if (item.status === 'saved' && item.attachmentId && (sessionId || snapshotId)) {
+    const params = new URLSearchParams(sessionId ? { sessionId } : { snapshotId })
+    params.set('attachmentId', item.attachmentId)
+    if (Number.isSafeInteger(item.seq)) params.set('seq', item.seq)
+    const url = `./conversation-attachment?${params}`
+    if (['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(item.mediaType)) {
+      const preview = text('button', '', 'archive-attachment-preview')
+      preview.type = 'button'
+      preview.setAttribute('aria-label', `放大图片 ${name}`)
+      preview.setAttribute('aria-pressed', 'false')
+      preview.addEventListener('click', () => {
+        const enlarged = preview.classList.toggle('enlarged')
+        preview.setAttribute('aria-pressed', String(enlarged))
+        preview.setAttribute('aria-label', `${enlarged ? '缩小图片' : '放大图片'} ${name}`)
+      })
+      const image = document.createElement('img')
+      image.alt = name
+      image.loading = 'lazy'
+      image.decoding = 'async'
+      image.addEventListener('error', () => preview.remove(), { once: true })
+      image.src = url + '&inline=true'
+      preview.append(image)
+      row.append(preview)
+    }
+    const link = text('a', name, 'text-action archive-attachment-name')
+    link.href = url
+    link.download = name
+    link.title = `下载「${name}」`
+    row.append(link)
+  } else {
+    row.append(text('strong', name, 'archive-attachment-name'),
+      text('span', archiveIssue(item.reason || item.status), 'muted'))
+  }
+  return row
+}
+
+function archiveButton(label, action) {
+  const button = text('button', label, 'secondary reader-button')
+  button.type = 'button'
+  button.addEventListener('click', action)
+  return button
+}
+
+function sourceArchive(history, { sessionId, snapshotId, ticket } = {}) {
+  const section = text('details', '', 'source-archive bridge-reader')
+  section.append(text('summary', '完整历史', 'reader-summary'))
+  const info = text('p', '', 'reader-note')
+  const result = text('div', '', 'source-archive-items reader-list')
+  result.tabIndex = 0
+  result.setAttribute('aria-label', '当前页的来源记录')
+  const pagination = text('nav', '', 'reader-pager')
+  pagination.setAttribute('aria-label', '完整历史分页')
+  const pageLabel = text('span', '', 'muted')
+  pageLabel.setAttribute('role', 'status')
+  const readError = text('p', '', 'muted')
+  readError.setAttribute('role', 'status')
+  const locators = [{}]
+  let index = -1
+  let nextCursor
+  let busy = false
+  const first = archiveButton('最早一页', () => void load(0, {}))
+  const previous = archiveButton('上一页', () => void load(index - 1, locators[index - 1]))
+  const next = archiveButton('下一页', () => void load(index + 1, { cursor: nextCursor }))
+  const goTo = text('form', '', 'reader-jump')
+  const turn = document.createElement('input')
+  turn.type = 'number'
+  turn.min = '1'
+  turn.step = '1'
+  turn.required = true
+  turn.setAttribute('aria-label', '回合号')
+  turn.placeholder = '回合号'
+  const go = text('button', '跳到回合', 'reader-button')
+  go.type = 'submit'
+  goTo.append(turn, go)
+  pagination.append(first, previous, pageLabel, next)
+  const toolbar = text('div', '', 'reader-toolbar')
+  toolbar.append(goTo, pagination)
+  section.append(info, toolbar, result, readError)
+  goTo.addEventListener('submit', event => {
+    event.preventDefault()
+    const number = Number(turn.value)
+    if (!busy && Number.isSafeInteger(number) && number > 0) void load(0, { turn: number })
+  })
+
+  if (sessionId) {
+    const downloads = text('details', '', 'reader-extra')
+    const exports = text('div', '', 'reader-downloads')
+    const option = document.createElement('label')
+    const withTools = document.createElement('input')
+    withTools.type = 'checkbox'
+    option.append(withTools, document.createTextNode(' 附带工具和摘要'))
+    exports.append(option)
+    for (const [format, name] of [['local', '下载来源全文（本机版）'], ['share', '下载来源全文（分享版）']]) {
+      const link = text('a', name, 'reader-button')
+      const setUrl = () => { link.href = archiveUrl('conversation-export', sessionId, { format, includeTrace: String(withTools.checked) }) }
+      link.download = ''
+      withTools.addEventListener('change', setUrl)
+      setUrl()
+      exports.append(link)
+    }
+    downloads.append(text('summary', '导出来源全文', 'reader-summary'), exports)
+    section.append(downloads)
+  }
+
+  function explain(counts) {
+    const partial = counts.complete === false
+      ? ' · 来源不完整，缺失原因见页内记录'
+      : ''
+    const { nativeFirstTurn: start, nativeLastTurn: end } = counts
+    const nativeRange = start && end ? `（原第 ${start === end ? start : `${start}–${end}`} 轮）` : ''
+    const retained = sessionId
+      ? `已迁入 ${formatStatNumber(counts.nativeMessages ?? 0)} 条消息${nativeRange}`
+      : `预览保留 ${formatStatNumber(counts.nativeMessages ?? 0)} 条续聊消息${nativeRange}`
+    info.textContent = `${formatStatNumber(counts.messages ?? 0)} 条历史消息 · ${formatStatNumber(counts.tools ?? 0)} 条工具记录 · ${formatStatNumber(counts.attachments ?? 0)} 个附件 · ${retained}${partial}`
+  }
+
+  function syncControls() {
+    first.disabled = busy || (index <= 0 && !locators[0].turn)
+    previous.disabled = busy || index <= 0
+    next.disabled = busy || !nextCursor
+    turn.disabled = busy
+    go.disabled = busy
+    pageLabel.textContent = busy ? '正在读取…' : (index >= 0 ? `第 ${index + 1} 页` : '')
+  }
+
+  function renderItem(item) {
+    const row = text('article', '', 'history-message reader-row')
+    if (item.role) row.dataset.role = item.role
+    if (item.kind === 'gap') {
+      row.append(text('p', archiveIssue(item.reason), 'reader-body'))
+      return row
+    }
+    const label = item.kind === 'message'
+      ? (item.role === 'user' ? '用户' : '助手')
+      : traceKindNames[item.kind] ?? '附件'
+    const meta = text('div', '', 'reader-meta')
+    if (item.turn) meta.append(text('small', '第 ' + item.turn + ' 轮'))
+    meta.append(text('strong', label))
+    row.append(meta)
+    const detail = [
+      item.kind === 'attachment' ? '' : item.name,
+      item.callId ? `调用 ${item.callId}` : '', traceStateNames[item.status],
+      item.branchId ? `分支 ${item.branchId}` : '',
+      item.offset || item.continued ? '分段显示' : '',
+    ].filter(Boolean).join(' · ')
+    if (detail) row.append(text('small', detail, 'reader-detail'))
+    if (item.kind === 'attachment') {
+      row.append(archivedAttachment(item, { sessionId, snapshotId }))
+      return row
+    }
+    if (item.text) {
+      row.append(item.kind === 'message' && item.role === 'assistant' && !item.offset && !item.continued
+        ? markdownBody(item.text, 'preview-body reader-body')
+        : text('p', item.text, 'preview-body reader-body'))
+      const copy = archiveButton('复制摘录', async () => {
+        try {
+          await navigator.clipboard.writeText(item.text)
+          readError.textContent = '已复制，可粘贴到下一条消息。'
+        } catch {
+          readError.textContent = '无法访问剪贴板，请手动选择文字复制。'
+        }
+      })
+      const actions = text('div', '', 'reader-actions')
+      actions.append(copy)
+      if (sessionId && item.text.length <= 65_536) {
+        actions.append(archiveButton('引用到草稿', async event => {
+          const button = event.currentTarget
+          button.disabled = true
+          try {
+            await requestParent('quote-history', { sessionId, text: item.text })
+            dialog.close()
+          } catch (error) {
+            readError.textContent = error.message
+          } finally {
+            button.disabled = false
+          }
+        }))
+      }
+      row.append(actions)
+    }
+    return row
+  }
+
+  function renderPage(items) {
+    const groups = new Map()
+    const rows = []
+    for (const [index, item] of items.entries()) {
+      const row = renderItem(item)
+      const previous = items[index - 1]
+      if (item.kind === 'attachment' && item.turn > 0 && previous?.kind === 'attachment'
+        && previous.turn === item.turn && previous.branchId === item.branchId) row.classList.add('reader-following-file')
+      if (!['summary', 'tool_call', 'tool_result'].includes(item.kind)) {
+        rows.push(row)
+        continue
+      }
+      const key = JSON.stringify([item.turn, item.branchId])
+      let group = groups.get(key)
+      if (!group) {
+        const disclosure = text('details', '', 'source-archive-process reader-process')
+        const summary = text('summary', '', 'reader-summary')
+        const contents = text('div', '', 'source-archive-process-items reader-process-items')
+        disclosure.append(summary, contents)
+        group = { summary, contents, records: new Set(), turn: item.turn, branch: item.branchId }
+        groups.set(key, group)
+        rows.push(disclosure)
+      }
+      group.contents.append(row)
+      group.records.add(item.seq ?? item)
+    }
+    for (const group of groups.values()) {
+      const label = [
+        group.turn ? `第 ${group.turn} 轮过程` : '未归属的过程',
+        group.branch ? `分支 ${group.branch}` : '',
+      ].filter(Boolean).join(' · ')
+      group.summary.append(document.createTextNode(label), text('small', '本页 ' + group.records.size + ' 项'))
+    }
+    return rows
+  }
+
+  async function load(position, locator) {
+    if (busy || !locator) return
+    busy = true
+    readError.replaceChildren()
+    syncControls()
+    try {
+      const identity = sessionId ? { sessionId } : { snapshotId, ticket }
+      const page = await api('conversation-history', { ...identity, ...locator })
+      explain(page.history ?? history)
+      result.replaceChildren(...renderPage(page.items))
+      result.scrollTop = 0
+      if (!page.items.length) result.append(text('p', '这页暂无来源记录。', 'muted'))
+      if (position === 0) locators.length = 1
+      locators[position] = locator
+      index = position
+      nextCursor = page.nextCursor
+    } catch (error) {
+      readError.append(document.createTextNode(error.message + ' '), archiveButton('重试', () => void load(position, locator)))
+    } finally {
+      busy = false
+      syncControls()
+    }
+  }
+
+  section.addEventListener('toggle', () => { if (section.open && index < 0) void load(0, {}) })
+  explain(history)
+  syncControls()
+  return section
+}
 
 function renderSourceStats(stats, counts = {}, { preview = false } = {}) {
-  const section = text('section', '', 'source-stats')
+  const section = text('details', '', 'bridge-reader bridge-stats')
+  section.open = !stats
   const title = '原对话统计'
   section.setAttribute('aria-label', title)
-  section.append(text('h3', title))
-  const metrics = text('dl', '', 'source-stats-grid')
+  const heading = text('summary', title, 'reader-summary')
+  if (stats) heading.append(text('small', `${formatStatNumber(stats.userMessages)} 轮 · ${formatStatNumber(stats.userMessages + stats.assistantMessages)} 条消息`))
+  section.append(heading)
+  const metrics = text('dl', '')
   const notes = []
   function addMetric(label, value) {
     const metric = document.createElement('div')
@@ -1476,32 +1855,96 @@ function renderSourceStats(stats, counts = {}, { preview = false } = {}) {
   return section
 }
 
-async function previewSourceConversation(session) {
+async function previewSourceConversation(session, targetCwd) {
   const epoch = dialogEpoch
   const revision = ++historyPreview
-  historyChosenId = session.id
-  historyTicket = undefined
-  importedSessionId = undefined
-  historyImport.hidden = true
-  byId('history-import-label').textContent = '迁入并继续'
-  byId('history-choice').hidden = true
-  byId('history-back').hidden = !historySessions
-  byId('dialog-title').textContent = '继续旧对话'
-  byId('dialog-note').textContent = historyNote
-  dialogText.hidden = false
-  dialogText.dataset.format = 'plain'
-  dialogText.textContent = '正在读取这条对话…'
-  dialogText.closest('.dialog-content').scrollTop = 0
-  if (historySessions) byId('history-back-button').focus()
-  else dialogText.focus({ preventScroll: true })
+  if (targetCwd) {
+    setDialogBusy(true)
+  } else {
+    releaseHistoryPreview()
+    historyChosenId = session.id
+    historyTicket = undefined
+    importedSessionId = undefined
+    historyImport.hidden = true
+    byId('history-import-label').textContent = '迁入并继续'
+    byId('history-choice').hidden = true
+    byId('history-back').hidden = !historySessions
+    byId('dialog-title').textContent = '继续旧对话'
+    byId('dialog-note').textContent = historyNote
+    dialogText.hidden = false
+    dialogText.dataset.format = 'plain'
+    dialogText.textContent = '正在读取这条对话…'
+    dialogText.closest('.dialog-content').scrollTop = 0
+    if (historySessions) byId('history-back-button').focus()
+    else dialogText.focus({ preventScroll: true })
+  }
   status('', false, 'dialog-status')
+  const active = () => dialog.open && dialogEpoch === epoch && revision === historyPreview
   try {
-    const result = await api('preview-conversation', { projectId: historyProject.id, sessionId: session.id })
-    if (!dialog.open || dialogEpoch !== epoch || revision !== historyPreview) return
+    const result = await api('preview-conversation', {
+      projectId: historyProject.id, sessionId: session.id,
+      ...(targetCwd ? { targetCwd, snapshotId: historySnapshotId } : {}),
+    })
+    const snapshotId = result.history?.snapshotId
+    if (!active()) {
+      if (snapshotId && !result.resumePending) void api('discard-conversation-preview', { snapshotId }).catch(() => {})
+      return
+    }
+    if (snapshotId !== historySnapshotId) releaseHistoryPreview()
+    historySnapshotId = snapshotId
+    historyImportStarted = result.resumePending === true
     historyTicket = result.ticket
     const title = text('h3', result.title, 'preview-lead')
     const source = text('p', '', 'preview-context history-source')
-    source.append(agentLabel(session.agent), text('code', result.cwd || historyProject.cwd, 'preview-source'))
+    const original = result.sourceCwd ?? result.cwd ?? historyProject.cwd
+    source.append(agentLabel(session.agent), text('span', '原工作目录'), text('code', original, 'preview-source'))
+    const target = text('p', '', 'preview-context history-source')
+    if (result.targetCwd && result.targetCwd !== original) {
+      target.append(text('span', '迁入目录'), text('code', result.targetCwd, 'preview-source'))
+    }
+    const directory = result.history && !result.resumePending ? text('details', '', 'source-archive') : undefined
+    if (directory) {
+      const form = text('form', '', 'history-target-form')
+      const input = document.createElement('input')
+      input.type = 'text'
+      input.maxLength = 4096
+      input.required = true
+      input.autocomplete = 'off'
+      input.setAttribute('aria-label', '迁入目录的本机绝对路径')
+      input.placeholder = '输入迁入目录的本机绝对路径'
+      input.value = result.targetCwd || ''
+      const suggested = document.createElement('datalist')
+      suggested.id = 'history-target-suggestions'
+      input.setAttribute('list', suggested.id)
+      for (const project of catalog.filter(project => project.online)) {
+        suggested.append(new Option(project.name, project.cwd))
+      }
+      const verify = text('button', '核对目录', 'secondary')
+      verify.type = 'submit'
+      const browse = archiveButton('浏览本机目录', async () => {
+        if (dialogBusy) return
+        setDialogBusy(true)
+        status('', false, 'dialog-status')
+        try {
+          const { path } = await requestParent('pick-history-directory')
+          if (path && form.isConnected) {
+            input.value = path
+            await previewSourceConversation(session, path)
+          }
+        } catch (error) {
+          status(error.message, true, 'dialog-status')
+        } finally {
+          if (dialog.open) setDialogBusy(false)
+        }
+      })
+      form.append(input, suggested, browse, verify)
+      form.addEventListener('submit', event => {
+        event.preventDefault()
+        if (!dialogBusy && input.value.trim()) void previewSourceConversation(session, input.value.trim())
+      })
+      directory.open = !result.canImport
+      directory.append(text('summary', '选择迁入目录'), form)
+    }
     const skillChoices = renderSkillChoices(result.skillCandidates, { history: true })
     const stats = renderSourceStats(result.sourceStats, result.traceCounts, { preview: true })
     const traceByMessage = new Map()
@@ -1510,11 +1953,14 @@ async function previewSourceConversation(session) {
       traceByMessage.set(item.messageIndex, [...(traceByMessage.get(item.messageIndex) ?? []), item])
     }
     const summary = text('p', [
-      result.truncated ? '源记录或读取范围有限，部分历史未带入' : '',
-      result.canImport ? '' : '原工作目录不可访问，当前可预览',
+      result.truncated && !result.history ? '源记录或读取范围有限，部分历史未带入' : '',
+      result.canImport ? '' : '原工作目录不可访问，可以先预览或核对新的迁入目录',
+      result.resumePending ? '上次迁入尚未完成，可在同一会话继续。' : '',
     ].filter(Boolean).join(' · '), 'preview-context')
     dialogText.dataset.format = 'history'
-    dialogText.replaceChildren(title, source, stats, ...(summary.textContent ? [summary] : []), ...(skillChoices ? [skillChoices] : []), ...result.messages.map((message, index) => {
+    dialogText.replaceChildren(title, source, ...(target.textContent ? [target] : []), ...(directory ? [directory] : []),
+      stats, ...(summary.textContent ? [summary] : []), ...(result.history ? [sourceArchive(result.history, { snapshotId, ticket: result.ticket })] : []),
+      ...(skillChoices ? [skillChoices] : []), ...result.messages.map((message, index) => {
       const row = text('section', '', 'history-message')
       row.dataset.role = message.role
       const body = message.role === 'assistant'
@@ -1528,7 +1974,10 @@ async function previewSourceConversation(session) {
     historyImport.hidden = !result.canImport
     syncSkillChoiceButtons()
   } catch (error) {
-    if (dialog.open && dialogEpoch === epoch && revision === historyPreview) dialogText.textContent = error.message
+    if (active() && targetCwd) status(error.message, true, 'dialog-status')
+    else if (active()) dialogText.textContent = error.message
+  } finally {
+    if (active() && targetCwd) setDialogBusy(false)
   }
 }
 
@@ -1642,7 +2091,7 @@ function requestParent(type, values, requestId = `bridge-${Date.now()}-${++reque
     const timer = setTimeout(() => {
       pending = undefined
       reject(new Error('DSH 暂未响应。请重试。'))
-    }, 25_000)
+    }, type === 'pick-history-directory' ? 300_000 : 25_000)
     pending = { requestId, timer, resolve, reject }
     try {
       window.parent.postMessage({ type: `dsh-agent-bridge:${type}`, requestId, ...values }, parentOrigin)
@@ -1792,6 +2241,7 @@ async function completeHandoff(purpose, confirmedSkillIds) {
     status(importedSessionId ? '正在打开已迁入的会话…' : '正在迁入会话…', false, 'dialog-status')
     try {
       if (!importedSessionId) {
+        historyImportStarted = true
         const result = await api('import-conversation', { ticket: historyTicket })
         importedSessionId = result.sessionId
       }
@@ -2030,9 +2480,10 @@ async function updateNativeSession() {
     const response = await fetch(url, { signal: request.signal, headers: { Accept: 'application/json' } })
     if (response.status === 404) return
     if (!response.ok) throw new Error('无法读取来源记录。')
-    const { trace, sourceStats, traceCounts } = await response.json()
-    if (request.signal.aborted || !Array.isArray(trace) || (!trace.length && !sourceStats)) return
-    sessionSourceRecord.append(renderSourceStats(sourceStats, traceCounts))
+    const { trace = [], sourceStats, traceCounts, history } = await response.json()
+    if (request.signal.aborted) return
+    if (trace.length || sourceStats) sessionSourceRecord.append(renderSourceStats(sourceStats, traceCounts))
+    if (history) sessionSourceRecord.append(sourceArchive(history, { sessionId: session.id }))
     if (trace.length) {
       sessionSourceRecord.append(sessionTraceDisclosure(trace))
       exportTraceOption.hidden = false
@@ -2250,6 +2701,7 @@ document.addEventListener('keydown', event => {
   if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey || dialog.open || !agentPopover.hidden
     || event.target.matches?.('input, select, textarea, [contenteditable]')) return
   event.preventDefault()
+  if (compactLayout.matches) expandProjectIndex(true)
   projectSearch.focus()
 })
 projectList.addEventListener('keydown', event => {
@@ -2286,12 +2738,7 @@ function searchHistory() {
 }
 historySearch.addEventListener('input', searchHistory)
 wireClear(historySearch, searchHistory)
-byId('history-more').addEventListener('click', () => {
-  const index = historyResults.childElementCount
-  historyLimit += 30
-  renderHistoryResults()
-  historyResults.children[index]?.querySelector('button')?.focus()
-})
+byId('history-more').addEventListener('click', moreHistoryResults)
 historyImport.addEventListener('click', importSourceConversation)
 sessionSelect.addEventListener('change', clearDownload)
 sessionSelect.addEventListener('change', updateNativeSession)
@@ -2305,6 +2752,7 @@ dialog.addEventListener('click', event => {
 dialog.addEventListener('cancel', event => { if (dialogBusy) event.preventDefault() })
 dialog.addEventListener('close', () => {
   ++dialogEpoch
+  releaseHistoryPreview()
   if (!dialog.open) sessionTraceRequest?.abort()
   if (activateDialog.open) activateDialog.close()
   clearDownload()
@@ -2326,7 +2774,7 @@ activateDialog.addEventListener('click', event => {
 exportButton.addEventListener('click', () => { void exportMarkdown('local') })
 exportShareButton.addEventListener('click', () => { void exportMarkdown('share') })
 document.addEventListener('visibilitychange', () => schedulePoll(0))
-for (const button of themeOptions) button.addEventListener('click', () => setTheme(button.dataset.themeChoice))
+appearance.addEventListener('change', () => setTheme(appearance.value))
 let savedTheme
 try { savedTheme = localStorage.getItem(themeKey) } catch { /* Use the default theme. */ }
 setTheme(savedTheme, false)
