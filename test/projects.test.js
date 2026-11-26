@@ -33,6 +33,25 @@ const codexRow = (role, ...blocks) => ({
 const codexMeta = (cwd, id) => ({ type: 'session_meta', payload: { id, cwd } });
 const jsonl = row => JSON.stringify(row) + '\n';
 
+test('text-only conversation reads retain the messages without collecting tool traces', async t => {
+  const { root, cwd } = await fixture(t);
+  const file = path.join(root, 'sessions', 'text-only.jsonl');
+  await writeJsonl(file, [
+    codexMeta(cwd, 'text-only'),
+    codexRow('user', 'Question'),
+    { type: 'response_item', payload: { type: 'function_call', name: 'read', call_id: 'call-1', arguments: '{}' } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-1', output: 'historical tool result' } },
+    codexRow('assistant', 'Reply'),
+  ]);
+  const archive = { kind: 'codex', root, file };
+  const config = { agentRoots: { codex: [root] } };
+  const full = await readConversationHistory(archive, cwd, config);
+  const text = await readConversationHistory(archive, cwd, config, { includeTrace: false });
+  assert.equal(full.trace.length, 2);
+  assert.deepEqual(text.trace, []);
+  assert.deepEqual(text.messages.map(message => [message.role, message.text]), [['user', 'Question'], ['assistant', 'Reply']]);
+});
+
 async function writeZstd(file, chunks) {
   await mkdir(path.dirname(file), { recursive: true });
   await pipeline(Readable.from(chunks), zlib.createZstdCompress(), createWriteStream(file));

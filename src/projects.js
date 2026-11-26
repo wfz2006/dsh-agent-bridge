@@ -485,7 +485,7 @@ async function antigravityProjects(root) {
   return projects;
 }
 
-export async function scanProjects(config) {
+export async function scanProjects(config, { includeTranscripts = true } = {}) {
   const projects = [];
   const sources = [];
   const discovered = new Map();
@@ -518,19 +518,21 @@ export async function scanProjects(config) {
 
   await Promise.all([
     scan('workspacehub', 'Agent Workspace Manager', config.workspaceHubRoots ?? [], workspaceProjects),
-    scan('agentsview', 'AgentsView 会话归档', config.archiveFiles ?? [], archivedProjects),
-    ...Object.entries({
-      codex: codexProjects, claude: root => jsonlProjects(root, 'claude'),
-      opencode: opencodeProjects, workbuddy: root => jsonlProjects(root, 'workbuddy'),
-      qoder: root => jsonlProjects(root, 'qoder'), qwen: root => jsonlProjects(root, 'qwen', ['projects'], 2),
-      trae: root => editorProjects(root, 'trae'), copilot: root => editorProjects(root, 'copilot'),
-      gemini: geminiProjects,
-      antigravity: antigravityProjects,
-    }).map(([agent, load]) => scan(agent, agentLabels[agent], configuredRoots(config, agent), load, {
-      trae: '支持工作区元数据；会话可从 AgentsView 读取已归档部分',
-      copilot: '支持 VS Code 工作区会话及本机会话库；其他版本可从 AgentsView 读取已归档部分',
-      antigravity: '支持工作区元数据和 CLI 提示记录；完整会话可从 AgentsView 读取已归档部分',
-    }[agent])),
+    ...(includeTranscripts ? [
+      scan('agentsview', 'AgentsView 会话归档', config.archiveFiles ?? [], archivedProjects),
+      ...Object.entries({
+        codex: codexProjects, claude: root => jsonlProjects(root, 'claude'),
+        opencode: opencodeProjects, workbuddy: root => jsonlProjects(root, 'workbuddy'),
+        qoder: root => jsonlProjects(root, 'qoder'), qwen: root => jsonlProjects(root, 'qwen', ['projects'], 2),
+        trae: root => editorProjects(root, 'trae'), copilot: root => editorProjects(root, 'copilot'),
+        gemini: geminiProjects,
+        antigravity: antigravityProjects,
+      }).map(([agent, load]) => scan(agent, agentLabels[agent], configuredRoots(config, agent), load, {
+        trae: '支持工作区元数据；会话可从 AgentsView 读取已归档部分',
+        copilot: '支持 VS Code 工作区会话及本机会话库；其他版本可从 AgentsView 读取已归档部分',
+        antigravity: '支持工作区元数据和 CLI 提示记录；完整会话可从 AgentsView 读取已归档部分',
+      }[agent])),
+    ] : []),
   ]);
 
   for (const cwd of config.projectRoots ?? []) projects.push({ cwd, agent: 'manual' });
@@ -708,13 +710,14 @@ function traceCallId(value) {
 }
 
 function addSummary(result, text, time, id) {
+  if (!result.events && !result.trace) return;
   const value = result.events ? traceValue(text) : cleanTraceText(text);
   if (!value.trim()) return;
   addTrace(result, { kind: 'summary', text: value, status: 'ok', time: dateMillis(time), id });
 }
 
 function addToolCall(result, name, callId, input, time) {
-  if (typeof name !== 'string' || !name.trim()) return;
+  if ((!result.events && !result.trace) || typeof name !== 'string' || !name.trim()) return;
   addTrace(result, {
     kind: 'tool_call', name: name.trim().slice(0, 120),
     callId: traceCallId(callId),
@@ -1128,6 +1131,7 @@ function readCodexRow(result, row) {
     return;
   }
   if (payload?.type === 'reasoning') {
+    if (!result.events && !result.trace) return;
     // Only the visible summary is retained; encrypted reasoning has no text.
     const summary = Array.isArray(payload.summary) ? payload.summary : [];
     const text = summary.filter(item => item?.type === 'summary_text' && typeof item.text === 'string')
@@ -1141,6 +1145,7 @@ function readCodexRow(result, row) {
     return;
   }
   if (payload?.type === 'function_call_output' || payload?.type === 'custom_tool_call_output') {
+    if (!result.events && !result.trace) return;
     const output = payload.output ?? payload.content;
     const text = result.events ? traceValue(sourceToolOutput(result, output, payload.call_id))
       : (Array.isArray(output)
@@ -1755,20 +1760,20 @@ export async function probeConversation(archive, options) {
   return reason ? { state: 'unknown', reason } : { state: 'empty' };
 }
 
-export async function readConversationHistory(archive, cwd, config) {
+export async function readConversationHistory(archive, cwd, config, { includeTrace = true } = {}) {
   const result = {
     messages: [], usedSkills: new Set(), limits: conversationLimits, characters: 0, truncated: false,
-    trace: [], traceKeys: new Set(), traceOrder: 0, messageSeq: 0, turn: 0, turnRef: undefined,
+    ...(includeTrace ? { trace: [], traceKeys: new Set(), traceOrder: 0, messageSeq: 0, turn: 0, turnRef: undefined } : {}),
     readStats: { userMessages: 0, assistantMessages: 0, timedMessages: 0 },
   };
   await readHistory(archive, cwd, config, result);
   const calls = new Map();
-  for (const item of result.trace) {
+  for (const item of result.trace ?? []) {
     if (item.kind !== 'tool_call') continue;
     item.status = 'missing';
     if (item.callId) calls.set(item.callId, item);
   }
-  for (const item of result.trace) {
+  for (const item of result.trace ?? []) {
     if (item.kind !== 'tool_result') continue;
     const call = calls.get(item.callId);
     item.turnRef = call?.turnRef;
@@ -1794,7 +1799,7 @@ export async function readConversationHistory(archive, cwd, config) {
   // The last displayed reply in each source turn is its disclosure anchor.
   // A turn without a reply is anchored to its own user message.
   const indexOf = new Map(retained.map((message, index) => [message.turnRef, index]));
-  const trace = result.trace
+  const trace = (result.trace ?? [])
     .filter(item => item.turnRef !== undefined && indexOf.has(item.turnRef))
     .map(({ turnRef, ...item }) => ({ ...item, messageIndex: indexOf.get(turnRef) }))
     .sort((a, b) => a.turn - b.turn || a.order - b.order);

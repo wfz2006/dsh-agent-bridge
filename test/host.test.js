@@ -180,13 +180,22 @@ test('the panel authenticates, refreshes changed project files, and exports revi
     }
     assert.equal((await fetch(preview, { headers })).status, 404)
     const downloadUrl = base + `conversation-export?sessionId=${traceSessionId}&format=share`
-    const response = await fetch(downloadUrl, { headers })
-    assert.match(response.headers.get('content-disposition'), /^attachment/)
+    const unreviewed = await fetch(downloadUrl, { headers })
+    assert.equal(unreviewed.status, 409)
+    assert.equal(unreviewed.headers.get('content-disposition'), null)
+    const previewUrl = base + `conversation-share-preview?sessionId=${traceSessionId}`
+    assert.equal((await fetch(previewUrl, { headers: { Cookie: 'signed-in=guest' } })).status, 403)
+    const response = await fetch(previewUrl, { headers })
+    assert.match(response.headers.get('content-type'), /^text\/plain/)
+    assert.equal(response.headers.get('content-disposition'), null)
     const fullMarkdown = await response.text()
     assert.ok(fullMarkdown.includes('```csharp\r\nfirst\r\n\r\nlast\r\n```'))
     assert.ok(!fullMarkdown.includes('archive-call'))
     assert.ok(!fullMarkdown.includes(directory))
-    assert.match(await (await fetch(downloadUrl + '&includeTrace=true', { headers })).text(), /archive-call/)
+    assert.match(await (await fetch(previewUrl + '&includeTrace=true', { headers })).text(), /archive-call/)
+    const localHistory = await fetch(downloadUrl.replace('format=share', 'format=local'), { headers })
+    assert.match(localHistory.headers.get('content-disposition'), /^attachment/)
+    assert.match(await localHistory.text(), /file:\/\//)
     for (const path of Object.values(listing.agentIcons)) {
       const icon = await fetch(base + path, { headers })
       assert.equal(icon.status, 200, path)

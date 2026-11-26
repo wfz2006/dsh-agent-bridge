@@ -205,7 +205,6 @@ async function fixture(t) {
   const asset = { ...scannedAsset, id: 'a'.repeat(24) }
   const dsh = fakeDsh()
   const bridge = createSkillBridge(dsh.ctx, {
-    loadProvider: async () => ({ FileSystemSkillProvider: FakeFileSystemSkillProvider }),
     storeRoot,
   })
   await bridge.ready
@@ -260,7 +259,6 @@ test('an external store update invalidates another bridge provider cache', async
   const { project, asset, storeRoot, bridge } = await fixture(t)
   const otherDsh = fakeDsh()
   const other = createSkillBridge(otherDsh.ctx, {
-    loadProvider: async () => ({ FileSystemSkillProvider: FakeFileSystemSkillProvider }),
     storeRoot,
   })
   t.after(() => {

@@ -144,6 +144,7 @@
             </header>
             <p id="recent-status" class="recent-status" role="status"></p>
             <ul id="recent-conversations" class="conversation-list" aria-label="最近对话"></ul>
+            <button id="project-relay" class="text-action" type="button">项目接力单</button>
             <button id="browse-history" class="text-action" type="button" hidden>
               <span id="browse-history-label">查看全部对话</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg>
             </button>
@@ -214,8 +215,15 @@
           <div class="field">
             <svg class="icon field-icon" aria-hidden="true"><use href="#icon-search"/></svg>
             <label class="sr-only" for="history-search">搜索来源对话</label>
-            <input id="history-search" type="search" placeholder="搜对话标题或 Agent" autocomplete="off">
+            <input id="history-search" type="search" placeholder="搜本项目的对话正文" autocomplete="off" maxlength="200">
             <button class="clear-search icon-button" id="clear-history-search" type="button" aria-label="清除对话搜索" hidden><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+          </div>
+          <div class="history-search-tools">
+            <select id="history-search-scope" aria-label="对话搜索范围">
+              <option value="body">正文</option>
+              <option value="title">标题或 Agent</option>
+            </select>
+            <span id="history-selected-count" class="muted" role="status"></span>
           </div>
           <p id="history-empty" class="recent-status" role="status"></p>
           <ul id="history-results" class="conversation-list" aria-label="来源对话"></ul>
@@ -227,7 +235,7 @@
         </div>
         <div id="history-back" class="history-back" hidden>
           <button id="history-back-button" class="text-action" type="button">
-            <svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg>返回对话列表
+            <svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg>返回对话搜索
           </button>
         </div>
         <div id="dialog-text" class="dialog-text" tabindex="0"></div>
@@ -244,17 +252,22 @@
         </details>
       </div>
       <footer class="dialog-actions">
+        <button id="relay-return" class="secondary" type="button" hidden>项目接力单</button>
+        <button id="relay-pick" class="secondary" type="button" hidden>从对话选内容</button>
+        <button id="relay-export" class="primary" type="button" hidden>审阅并导出接力单</button>
         <label id="export-trace-option" class="export-trace-option" hidden>
           <input type="checkbox" id="export-trace">
           <span>附带来源记录（工具名与结果摘录）</span>
         </label>
         <a id="export-download" class="secondary" download hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>下载 Markdown</a>
         <button id="export" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出本机版</button>
-        <button id="export-share" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>导出分享版</button>
+        <button id="export-share" class="secondary" type="button" hidden><svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"/></svg>审阅分享版</button>
         <button id="recover-draft" class="secondary" type="button" hidden>打开已创建的会话</button>
         <button id="skill-undo" class="secondary" type="button" hidden>恢复上一版</button>
         <button id="skill-deactivate" class="secondary" type="button" hidden>停用技能</button>
         <button id="skill-apply" class="primary" type="button" hidden><span id="skill-apply-label">启用技能</span><svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+        <button id="history-copy" class="secondary" type="button" hidden>另开副本</button>
+        <button id="history-open-existing" class="primary" type="button" hidden>打开已有会话<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
         <button id="history-import" class="primary" type="button" hidden><span id="history-import-label">迁入并继续</span><svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
         <button id="import" class="primary" type="button" hidden>打开新对话<svg class="icon button-icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
       </footer>

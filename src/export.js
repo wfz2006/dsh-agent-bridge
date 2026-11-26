@@ -209,6 +209,7 @@ export function makeExport({
   const heading = clean(title) || '项目交接'
   const session = origin === 'DSH 会话'
   const mode = format === 'share' ? 'share' : 'local'
+  const filename = filenameOf(mode === 'share' ? 'share' : heading, date)
   const exportFile = typeof savePath === 'string' && path.isAbsolute(savePath) ? savePath : undefined
   const legacy = typeof prompt === 'string' && prompt.trim() && !Array.isArray(preview.sections)
   const sections = Array.isArray(preview.sections)
@@ -238,7 +239,7 @@ export function makeExport({
     lines.push(fenceSafe(prompt), '')
     if (truncated) lines.push('> 部分内容已截取，完整内容见来源文件。', '')
     if (preview.footer) lines.push(`> ${clean(preview.footer, 200)}`, '')
-    return { filename: filenameOf(heading, date), markdown: `${lines.join('\n').trimEnd()}\n` }
+    return { filename, markdown: `${lines.join('\n').trimEnd()}\n` }
   }
 
   if (files.length) {
@@ -269,5 +270,5 @@ export function makeExport({
   if (truncated) lines.push('> 部分内容已截取，完整内容见来源文件。', '')
   if (preview.footer) lines.push(`> ${clean(preview.footer, 200)}`, '')
 
-  return { filename: filenameOf(heading, date), markdown: `${lines.join('\n').trimEnd()}\n` }
+  return { filename, markdown: `${lines.join('\n').trimEnd()}\n` }
 }

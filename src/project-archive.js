@@ -143,3 +143,26 @@ export async function writeProjectContinuation(config, projectId) {
       RETURNING continued_at`).get(projectId, Date.now()).continued_at
   })
 }
+
+export async function readProjectRelay(config, projectId) {
+  return await readArchive(config, db => {
+    if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE name='project_relay' AND type='table'").get()) return []
+    return db.prepare('SELECT item FROM project_relay WHERE project_id=? ORDER BY rowid')
+      .all(projectId).map(row => JSON.parse(row.item))
+  }) ?? []
+}
+
+export async function changeProjectRelay(config, projectId, id, change) {
+  return writeArchive(config, true, db => {
+    db.exec(`CREATE TABLE IF NOT EXISTS project_relay (
+      project_id TEXT NOT NULL, id TEXT NOT NULL, item TEXT NOT NULL, PRIMARY KEY (project_id,id)
+    ) STRICT`)
+    const row = db.prepare('SELECT item FROM project_relay WHERE project_id=? AND id=?').get(projectId, id)
+    const item = change(row && JSON.parse(row.item))
+    if (item) {
+      db.prepare(`INSERT INTO project_relay VALUES (?,?,?) ON CONFLICT(project_id,id)
+        DO UPDATE SET item=excluded.item`).run(projectId, id, JSON.stringify(item))
+    } else db.prepare('DELETE FROM project_relay WHERE project_id=? AND id=?').run(projectId, id)
+    return item ?? null
+  })
+}

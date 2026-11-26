@@ -112,6 +112,12 @@ export function apply(ctx) {
       if (!host) throw Object.assign(new Error('当前 DSH 未提供会话迁入服务。'), { status: 409 })
       return saveNativeSession(host, record, cwd)
     },
+    async canOpenConversation(id) {
+      const host = services()
+      if (!host || host.workspaces.archivedSessionIds?.includes(id)) return false
+      if (!host.persistence.stat) return true
+      return (await host.persistence.stat(id))?.header?.id === id
+    },
     skillHandoff,
     loadSourceRecord,
   })
@@ -123,6 +129,9 @@ export function apply(ctx) {
     ['/reader.css', 'reader.css', 'text/css; charset=utf-8'],
     ['/inline-process.css', 'inline-process.css', 'text/css; charset=utf-8'],
     ['/panel.js', 'panel.js', 'text/javascript; charset=utf-8'],
+    ['/relay-categories.js', 'relay-categories.js', 'text/javascript; charset=utf-8'],
+    ['/share-review.js', 'share-review.js', 'text/javascript; charset=utf-8'],
+    ['/share-redaction.js', 'share-redaction.js', 'text/javascript; charset=utf-8'],
     ['/project-context.js', 'project-context.js', 'text/javascript; charset=utf-8'],
     ['/markdown.js', 'markdown.js', 'text/javascript; charset=utf-8'],
     ['/vendor/markdown-it.mjs', 'vendor/markdown-it.mjs', 'text/javascript; charset=utf-8'],
@@ -177,7 +186,8 @@ export function apply(ctx) {
       return
     }
     const input = await readBody(req)
-    const conversationAction = ['list-conversations', 'preview-conversation', 'import-conversation'].includes(input.action)
+    const conversationAction = ['list-conversations', 'search-conversations', 'conversation-import-status', 'preview-conversation',
+      'preview-conversation-context', 'import-conversation'].includes(input.action)
     const nativeSessionImport = (conversationAction || input.action === 'catalog') && Boolean(services())
     if (conversationAction && !nativeSessionImport) {
       json(res, 403, { error: '请在支持会话迁入的本机 DSH 主界面中使用。' })
@@ -251,25 +261,27 @@ export function apply(ctx) {
       'Content-Disposition': attachmentDisposition(attachment.name, `${attachmentId.slice(0, 12)}.${extension}`, inline) })
     res.end(attachment.bytes)
   })
-  register('/conversation-export', 'GET', async (req, res) => {
-    const query = new URL(req.url ?? '/', 'http://localhost').searchParams
+  async function streamConversationMarkdown(query, res, format) {
     const { config, stored } = await loadArchive(query.get('sessionId'))
     async function* pages() {
       let cursor
       do {
         const page = await readHistoryPage(config, stored.id, cursor)
-        if (!page || res.destroyed) return
+        if (res.destroyed) return
+        if (!page) throw new Error('The source archive is no longer available')
         yield page
         cursor = page.nextCursor
       } while (cursor)
     }
-    res.writeHead(200, { ...pageHeaders, 'Content-Type': 'text/markdown; charset=utf-8',
-      'Content-Disposition': 'attachment; filename="agent-conversation.md"' })
+    res.writeHead(200, format === 'share'
+      ? { ...pageHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+      : { ...pageHeaders, 'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="agent-conversation.md"' })
     try {
       const signal = new AbortController()
       res.once('close', () => signal.abort())
       for await (const chunk of sourceHistoryMarkdown(stored, pages(), {
-        format: query.get('format'), includeTrace: query.get('includeTrace') === 'true',
+        format, includeTrace: query.get('includeTrace') === 'true',
       })) {
         if (res.destroyed) return
         if (chunk && !res.write(chunk)) await once(res, 'drain', { signal: signal.signal })
@@ -278,5 +290,16 @@ export function apply(ctx) {
     } catch (error) {
       if (!res.destroyed) res.destroy(error)
     }
+  }
+  register('/conversation-export', 'GET', async (req, res) => {
+    const query = new URL(req.url ?? '/', 'http://localhost').searchParams
+    if (query.get('format') === 'share') {
+      json(res, 409, { error: '请在来源记录中审阅并确认分享版后下载。' })
+      return
+    }
+    await streamConversationMarkdown(query, res, 'local')
+  })
+  register('/conversation-share-preview', 'GET', async (req, res) => {
+    await streamConversationMarkdown(new URL(req.url ?? '/', 'http://localhost').searchParams, res, 'share')
   })
 }

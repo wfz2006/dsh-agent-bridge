@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import { listProjectAssets, verifyAssetSource } from '../src/assets.js'
 import { createCatalog } from '../src/catalog.js'
 import { SkillActivationStore, SkillHandoff } from '../src/skill-handoff.js'
-import { copySkillPackage, readSkillPackage } from '../src/skill-package.js'
+import { copySkillPackage, PACKAGE_MAX_BYTES, readSkillPackage } from '../src/skill-package.js'
 
 test('marks project skill availability and omits an enabled skill body from the revised draft', async t => {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dsh-skill-catalog-')))
@@ -266,6 +266,18 @@ test('the package copy entry rejects file identities replaced after reading', as
   await assert.rejects(stat(destination), { code: 'ENOENT' })
 })
 
+test('rejects hardlinked resources and oversized flat skills during package inspection', async t => {
+  const { root, skillRoot } = await proofFixture(t)
+  const external = path.join(root, 'external.txt')
+  await writeFile(external, 'unrelated content')
+  await link(external, path.join(skillRoot, 'references', 'linked.txt'))
+  await assert.rejects(readSkillPackage(path.join(skillRoot, 'SKILL.md')), { code: 'unsafe-file' })
+  const flat = path.join(root, 'example.md')
+  await writeFile(flat, '---\nname: example\ndescription: Fixture.\n---\n')
+  await truncate(flat, PACKAGE_MAX_BYTES + 1)
+  await assert.rejects(readSkillPackage(flat), { code: 'package-too-large' })
+})
+
 test('still accepts a skill discovered through an explicitly allowed shared root', async t => {
   const { root, projectRoot, skillRoot, handoff, project } = await proofFixture(t)
   const sharedRoot = path.join(root, 'shared')
@@ -287,4 +299,25 @@ Shared body.
   assert.ok(asset)
   const preview = await handoff.preview(project, [asset])
   assert.equal(preview.items[0].action, 'enable')
+})
+
+test('reads quoted invocation keys and fails closed on unsupported YAML policy', async t => {
+  const { skillRoot } = await proofFixture(t)
+  const file = path.join(skillRoot, 'SKILL.md')
+  const putPolicy = policy => writeFile(file, ['---', 'name: scope-probe', 'description: Fixture.', ...policy, '---', 'Body.'].join('\n'))
+  await putPolicy(["'disable-model-invocation': true", 'user-invocable : false', 'metadata:', '  version: "1.0"', '  count: 2'])
+  const packageInfo = await readSkillPackage(file)
+  assert.deepEqual(packageInfo.invocation, { modelInvocable: false, userInvocable: false })
+  assert.deepEqual({ ...packageInfo.metadata }, { version: '1.0', count: 2 })
+  await putPolicy(['"disable\\u002dmodel-invocation": true'])
+  assert.equal((await readSkillPackage(file)).invocation.modelInvocable, false)
+  for (const policy of [
+    ['settings: &policy {disable-model-invocation: true}', '<<: *policy'],
+    ['disable-model-invocation: *policy'],
+    ['disable-model-invocation:', '  - false'],
+    ['disable-model-invocation: true', 'disable-model-invocation: false'],
+  ]) {
+    await putPolicy(policy)
+    await assert.rejects(readSkillPackage(file), /policy|boolean|frontmatter|duplicate/i)
+  }
 })

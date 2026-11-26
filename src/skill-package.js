@@ -1,26 +1,17 @@
-import { constants } from 'node:fs'
-import { chmod, lstat, mkdir, open, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import { constants } from 'node:fs'
+import { lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { verifySourceAuthorization } from './assets.js'
-
-// File discovery, frontmatter parsing, and package limits are adapted from
-// dsh-mode-skills commit 706595127984c9bc87627f77d2a8e288b8dcbbbb
-// (MIT). See THIRD_PARTY_NOTICES.md.
 
 export const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 export const PACKAGE_MAX_FILES = 1000
 export const PACKAGE_MAX_BYTES = 25 * 1024 * 1024
-const SKIPPED = new Set(['.git', '.DS_Store'])
-const SENSITIVE_NAMES = new Set([
-  '.env', '.git-credentials', '.netrc', '.npmrc', '.pypirc',
-  'auth.json', 'credentials.json', 'id_ecdsa', 'id_ed25519', 'id_rsa', 'secrets.json',
-])
-const SENSITIVE_EXTENSIONS = new Set(['.key', '.p12', '.pem', '.pfx'])
-const SCRIPT_EXTENSIONS = new Set([
-  '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd', '.py',
-  '.js', '.mjs', '.cjs', '.ts', '.rb', '.pl', '.php', '.lua',
-])
+const skipNames = new Set(['.git', '.DS_Store'])
+const scriptName = /\.(?:sh|bash|zsh|fish|ps1|bat|cmd|py|js|mjs|cjs|ts|rb|pl|php|lua)$/i
+const credentialName = /^(?:\.env(?:\..+)?|\.git-credentials|\.netrc|\.npmrc|\.pypirc|auth\.json|credentials\.json|secrets\.json|id_(?:ecdsa|ed25519|rsa))$|\.(?:key|p12|pem|pfx)$/i
+const safeEnvExample = /^\.env\.(?:example|sample|template)$/i
 
 export class SkillPackageError extends Error {
   constructor(code, message, details) {
@@ -31,387 +22,378 @@ export class SkillPackageError extends Error {
   }
 }
 
-function pathKey(value) {
-  const normalized = path.normalize(value)
+function pathKey(file) {
+  const normalized = path.normalize(file)
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
-function isPathInside(root, file) {
-  const relative = path.relative(pathKey(root), pathKey(file))
-  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+function relativePath(root, file) {
+  const relative = path.relative(root, file)
+  return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)
+    ? relative : undefined
 }
 
-function unquote(value) {
-  const text = value.trim()
-  if (text.length >= 2 && ((text.startsWith('"') && text.endsWith('"'))
-    || (text.startsWith("'") && text.endsWith("'")))) {
-    return text.startsWith('"')
-      ? text.slice(1, -1).replace(/\\(["\\nt])/g, (_, escaped) => ({ n: '\n', t: '\t' })[escaped] ?? escaped)
-      : text.slice(1, -1).replaceAll("''", "'")
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
+}
+
+function changed() {
+  return new SkillPackageError('source-changed', 'The skill source changed while it was being read.')
+}
+
+function protectName(name) {
+  if (credentialName.test(name) && !safeEnvExample.test(name)) {
+    throw new SkillPackageError('sensitive-file', 'A skill package contains a credential-like file and was not copied.')
   }
-  return text
+}
+
+function yamlScalar(text) {
+  const raw = text.trim()
+  const quote = raw[0]
+  if (quote !== '"' && quote !== "'") return raw.replace(/[ \t]+#.*$/, '').trimEnd()
+  const pairs = quote === '"' ? /^"((?:[^"\\]|\\.)*)"[ \t]*(?:#.*)?$/ : /^'((?:[^']|'')*)'[ \t]*(?:#.*)?$/
+  const match = pairs.exec(raw)
+  if (!match) throw new SkillPackageError('invalid-frontmatter', 'The skill contains a malformed quoted value.')
+  if (quote === "'") return match[1].replaceAll("''", "'")
+  const escapes = {
+    '0': '\0', a: '\x07', b: '\b', t: '\t', n: '\n', v: '\v', f: '\f', r: '\r', e: '\x1b',
+    ' ': ' ', '"': '"', '/': '/', '\\': '\\', N: '\u0085', _: '\u00a0', L: '\u2028', P: '\u2029',
+  }
+  return match[1].replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)/g, (_, escaped) => {
+    if (Object.hasOwn(escapes, escaped)) return escapes[escaped]
+    const codepoint = escaped.length > 1 ? Number.parseInt(escaped.slice(1), 16) : -1
+    if (codepoint < 0 || codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
+      throw new SkillPackageError('invalid-frontmatter', 'The skill contains an unsupported YAML escape.')
+    }
+    return String.fromCodePoint(codepoint)
+  })
+}
+
+function blockScalar(rows, mode) {
+  const indent = rows.reduce((min, line) => line.trim() ? Math.min(min, line.match(/^[ \t]*/)[0].length) : min, Infinity)
+  const dedented = rows.map(line => line.slice(indent))
+  if (mode === '|') return dedented.join('\n')
+  return dedented.reduce((value, line, index) => {
+    const previous = dedented[index - 1]
+    const separator = previous === undefined ? '' : previous && line ? ' ' : '\n'
+    return value + separator + line
+  }, '')
+}
+
+const fieldPattern = /^([A-Za-z_][\w.-]*|"[^"\\]*(?:\\.[^"\\]*)*"|'(?:[^']|'')*')[ \t]*:[ \t]*(.*)$/
+const spaces = line => line.match(/^[ \t]*/)[0].length
+const policyKeys = new Set(['disable-model-invocation', 'user-invocable'])
+
+function metadataValue(value, children) {
+  if (value.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    } catch { /* Non-JSON flow mappings are outside the supported metadata subset. */ }
+    return undefined
+  }
+  if (value || !children.length) return undefined
+  const metadata = Object.create(null)
+  const indent = spaces(children[0])
+  for (const line of children) {
+    const entry = fieldPattern.exec(line.slice(indent))
+    if (spaces(line) !== indent || !entry || !entry[2]) return undefined
+    const key = yamlScalar(entry[1])
+    if (Object.hasOwn(metadata, key)) return undefined
+    const scalar = yamlScalar(entry[2])
+    if (/^[\[{&*!|>]/.test(scalar) && !/^[\"']/.test(entry[2])) return undefined
+    if (/^[\"']/.test(entry[2])) metadata[key] = scalar
+    else if (/^(?:null|~)$/i.test(scalar)) metadata[key] = null
+    else if (/^(?:true|false)$/i.test(scalar)) metadata[key] = scalar.toLowerCase() === 'true'
+    else if (/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(scalar) && Number.isFinite(Number(scalar))) {
+      metadata[key] = Number(scalar)
+    } else metadata[key] = scalar
+  }
+  return metadata
 }
 
 export function parseSkillFile(text) {
-  const match = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text)
-  if (match === null) return { fields: {}, body: text }
-  const fields = {}
-  const lines = match[1].split(/\r?\n/)
-  for (let index = 0; index < lines.length; index++) {
-    const line = /^([A-Za-z][\w-]*):(?:[ \t]+(.*))?$/.exec(lines[index])
-    if (line === null) continue
-    const [, key, raw = ''] = line
-    const block = /^([|>])([+-]?)\s*$/.exec(raw.trim())
-    if (block === null) {
-      if (raw.trim() !== '') fields[key] = unquote(raw)
-      continue
+  const opening = /^\uFEFF?---[ \t]*\r?\n/.exec(text)
+  const fields = Object.create(null)
+  if (!opening) return { fields, body: text }
+  const boundary = /^---[ \t]*(?:\r?\n|$)/gm
+  boundary.lastIndex = opening[0].length
+  const end = boundary.exec(text)
+  if (!end) return { fields, body: text }
+  const header = text.slice(opening[0].length, end.index)
+  const rows = header.replace(/\r?\n$/, '').split(/\r?\n/)
+  const meaningful = line => Boolean(line.trim() && !line.trimStart().startsWith('#'))
+  const indent = rows.reduce((min, line) => meaningful(line) ? Math.min(min, spaces(line)) : min, Infinity)
+  for (let row = 0; row < rows.length; row++) {
+    if (!meaningful(rows[row])) continue
+    const property = spaces(rows[row]) === indent && fieldPattern.exec(rows[row].slice(indent))
+    if (!property) {
+      throw new SkillPackageError('invalid-frontmatter', 'The skill frontmatter contains an unsupported YAML field or policy.')
     }
-    const collected = []
-    while (index + 1 < lines.length && (lines[index + 1].trim() === '' || /^[ \t]/.test(lines[index + 1]))) {
-      collected.push(lines[++index])
+    const key = yamlScalar(property[1])
+    const value = property[2].trimEnd()
+    if (Object.hasOwn(fields, key) || key === '<<') {
+      throw new SkillPackageError('invalid-frontmatter', 'The skill frontmatter contains a duplicate field or YAML merge.')
     }
-    const indent = Math.min(...collected.filter(entry => entry.trim() !== '')
-      .map(entry => /^[ \t]*/.exec(entry)[0].length))
-    const rows = collected.map(entry => entry.slice(Number.isFinite(indent) ? indent : 0))
-    const joined = block[1] === '|' ? rows.join('\n') : rows.join('\n').replace(/([^\n])\n(?=[^\n])/g, '$1 ')
-    fields[key] = block[2] === '+' ? joined : joined.replace(/\s+$/, '')
+    const children = []
+    while (row + 1 < rows.length && (!meaningful(rows[row + 1]) || spaces(rows[row + 1]) > indent)) {
+      children.push(rows[++row])
+    }
+    const operator = /^([|>])([+-]?)[ \t]*(?:#.*)?$/.exec(value)
+    if (key === 'metadata') {
+      fields[key] = metadataValue(value, children.filter(meaningful))
+    } else if (operator) {
+      const block = blockScalar(children.filter(line => !line.trim() || spaces(line) > indent), operator[1])
+      fields[key] = operator[2] === '+' ? block : block.trimEnd()
+    } else {
+      if (policyKeys.has(key) && children.some(meaningful)) {
+        throw new SkillPackageError('invalid-invocation', 'The skill invocation policy must use a scalar value.')
+      }
+      fields[key] = yamlScalar(value)
+    }
   }
-  return { fields, body: text.slice(match[0].length) }
+  return { fields, body: text.slice(boundary.lastIndex) }
 }
 
-function frontmatterBoolean(fields, key) {
-  if (!Object.hasOwn(fields, key)) return undefined
-  const value = fields[key]
-  if (typeof value === 'boolean') return value
-  if (value === 1 || value === '1') return true
-  if (value === 0 || value === '0') return false
-  if (typeof value === 'string') {
-    const normalized = value.toLowerCase()
-    if (['true', 'yes', 'on'].includes(normalized)) return true
-    if (['false', 'no', 'off'].includes(normalized)) return false
+function readInvocation(fields) {
+  function flag(name, fallback) {
+    if (!Object.hasOwn(fields, name)) return fallback
+    const value = fields[name].toLowerCase()
+    if (/^(?:true|yes|on|1)$/.test(value)) return true
+    if (/^(?:false|no|off|0)$/.test(value)) return false
+    throw new SkillPackageError('invalid-invocation', 'Frontmatter ' + name + ' must be a boolean.')
   }
-  throw new SkillPackageError('invalid-invocation', `Frontmatter ${key} must be a boolean.`)
-}
-
-function invocationPolicy(fields) {
-  if (Object.hasOwn(fields, 'disableModelInvocation') || Object.hasOwn(fields, 'modelInvocable')
-    || Object.hasOwn(fields, 'userInvocable')) {
-    throw new SkillPackageError('invalid-invocation', 'Skill invocation fields must use the kebab-case names.')
+  if (['disableModelInvocation', 'modelInvocable', 'userInvocable'].some(name => Object.hasOwn(fields, name))) {
+    throw new SkillPackageError('invalid-invocation', 'Skill invocation fields must use kebab-case.')
   }
-  const modelDisabled = frontmatterBoolean(fields, 'disable-model-invocation')
-  const userDisabled = frontmatterBoolean(fields, 'user-invocable')
-  return {
-    modelInvocable: modelDisabled !== true,
-    userInvocable: userDisabled !== false,
-  }
+  return { modelInvocable: !flag('disable-model-invocation', false), userInvocable: flag('user-invocable', true) }
 }
 
 export function skillLocation(file) {
-  return path.basename(file) === 'SKILL.md'
-    ? { layout: 'directory', root: path.dirname(file), file }
-    : { layout: 'flat', root: path.dirname(file), file }
+  return { layout: path.basename(file) === 'SKILL.md' ? 'directory' : 'flat', root: path.dirname(file), file }
 }
 
-async function stableFileBuffer(file, expected) {
+async function scanFile(root, entry, info, rel) {
+  const target = await realpath(entry)
+  const relative = relativePath(root, target)
+  if (relative === undefined) throw new SkillPackageError('unsafe-link', 'A skill links outside its package.')
+  if (info.isSymbolicLink()) {
+    relative.split(path.sep).forEach(protectName)
+    info = await lstat(target, { bigint: true })
+    if (!info.isFile()) throw new SkillPackageError('unsafe-link', 'A skill link must resolve to a regular file.')
+  } else if (pathKey(entry) !== pathKey(target)) throw changed()
+  if (!info.isFile() || info.nlink !== 1n) {
+    throw new SkillPackageError('unsafe-file', 'Skill files must be regular files without hard links.')
+  }
+  return { entry, path: target, rel, script: scriptName.test(rel), info }
+}
+
+async function readChecked(root, rootInfo, file) {
+  async function checkPath() {
+    const now = await lstat(root, { bigint: true })
+    if (!now.isDirectory() || now.dev !== rootInfo.dev || now.ino !== rootInfo.ino
+      || pathKey(await realpath(root)) !== pathKey(root)
+      || pathKey(await realpath(file.entry)) !== pathKey(file.path)) throw changed()
+  }
   let handle
   try {
-    handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    await checkPath()
+    handle = await open(file.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
     const before = await handle.stat({ bigint: true })
-    if (!before.isFile() || before.size !== expected.size
-      || before.dev !== expected.dev || before.ino !== expected.ino) {
-      throw new SkillPackageError('source-changed', 'A skill file changed while it was being read.')
+    if (!before.isFile() || before.nlink !== 1n || !sameIdentity(before, file.info)) throw changed()
+    const size = Number(before.size)
+    if (size > PACKAGE_MAX_BYTES) throw packageLimit()
+    const bytes = Buffer.allocUnsafe(size)
+    let progress = 0
+    while (progress < size) {
+      const { bytesRead } = await handle.read(bytes, progress, size - progress, progress)
+      if (!bytesRead) throw changed()
+      progress += bytesRead
     }
-    const bytes = await handle.readFile()
     const after = await handle.stat({ bigint: true })
-    if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs
-      || BigInt(bytes.length) !== after.size) {
-      throw new SkillPackageError('source-changed', 'A skill file changed while it was being read (read).')
-    }
+    await checkPath()
+    if (after.nlink !== 1n || !sameIdentity(before, after)
+      || !sameIdentity(after, await lstat(file.path, { bigint: true }))) throw changed()
     return bytes
+  } catch (error) {
+    if (error instanceof SkillPackageError) throw error
+    throw changed()
   } finally {
     await handle?.close()
   }
 }
 
-async function walkPackage(base, directory, files, totals) {
-  let entries
-  try {
-    entries = await readdir(directory, { withFileTypes: true })
-  } catch (error) {
-    throw new SkillPackageError('unreadable-package', `Cannot read skill directory: ${error.message}`)
+function packageLimit() {
+  return new SkillPackageError('package-too-large', 'The skill is too large to copy safely.', {
+    files: PACKAGE_MAX_FILES, bytes: PACKAGE_MAX_BYTES,
+  })
+}
+
+async function inventory(root, skillFile, layout) {
+  const files = []
+  let bytes = 0
+  function remember(file) {
+    bytes += Number(file.info.size)
+    if (bytes > PACKAGE_MAX_BYTES || files.length >= PACKAGE_MAX_FILES) throw packageLimit()
+    files.push(file)
   }
-  entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
-  for (const entry of entries) {
-    if (SKIPPED.has(entry.name)) continue
-    const lowerName = entry.name.toLowerCase()
-    const envFile = lowerName.startsWith('.env.')
-      && !['.env.example', '.env.sample', '.env.template'].includes(lowerName)
-    if (SENSITIVE_NAMES.has(lowerName) || envFile
-      || SENSITIVE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
-      throw new SkillPackageError('sensitive-file', 'A skill package contains a credential-like file and was not copied.')
-    }
-    const candidate = path.join(directory, entry.name)
-    let info
-    try {
-      info = await lstat(candidate, { bigint: true })
-    } catch (error) {
-      throw new SkillPackageError('unreadable-package', `Cannot inspect skill file: ${error.message}`)
-    }
-    let source = candidate
-    let type = info.isDirectory() ? 'directory' : info.isFile() ? 'file' : info.isSymbolicLink() ? 'link' : 'other'
-    if (type === 'link') {
-      let target
-      try {
-        target = await realpath(candidate)
-      } catch {
-        throw new SkillPackageError('unsafe-link', 'A skill contains a broken link.')
-      }
-      if (!isPathInside(base, target)) {
-        throw new SkillPackageError('unsafe-link', 'A skill links outside its package.')
-      }
-      const targetInfo = await stat(target, { bigint: true }).catch(() => undefined)
-      if (targetInfo?.isFile()) {
-        source = target
-        info = targetInfo
-        type = 'file'
-      } else if (targetInfo?.isDirectory()) {
-        throw new SkillPackageError('unsafe-link', 'A skill directory link is not accepted.')
-      } else {
-        throw new SkillPackageError('unsafe-link', 'A skill contains an unsupported link.')
+  if (layout === 'flat') {
+    remember(await scanFile(root, skillFile, await lstat(skillFile, { bigint: true }), 'SKILL.md'))
+    return { files, bytes }
+  }
+  const visit = async directory => {
+    if (pathKey(await realpath(directory)) !== pathKey(directory)) throw changed()
+    for (const name of (await readdir(directory)).sort()) {
+      if (skipNames.has(name)) continue
+      protectName(name)
+      const entry = path.join(directory, name)
+      const info = await lstat(entry, { bigint: true })
+      if (info.isDirectory()) await visit(entry)
+      else {
+        const rel = path.relative(root, entry).split(path.sep).join('/')
+        remember(await scanFile(root, entry, info, rel))
       }
     }
-    const relative = path.relative(base, candidate)
-    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      throw new SkillPackageError('unsafe-path', 'A skill path leaves its package.')
-    }
-    if (type === 'directory') {
-      await walkPackage(base, candidate, files, totals)
-      continue
-    }
-    if (type !== 'file') {
-      throw new SkillPackageError('special-file', 'A skill contains a special file.')
-    }
-    totals.files++
-    totals.bytes += Number(info.size)
-    if (totals.files > PACKAGE_MAX_FILES || totals.bytes > PACKAGE_MAX_BYTES) {
-      throw new SkillPackageError('package-too-large', 'The skill is too large to copy safely.', {
-        files: PACKAGE_MAX_FILES,
-        bytes: PACKAGE_MAX_BYTES,
-      })
-    }
-    const extension = path.extname(relative).toLowerCase()
-    files.push({
-      path: source,
-      rel: relative.split(path.sep).join('/'),
-      size: info.size,
-      mtimeNs: info.mtimeNs,
-      dev: info.dev,
-      ino: info.ino,
-      mode: Number(info.mode),
-      script: SCRIPT_EXTENSIONS.has(extension),
-    })
+    if (pathKey(await realpath(directory)) !== pathKey(directory)) throw changed()
   }
+  await visit(root)
+  return { files, bytes }
 }
 
-function hashFiles(files, buffers) {
-  const content = createHash('sha256')
-  for (const file of files) {
-    content.update(file.rel)
-    content.update('\0')
-    content.update(buffers.get(file.rel))
-    content.update('\n')
-  }
-  return content.digest('hex')
-}
-
-function quickHash(files) {
-  const quick = createHash('sha256')
-  for (const file of files) {
-    quick.update(`${file.rel}\0${file.size}\0${file.mtimeNs}\n`)
-  }
-  return quick.digest('hex')
-}
-
-function resourceSummary(files) {
-  const resources = { scripts: 0, references: 0, assets: 0 }
-  for (const file of files) {
-    if (file.rel.startsWith('scripts/')) resources.scripts++
-    else if (file.rel.startsWith('references/')) resources.references++
-    else if (file.rel.startsWith('assets/')) resources.assets++
-  }
-  return resources
-}
-
-/**
- * Read a skill directory bundle without following links outside it.
- * Content is read only when requested, while the quick hash always comes from
- * the stable path/size/mtime list.
- */
-export async function readSkillPackage(file, { content = false, authorization } = {}) {
+async function sourceLocation(file, authorization) {
   if (typeof file !== 'string' || !path.isAbsolute(file)) {
     throw new SkillPackageError('invalid-path', 'The skill path is not absolute.')
   }
   const location = skillLocation(file)
-  let base
-  let skillFile
-  let skillInfo
   try {
-    if (authorization) {
-      if (authorization.file !== file || authorization.directory !== location.root) {
-        throw new SkillPackageError('unsafe-path', 'The skill authorization does not match this package.')
-      }
-      const verified = await verifySourceAuthorization(authorization)
-      base = verified.directory
-      skillFile = verified.file
-      skillInfo = verified.fileInfo
-    } else {
-      base = await realpath(location.root)
-      skillFile = await realpath(location.file)
+    const authorized = authorization && await verifySourceAuthorization(authorization)
+    if (authorized && (authorized.file !== file || authorized.directory !== location.root)) {
+      throw new SkillPackageError('unsafe-path', 'The skill authorization does not match this package.')
     }
+    const root = authorized?.directory ?? await realpath(location.root)
+    const rootInfo = await lstat(root, { bigint: true })
+    if (!rootInfo.isDirectory()) throw new SkillPackageError('unsafe-path', 'The skill root is not a directory.')
+    const skillFile = path.join(root, path.basename(file))
+    await lstat(skillFile)
+    return { root, rootInfo, skillFile, layout: location.layout }
   } catch (error) {
     if (error instanceof SkillPackageError) throw error
-    if (error?.code === 'ASSET_SOURCE_CHANGED') {
-      throw new SkillPackageError('source-changed', 'The skill source changed or left its authorized root.')
+    if (error?.code === 'ASSET_SOURCE_CHANGED') throw changed()
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      throw new SkillPackageError('missing', 'The skill file or folder no longer exists.')
     }
-    throw new SkillPackageError('missing', 'The skill file or folder no longer exists.')
+    throw new SkillPackageError('unreadable-package', 'The skill package could not be inspected.')
   }
-  if (!isPathInside(base, skillFile) || !(await stat(skillFile)).isFile()) {
-    throw new SkillPackageError('unsafe-path', 'The skill file cannot be resolved inside its package.')
-  }
-  skillInfo ??= await lstat(skillFile, { bigint: true })
-  if (!skillInfo.isFile() || skillInfo.nlink > 1n) {
-    throw new SkillPackageError('unsafe-file', 'SKILL.md must be a regular file.')
-  }
-  const skillText = (await stableFileBuffer(skillFile, skillInfo)).toString('utf8')
-  const parsed = parseSkillFile(skillText)
-  const name = typeof parsed.fields.name === 'string' ? parsed.fields.name.trim() : ''
-  const description = typeof parsed.fields.description === 'string' ? parsed.fields.description.trim() : ''
-  if (!name || !description) {
-    throw new SkillPackageError('invalid-frontmatter', 'SKILL.md needs name and description frontmatter.')
-  }
-  if (!SKILL_NAME.test(name)) {
-    throw new SkillPackageError('invalid-name', 'The skill name is not valid kebab-case.')
-  }
-  const invocation = invocationPolicy(parsed.fields)
+}
 
-  const files = []
-  const totals = { files: 0, bytes: 0 }
-  if (location.layout === 'directory') {
-    await walkPackage(base, base, files, totals)
-    if (!files.some(entry => entry.rel === 'SKILL.md')) {
-      throw new SkillPackageError('missing', 'SKILL.md is missing from the package list.')
-    }
-  } else {
-    files.push({
-      path: skillFile,
-      rel: 'SKILL.md',
-      size: skillInfo.size,
-      mtimeNs: skillInfo.mtimeNs,
-      dev: skillInfo.dev,
-      ino: skillInfo.ino,
-      mode: Number(skillInfo.mode),
-      script: false,
-    })
-    totals.files = 1
-    totals.bytes = Number(skillInfo.size)
+export async function readSkillPackage(file, { content = false, authorization } = {}) {
+  const { root, rootInfo, skillFile, layout } = await sourceLocation(file, authorization)
+  let manifest
+  try { manifest = await inventory(root, skillFile, layout) }
+  catch (error) {
+    if (error instanceof SkillPackageError) throw error
+    throw new SkillPackageError('unreadable-package', 'The skill package could not be inspected.')
   }
-  const buffers = new Map()
-  let contentHash
-  if (content) {
-    for (const entry of files) {
-      buffers.set(entry.rel, await stableFileBuffer(entry.path, entry))
+  const { files, bytes } = manifest
+  const instruction = files.find(entry => entry.rel === 'SKILL.md')
+  if (!instruction) throw new SkillPackageError('missing', 'SKILL.md is missing from the package.')
+  const instructions = await readChecked(root, rootInfo, instruction)
+  const { fields, body } = parseSkillFile(instructions.toString('utf8'))
+  const name = fields.name?.trim()
+  const description = fields.description?.trim()
+  if (!name || !description) throw new SkillPackageError('invalid-frontmatter', 'SKILL.md needs name and description frontmatter.')
+  if (!SKILL_NAME.test(name)) throw new SkillPackageError('invalid-name', 'The skill name is not valid kebab-case.')
+  const invocation = readInvocation(fields)
+  const metadata = createHash('sha256')
+  const contents = content ? createHash('sha256') : undefined
+  const resources = { scripts: 0, references: 0, assets: 0 }
+
+  // The on-disk activation receipts use these version-1 fingerprint encodings.
+  // Preserve the sorted depth-first order, slash form and field delimiters.
+  for (const entry of files) {
+    metadata.update(entry.rel).update('\0' + entry.info.size + '\0' + entry.info.mtimeNs + '\n')
+    const folder = entry.rel.split('/')[0]
+    if (Object.hasOwn(resources, folder) && entry.rel.includes('/')) resources[folder]++
+    if (contents) {
+      const data = entry === instruction ? instructions : await readChecked(root, rootInfo, entry)
+      contents.update(entry.rel).update('\0').update(data).update('\n')
     }
-    contentHash = hashFiles(files, buffers)
   }
-  const resources = resourceSummary(files)
+  if (authorization) {
+    try { await verifySourceAuthorization(authorization) } catch { throw changed() }
+  }
   return {
-    layout: location.layout,
-    name,
-    description,
-    invocation,
-    body: parsed.body.trim(),
-    sourceFile: file,
+    layout, name, description, invocation, body: body.trim(),
+    ...(fields.whenToUse?.trim() ? { whenToUse: fields.whenToUse.trim() } : {}),
+    ...(fields.metadata ? { metadata: fields.metadata } : {}),
+    sourceFile: file, sourceRoot: root, skillFile: instruction.path,
     ...(authorization ? { authorization } : {}),
-    sourceRoot: base,
-    skillFile,
-    files,
-    fileCount: files.length,
-    bytes: totals.bytes,
-    quickHash: quickHash(files),
-    ...(contentHash === undefined ? {} : { contentHash }),
-    resources,
+    files, fileCount: files.length, bytes, resources,
+    quickHash: metadata.digest('hex'),
+    ...(contents ? { contentHash: contents.digest('hex') } : {}),
     hasScripts: resources.scripts > 0 || files.some(entry => entry.script),
-    scriptFiles: files.filter(entry => entry.script).map(entry => entry.rel).slice(0, 20),
+    scriptFiles: files.filter(entry => entry.script).slice(0, 20).map(entry => entry.rel),
   }
 }
 
 export async function sourceState(file, recorded, { authorization } = {}) {
-  let current
   try {
-    current = await readSkillPackage(file, { content: false, authorization })
+    const current = await readSkillPackage(file, { authorization })
+    if (current.quickHash === recorded?.quickHash && recorded?.contentHash !== undefined) return 'same'
+    const verified = await readSkillPackage(file, { content: true, authorization })
+    return verified.contentHash === recorded?.contentHash ? 'same' : 'changed'
   } catch (error) {
-    if (error instanceof SkillPackageError && error.code === 'missing') return 'missing'
-    if (error instanceof SkillPackageError) return 'invalid'
-    throw error
-  }
-  if (recorded?.quickHash === current.quickHash && recorded?.contentHash !== undefined) return 'same'
-  const full = await readSkillPackage(file, { content: true, authorization })
-  return full.contentHash === recorded?.contentHash ? 'same' : 'changed'
-}
-
-/**
- * Copy a validated package snapshot into a fresh directory and verify the
- * destination before the caller makes it visible.
- */
-export async function copySkillPackage(snapshot, destination) {
-  if (snapshot.layout !== 'directory') {
-    throw new SkillPackageError('flat-package', 'Only directory skill bundles can be enabled.')
-  }
-  const partial = `${destination}.partial-${process.pid}-${Date.now()}`
-  await mkdir(path.dirname(destination), { recursive: true })
-  try {
-    await mkdir(partial, { recursive: true })
-    const ordered = [...snapshot.files].sort((left, right) => {
-      if (left.rel === 'SKILL.md') return 1
-      if (right.rel === 'SKILL.md') return -1
-      return left.rel.localeCompare(right.rel)
-    })
-    for (const file of ordered) {
-      const target = path.join(partial, ...file.rel.split('/'))
-      if (!isPathInside(partial, target)) {
-        throw new SkillPackageError('unsafe-path', 'A skill file leaves its destination.')
-      }
-      await mkdir(path.dirname(target), { recursive: true })
-      await writeFile(target, await stableFileBuffer(file.path, file))
-      if (process.platform !== 'win32') await chmod(target, file.mode & 0o777)
-    }
-    const copied = await readSkillPackage(path.join(partial, 'SKILL.md'), { content: true })
-    if (copied.contentHash !== snapshot.contentHash || copied.fileCount !== snapshot.fileCount) {
-      throw new SkillPackageError('source-changed', 'The skill changed while its snapshot was being copied.')
-    }
-    await moveIntoPlace(partial, destination)
-    return copied
-  } catch (error) {
-    await rm(partial, { recursive: true, force: true }).catch(() => {})
-    throw error
+    if (!(error instanceof SkillPackageError)) throw error
+    return error.code === 'missing' ? 'missing' : 'invalid'
   }
 }
 
-async function moveIntoPlace(source, destination) {
-  let last
-  for (let attempt = 0; attempt < 6; attempt++) {
+async function publishDirectory(staging, destination) {
+  for (let attempt = 0; ; attempt++) {
     try {
-      await rename(source, destination)
+      await rename(staging, destination)
       return
     } catch (error) {
-      last = error
-      if (!['EPERM', 'EBUSY', 'EACCES', 'EEXIST'].includes(error.code) || attempt === 5) break
-      await new Promise(resolve => setTimeout(resolve, 40 * (attempt + 1)))
+      if (attempt === 5 || !['EACCES', 'EBUSY', 'EPERM'].includes(error.code)) throw error
+      await delay(40 * (attempt + 1))
     }
   }
-  throw last
+}
+
+export async function copySkillPackage(snapshot, destination) {
+  if (snapshot.layout !== 'directory') throw new SkillPackageError('flat-package', 'Only directory skill bundles can be enabled.')
+  const current = await readSkillPackage(snapshot.sourceFile, { content: true, authorization: snapshot.authorization })
+  if (current.contentHash !== snapshot.contentHash || current.quickHash !== snapshot.quickHash) throw changed()
+  const { sourceRoot: root } = current
+  const rootInfo = await lstat(root, { bigint: true })
+  await mkdir(path.dirname(destination), { recursive: true })
+  const stage = await mkdtemp(destination + '.part-')
+  let committed = false
+  try {
+    for (const file of current.files) {
+      const target = path.join(stage, ...file.rel.split('/'))
+      if (!relativePath(stage, target)) throw new SkillPackageError('unsafe-path', 'A skill file leaves its destination.')
+      const bytes = await readChecked(root, rootInfo, file)
+      await mkdir(path.dirname(target), { recursive: true })
+      await writeFile(target, bytes, { flag: 'wx', mode: 0o600 })
+      if (process.platform !== 'win32') {
+        const handle = await open(target, 'r')
+        try { await handle.chmod(Number(file.info.mode) & 0o777) } finally { await handle.close() }
+      }
+    }
+    const copied = await readSkillPackage(path.join(stage, 'SKILL.md'), { content: true })
+    if (copied.contentHash !== snapshot.contentHash || copied.fileCount !== snapshot.fileCount) throw changed()
+    await publishDirectory(stage, destination)
+    committed = true
+    return copied
+  } finally {
+    if (!committed && path.dirname(stage) === path.dirname(destination)) {
+      await rm(stage, { recursive: true, force: true }).catch(() => {})
+    }
+  }
 }
 
 export function snapshotIdFor(name, contentHash) {
-  return `${name}-${contentHash.slice(0, 16)}`
+  return name + '-' + contentHash.slice(0, 16)
 }

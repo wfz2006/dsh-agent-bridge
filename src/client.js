@@ -65,7 +65,8 @@ window.__ModuleLoader__.load({
         archiveContext: ' · 续聊上下文 {count} 条',
         archiveWithTools: '附带工具和摘要',
         archiveLocal: '下载来源全文（本机版）',
-        archiveShare: '下载来源全文（分享版）',
+        archiveShare: '审阅来源全文（分享版）',
+        shareLanguage: 'zh',
         archiveAttachment: '附件',
         archiveImageZoomIn: '放大图片',
         archiveImageZoomOut: '缩小图片',
@@ -140,7 +141,8 @@ window.__ModuleLoader__.load({
         archiveContext: ' · {count} messages in continuation context',
         archiveWithTools: 'Include tools and summaries',
         archiveLocal: 'Download full history (local)',
-        archiveShare: 'Download full history (shareable)',
+        archiveShare: 'Review full history (shareable)',
+        shareLanguage: 'en',
         archiveAttachment: 'Attachment',
         archiveImageZoomIn: 'Enlarge image',
         archiveImageZoomOut: 'Shrink image',
@@ -649,8 +651,34 @@ window.__ModuleLoader__.load({
         return [...turns.values()];
       }
 
-      function ArchiveDetails({ history, sessionId, t }) {
+      function ArchiveDetails({ history, sessionId, t, theme }) {
         const [includeTrace, setIncludeTrace] = useState(false);
+        const [shareError, setShareError] = useState('');
+        const review = useRef(null);
+        useEffect(() => () => {
+          const previous = review.current;
+          review.current = null;
+          previous?.close?.();
+        }, [sessionId]);
+        async function reviewShare() {
+          if (review.current) return;
+          const active = {};
+          review.current = active;
+          setShareError('');
+          const url = archiveUrl('conversation-share-preview', sessionId, { includeTrace: String(includeTrace) });
+          try {
+            const { openShareReview, loadSourceSharePreview } = await import(new URL('agent-bridge/share-review.js', document.baseURI).href);
+            if (review.current !== active) return;
+            active.close = openShareReview({
+              load: signal => loadSourceSharePreview(url, signal), theme, language: t('shareLanguage'),
+              onClose() { if (review.current === active) review.current = null; },
+            });
+          } catch {
+            if (review.current !== active) return;
+            review.current = null;
+            setShareError(t('traceFailed'));
+          }
+        }
         const { nativeFirstTurn: start, nativeLastTurn: end } = history;
         const range = start && end ? t('archiveNativeRange').replace('{turns}', start === end ? start : start + '–' + end) : '';
         const scope = t('archiveScope').replace('{messages}', number(history.messages ?? 0))
@@ -662,15 +690,16 @@ window.__ModuleLoader__.load({
           h('p', { key: 'info', className: 'reader-note' }, scope),
           history.complete === false && h('p', { key: 'partial', className: 'reader-note' }, t('archivePartial')),
           h('div', { key: 'links', className: 'reader-downloads' }, [
-            ...[['local', 'archiveLocal'], ['share', 'archiveShare']].map(([format, label]) =>
-              h('a', { key: format, className: 'reader-button', download: '', href: archiveUrl('conversation-export', sessionId, {
-                format, includeTrace: String(includeTrace),
-              }) }, t(label))),
+            h('a', { key: 'local', className: 'reader-button', download: '', href: archiveUrl('conversation-export', sessionId, {
+              format: 'local', includeTrace: String(includeTrace),
+            }) }, t('archiveLocal')),
+            h('button', { key: 'share', type: 'button', className: 'reader-button', onClick: reviewShare }, t('archiveShare')),
             h('label', { key: 'tools' }, [
               h('input', { key: 'check', type: 'checkbox', checked: includeTrace,
                 onChange: event => setIncludeTrace(event.target.checked) }), ' ', t('archiveWithTools'),
             ]),
           ]),
+          shareError && h('p', { key: 'error', className: 'reader-alert', role: 'status' }, shareError),
         ]);
       }
 
@@ -943,7 +972,7 @@ window.__ModuleLoader__.load({
           history && h(SourceArchive, { key: sessionId, sessionId, t, hidden: detailsVisible }),
           h('div', { key: 'content', hidden: !detailsVisible, className: 'reader-content' }, [
             h(SourceStats, { key: 'stats', stats: sourceStats, counts: traceCounts, t }),
-            history && h(ArchiveDetails, { key: 'export', history, sessionId, t }),
+            history && h(ArchiveDetails, { key: 'export', history, sessionId, t, theme }),
             error ? h('p', { key: 'error', className: 'reader-alert', role: 'status' }, error) : null,
             trace.length ? h('details', { key: 'excerpts', className: 'reader-extra', open: !history }, [
               h('summary', { key: 'title', className: 'reader-summary' }, t('traceExcerpt')),

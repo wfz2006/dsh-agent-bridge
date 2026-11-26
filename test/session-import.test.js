@@ -9,6 +9,96 @@ import { approveConversation, stageConversation } from '../src/conversation-stor
 import { nativeSessionEvents, saveNativeSession } from '../src/session-import.js'
 import { readSessionTrace } from '../src/session-trace.js'
 
+test('project body search locates the original turn and carries reviewed excerpts across sessions into the DSH model surface', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-search-'))
+  const cwd = join(root, 'fixture')
+  const other = join(root, 'other')
+  const agent = join(root, 'codex')
+  const dir = join(agent, 'sessions')
+  await Promise.all([mkdir(cwd), mkdir(other), mkdir(dir, { recursive: true })])
+  const config = { home: root, configFile: join(root, 'agent-bridge.json'),
+    agentRoots: { codex: [agent] }, workspaceHubRoots: [], archiveFiles: [] }
+  const write = (id, folder, pairs) => writeFile(join(dir, id + '.jsonl'), [
+    { type: 'session_meta', payload: { cwd: folder } },
+    ...pairs.flatMap(([question, answer]) => [['user', question], ['assistant', answer]])
+      .map(([role, text]) => ({ type: 'response_item', payload: { type: 'message', role, content: [{ type: 'text', text }] } })),
+  ].map(value => JSON.stringify(value)).join('\n'))
+  const long = '旧'.repeat(80_000) + '保留格式 SQLITE_BUSY'
+  await write('old', cwd, [['First title', long],
+    ...Array.from({ length: 28 }, (_, i) => [`Later question ${i}`, `Failure [x]+. ${i}`])])
+  await write('new', cwd, [['Continue', 'New reply']])
+  await write('outside', other, [['Unrelated title', '保留格式 SQLITE_BUSY']])
+  let imported
+  let failures = 0
+  const catalog = createCatalog(() => config, { importConversation: async record => {
+    const { nativeTranscriptEvents } = await import('../src/native-transcript.js')
+    imported = await nativeTranscriptEvents(record)
+    if (!failures++) throw new Error('temporary host failure')
+    return { sessionId: record.sessionId }
+  } })
+  t.after(async () => { catalog.dispose(); await rm(root, { recursive: true, force: true }) })
+  const { projects } = await catalog.execute('catalog', {})
+  const projectId = projects.find(p => p.cwd === cwd).id
+  const otherId = projects.find(p => p.cwd === other).id
+  const paged = await catalog.execute('search-conversations', { projectId, query: '[x]+.' })
+  const tail = await catalog.execute('search-conversations', { projectId, query: '[x]+.', cursor: paged.nextCursor })
+  assert.equal(paged.matches.length, 24)
+  assert.deepEqual(tail.matches.map(match => match.turn), [26, 27, 28, 29])
+  await assert.rejects(catalog.execute('search-conversations', { projectId: otherId, query: '[x]+.', cursor: paged.nextCursor }), { status: 409 })
+  const { matches } = await catalog.execute('search-conversations', { projectId, query: '保留格式 sqlite_busy' })
+  assert.equal(matches.length, 1)
+  const hit = matches[0]
+  assert.equal(hit.turn, 1)
+  assert.equal(hit.title, 'First title')
+  assert.match(hit.snippet, /保留格式 SQLITE_BUSY/)
+  const old = await catalog.execute('preview-conversation', { projectId, sessionId: hit.id, searchHit: hit })
+  const page = await catalog.execute('conversation-history', { snapshotId: old.history.snapshotId, ...old.historyLocation })
+  const item = page.items.find(item => item.text?.includes('保留格式 SQLITE_BUSY'))
+  assert.equal(item?.turn, 1)
+  const excerpts = [{ snapshotId: old.history.snapshotId, seq: item.seq, offset: item.offset }]
+  const { sessions } = await catalog.execute('list-conversations', { projectId })
+  const latest = await catalog.execute('preview-conversation', { projectId, sessionId: sessions.find(s => s.title === 'Continue').id })
+  const relayOne = await catalog.execute('add-relay-item', { projectId, ...excerpts[0], category: 'decided' })
+  const latestPage = await catalog.execute('conversation-history', { snapshotId: latest.history.snapshotId })
+  const question = latestPage.items.find(entry => entry.role === 'user')
+  const relayTwo = await catalog.execute('add-relay-item', { projectId, snapshotId: latest.history.snapshotId,
+    seq: question.seq, offset: question.offset, category: 'unresolved' })
+  assert.notEqual(relayOne.source.id, relayTwo.source.id)
+  const updated = await catalog.execute('update-relay-item', { projectId, id: relayTwo.id, category: 'next', text: 'Verify the next run' })
+  assert.deepEqual(updated.source, relayTwo.source)
+  const { markdown } = await catalog.execute('export-relay', { projectId })
+  assert.match(markdown, /## 已决定[\s\S]*保留格式 SQLITE_BUSY[\s\S]*## 已完成[\s\S]*## 未解决[\s\S]*## 下一步[\s\S]*Verify the next run/)
+  assert.deepEqual((await catalog.execute('project-relay', { projectId: otherId })).items, [])
+  const foreign = await catalog.execute('search-conversations', { projectId: otherId, query: 'sqlite_busy' })
+  const foreignPreview = await catalog.execute('preview-conversation', { projectId: otherId, sessionId: foreign.matches[0].id })
+  await assert.rejects(catalog.execute('preview-conversation-context', { ticket: latest.ticket,
+    excerpts: [{ ...excerpts[0], snapshotId: foreignPreview.history.snapshotId }] }), { status: 409 })
+  const reviewed = await catalog.execute('preview-conversation-context', { ticket: latest.ticket, excerpts })
+  assert.match(reviewed.firstMessage, /第一|第 1 轮/)
+  assert.match(reviewed.firstMessage, /保留格式 SQLITE_BUSY/)
+  assert.match(reviewed.firstMessage, /Continue/)
+  await assert.rejects(catalog.execute('import-conversation', { ticket: latest.ticket, excerpts: [], contextKey: reviewed.contextKey }), { status: 409 })
+  const commit = { ticket: latest.ticket, excerpts, contextKey: reviewed.contextKey }
+  await assert.rejects(catalog.execute('import-conversation', commit), { status: 503 })
+  await catalog.execute('discard-conversation-preview', { snapshotId: old.history.snapshotId })
+  const jumped = await catalog.execute('preview-conversation', { projectId, sessionId: hit.id, relayId: relayOne.id })
+  const original = await catalog.execute('conversation-history', { snapshotId: jumped.history.snapshotId, ...jumped.historyLocation })
+  assert.equal(original.items.find(entry => entry.seq === jumped.historyLocation.seq).text, item.text)
+  await catalog.execute('remove-relay-item', { projectId, id: relayTwo.id })
+  assert.deepEqual((await catalog.execute('project-relay', { projectId })).items, [relayOne])
+  const pending = await catalog.execute('preview-conversation', {
+    projectId, sessionId: sessions.find(s => s.title === 'Continue').id, snapshotId: latest.history.snapshotId,
+  })
+  assert.equal(pending.messages[0].text, reviewed.firstMessage)
+  await catalog.execute('import-conversation', commit)
+  const { events } = imported
+  const historyUser = events.find(event => event.type === 'user/message' && event.data.source.kind === 'user')
+  const contextUser = events.find(event => event.type === 'user/message' && event.data.source.kind === 'agent-bridge-context')
+  assert.equal(historyUser.data.content[0].text, 'Continue')
+  assert.equal(contextUser.data.content[0].text, reviewed.firstMessage)
+  assert.equal(contextUser.surfaceOp.op, 'replace')
+})
+
 test('a reviewed conversation imports only that session, preserving repeated messages, with a retry-safe receipt', async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-native-history-'))
   const cwd = join(root, 'fixture')
@@ -88,6 +178,115 @@ test('a reviewed conversation imports only that session, preserving repeated mes
   assert.deepEqual(first, second)
   assert.equal(imports, 1)
   assert.deepEqual(await readFile(file), bytes)
+})
+
+test('reopening a migrated source uses the latest available DSH session and only creates an explicit copy', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-import-reuse-'))
+  const cwd = join(root, 'project')
+  const alternate = join(root, 'alternate')
+  const agent = join(root, 'codex')
+  const source = join(agent, 'sessions', 'selected.jsonl')
+  await Promise.all([mkdir(cwd), mkdir(alternate), mkdir(dirname(source), { recursive: true })])
+  await writeFile(source, [
+    { type: 'session_meta', payload: { id: 'selected', cwd } },
+    ...[['user', 'Original title'], ['assistant', 'A searchable body']].map(([role, text]) =>
+      ({ type: 'response_item', payload: { type: 'message', role, content: [{ type: 'text', text }] } })),
+  ].map(value => JSON.stringify(value)).join('\n'))
+  const config = { home: root, configFile: join(root, 'agent-bridge.json'),
+    agentRoots: { codex: [agent] }, projectRoots: [alternate], workspaceHubRoots: [], archiveFiles: [] }
+  const visible = new Set()
+  const writes = []
+  const enteredFirstImport = Promise.withResolvers()
+  const finishFirstImport = Promise.withResolvers()
+  const options = {
+    importConversation: async (record, path) => {
+      writes.push({ id: record.sessionId, path })
+      if (writes.length === 1) {
+        enteredFirstImport.resolve()
+        await finishFirstImport.promise
+      }
+      visible.add(record.sessionId)
+      return { sessionId: record.sessionId }
+    },
+    canOpenConversation: id => visible.has(id),
+  }
+  let catalog = createCatalog(() => config, options)
+  t.after(async () => { catalog.dispose(); await rm(root, { recursive: true, force: true }) })
+  const { projects } = await catalog.execute('catalog', {})
+  const projectId = projects.find(project => project.cwd === cwd).id
+  const { sessions: [session] } = await catalog.execute('list-conversations', { projectId })
+  const input = { projectId, sessionId: session.id }
+  const first = await catalog.execute('preview-conversation', input)
+  const stale = await catalog.execute('preview-conversation', { ...input, targetCwd: alternate })
+  assert.ok(first.canImport)
+  const before = Date.now()
+  const pending = catalog.execute('import-conversation', { ticket: first.ticket })
+  await Promise.race([enteredFirstImport.promise, pending])
+  try {
+    await assert.rejects(catalog.execute('import-conversation', { ticket: stale.ticket }), { status: 409 })
+  } finally {
+    finishFirstImport.resolve()
+  }
+  const original = await pending
+  const reopened = await catalog.execute('preview-conversation', input)
+  assert.equal(reopened.openExisting, true)
+  assert.equal(reopened.lastImport.sessionId, original.sessionId)
+  assert.ok(reopened.lastImport.importedAt >= before && reopened.lastImport.importedAt <= Date.now())
+  assert.equal(reopened.lastImport.approximate, false)
+  assert.equal(reopened.ticket, undefined)
+  const reused = await catalog.execute('import-conversation', { ticket: stale.ticket })
+  assert.equal(reused.sessionId, original.sessionId)
+  assert.equal(reused.reused, true)
+  assert.equal(writes.length, 1)
+
+  // Backfill an old snapshot without a completion timestamp to exercise the upgrade path.
+  const db = new DatabaseSync(join(root, 'agent-bridge-history', 'history.sqlite'))
+  const legacyTime = before - 60_000
+  try {
+    db.prepare("UPDATE snapshots SET created=?,record=json_remove(record,'$.importedAt') WHERE id=?")
+      .run(legacyTime, first.ticket)
+  } finally {
+    db.close()
+  }
+  catalog.dispose()
+  catalog = createCatalog(() => config, options)
+  const recent = await catalog.execute('list-conversations', { projectId, recent: true })
+  assert.deepEqual(recent.sessions[0].lastImport, {
+    sessionId: original.sessionId, importedAt: legacyTime, approximate: true,
+  })
+  const { matches: [hit] } = await catalog.execute('search-conversations', { projectId, query: 'searchable' })
+  assert.equal(hit.lastImport.sessionId, original.sessionId)
+  const jump = await catalog.execute('preview-conversation', { ...input, searchHit: hit })
+  assert.equal(jump.historyLocation.turn, 1)
+  assert.equal(jump.lastImport.sessionId, original.sessionId)
+
+  const copyPreview = await catalog.execute('preview-conversation', { ...input, targetCwd: alternate, duplicate: true })
+  assert.ok(copyPreview.canImport)
+  const copy = await catalog.execute('import-conversation', { ticket: copyPreview.ticket, duplicate: true })
+  assert.notEqual(copy.sessionId, original.sessionId)
+  assert.deepEqual(writes.map(write => write.path), [cwd, alternate])
+  const latest = await catalog.execute('conversation-import-status', input)
+  assert.equal(latest.lastImport.sessionId, copy.sessionId)
+  assert.equal(latest.lastImport.approximate, false)
+  assert.ok(latest.lastImport.importedAt > legacyTime)
+  const foreign = await catalog.execute('conversation-import-status', {
+    ...input, projectId: projects.find(project => project.cwd === alternate).id,
+  })
+  assert.equal(foreign.lastImport, null)
+
+  visible.delete(copy.sessionId)
+  const fallback = await catalog.execute('conversation-import-status', input)
+  assert.equal(fallback.lastImport.sessionId, original.sessionId)
+  assert.equal(fallback.lastImport.importedAt, latest.lastImport.importedAt)
+  assert.equal(fallback.lastImport.older, true)
+  visible.delete(original.sessionId)
+  const fresh = await catalog.execute('preview-conversation', input)
+  assert.equal(fresh.lastImport.sessionId, null)
+  assert.ok(fresh.canImport)
+  assert.equal(writes.length, 2)
+  const recovered = await catalog.execute('import-conversation', { ticket: fresh.ticket })
+  assert.equal(writes.length, 3)
+  assert.equal((await catalog.execute('conversation-import-status', input)).lastImport.sessionId, recovered.sessionId)
 })
 
 

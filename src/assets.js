@@ -22,6 +22,7 @@ const agentHomes = {
   trae: ['.trae-cn', '.trae'],
   workbuddy: ['.workbuddy'],
 };
+const projectMemoryAgents = new Set(['claude', 'qoder', 'qwen']);
 const projectAgentFolders = {
   '.agent': 'antigravity',
   '.claude': 'claude',
@@ -258,7 +259,18 @@ async function exportedNotes(items, cwd, memoryExports) {
   }));
 }
 
-async function nativeNotes(items, root, cwd, agent) {
+async function nativeNotes(items, root, cwd, agent, projectOnly) {
+  if (!projectOnly) await agentNotes(items, root, agent);
+  if (cwd && projectMemoryAgents.has(agent)) {
+    const slug = cwd.replace(/[^\p{L}\p{N}]/gu, '-');
+    const asciiSlug = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+    for (const name of new Set([slug, asciiSlug, slug.toLowerCase()])) {
+      await notesIn(items, root, path.join('projects', name, 'memory'), agent, 'project', '原生工作区记忆');
+    }
+  }
+}
+
+async function agentNotes(items, root, agent) {
   const globalFolders = {
     antigravity: ['knowledge'], claude: ['agent-memory'],
     codex: ['memories', 'memories_v2', 'memories/extensions/ad_hoc/notes', 'memories_v2/extensions/ad_hoc/notes'],
@@ -279,13 +291,6 @@ async function nativeNotes(items, root, cwd, agent) {
     opencode: ['AGENTS.md', 'MEMORY.md'], qwen: ['QWEN.md'], workbuddy: ['USER.md', 'SOUL.md', 'MEMORY.md'],
   };
   await Promise.all((instructionFiles[agent] ?? []).map((name) => addNote(items, root, name, agent, 'agent', '用户指引')));
-  if (cwd && ['claude', 'qoder', 'qwen'].includes(agent)) {
-    const slug = cwd.replace(/[^\p{L}\p{N}]/gu, '-');
-    const asciiSlug = cwd.replace(/[^a-zA-Z0-9]/g, '-');
-    for (const name of new Set([slug, asciiSlug, slug.toLowerCase()])) {
-      await notesIn(items, root, path.join('projects', name, 'memory'), agent, 'project', '原生工作区记忆');
-    }
-  }
 }
 
 async function skillFolder(items, root, relative, agent, scope, linkedRoots, detail, includeSystem = true) {
@@ -335,7 +340,9 @@ function unique(items) {
   return [...indexed.values()].sort((a, b) => a.agent.localeCompare(b.agent) || a.name.localeCompare(b.name));
 }
 
-export async function listProjectAssets(project, config = {}) {
+export async function listProjectAssets(project, config = {}, {
+  projectMemoryOnly = false, includeSkills = !projectMemoryOnly, includeGlobalMemory = !projectMemoryOnly,
+} = {}) {
   const home = config.home ?? homedir();
   const cwd = await directory(project.cwd);
   const hubs = (await Promise.all((config.workspaceHubRoots ?? []).map(directory))).filter(Boolean);
@@ -344,9 +351,15 @@ export async function listProjectAssets(project, config = {}) {
     path.join(home, '.skillshare/skills'), path.join(home, 'AppData/Roaming/skillshare/skills'),
     ...(config.skillRoots ?? []), ...hubs.map((root) => path.join(root, 'skills/source')),
   ];
-  const sharedRoots = [...new Set((await Promise.all(sharedCandidates.map(directory))).filter(Boolean))];
+  const sharedRoots = includeSkills ? [...new Set((await Promise.all(sharedCandidates.map(directory))).filter(Boolean))] : [];
   const agents = new Set((project.agents ?? []).map(agentId));
   const configured = Object.entries(config.agentRoots ?? {});
+  if (projectMemoryOnly) {
+    for (const [name, roots] of configured) {
+      const agent = agentId(name);
+      if (roots?.length && (projectMemoryAgents.has(agent) || includeGlobalMemory || includeSkills)) agents.add(agent);
+    }
+  }
   const memories = [];
   const skills = [];
 
@@ -358,7 +371,7 @@ export async function listProjectAssets(project, config = {}) {
         ...Object.entries(projectInstructions).filter(([, owner]) => owner === agent).map(([file]) => (
           addNote(memories, cwd, path.join(folder, file), agent, 'project', '项目指引')
         )),
-        skillFolder(skills, cwd, path.join(folder, 'skills'), agent, 'project', sharedRoots, '项目 Skill'),
+        includeSkills && skillFolder(skills, cwd, path.join(folder, 'skills'), agent, 'project', sharedRoots, '项目 Skill'),
       ]);
     });
     await Promise.all([
@@ -367,9 +380,9 @@ export async function listProjectAssets(project, config = {}) {
       notesIn(memories, cwd, '.agent-bridge/handoffs', 'shared', 'project', '项目交接'),
       ...hubs.map((root) => hubNotes(memories, root, cwd, project.projectIds ?? [])),
       exportedNotes(memories, cwd, config.memoryExports),
-      ...['.agents/skills', '.skillshare/skills', 'skills'].map((folder) => (
+      includeSkills && Promise.all(['.agents/skills', '.skillshare/skills', 'skills'].map((folder) => (
         skillFolder(skills, cwd, folder, 'shared', 'project', sharedRoots, '项目 Skill')
-      )),
+      ))),
     ]);
   }
 
@@ -387,17 +400,17 @@ export async function listProjectAssets(project, config = {}) {
         const memoryRoots = [...new Set([...roots, ...configRoots])];
         const skillRoots = config.opencodeSkillRoots === undefined ? memoryRoots : [...new Set(configRoots)];
         await Promise.all([
-          ...memoryRoots.map((root) => nativeNotes(memories, root, cwd, agent)),
-          ...skillRoots.flatMap((root) => ['skills', 'skill'].map((folder) => (
+          ...memoryRoots.map((root) => nativeNotes(memories, root, cwd, agent, !includeGlobalMemory)),
+          includeSkills && Promise.all(skillRoots.flatMap((root) => ['skills', 'skill'].map((folder) => (
             skillFolder(skills, root, folder, agent, 'agent', sharedRoots, '智能体 Skill')
-          ))),
+          )))),
         ]);
         return;
       }
       await Promise.all(roots.flatMap((root) => [
-        nativeNotes(memories, root, cwd, agent),
-        skillFolder(skills, root, 'skills', agent, 'agent', sharedRoots, '智能体 Skill'),
-        ...(['claude', 'codex'].includes(agent) ? [cachedPluginSkills(skills, root, agent)] : []),
+        nativeNotes(memories, root, cwd, agent, !includeGlobalMemory),
+        includeSkills && skillFolder(skills, root, 'skills', agent, 'agent', sharedRoots, '智能体 Skill'),
+        includeSkills && ['claude', 'codex'].includes(agent) && cachedPluginSkills(skills, root, agent),
       ]));
     }),
   ]);

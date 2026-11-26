@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, open } from 'node:fs/promises'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { keyFor } from './handoff.js'
 import { isSessionId, traceDirectory } from './session-trace.js'
 
 const pageBytes = 64 * 1024
@@ -338,13 +339,33 @@ export async function readStoredConversation(config, sessionId) {
   return use(config, db => readRecord(db.prepare("SELECT record,state FROM snapshots WHERE session_id=? AND state='done'").get(sessionId)), false)
 }
 
-export async function approveConversation(config, id) {
-  return use(config, db => db.prepare(`UPDATE snapshots AS proposed SET state='approved'
-    WHERE proposed.id=? AND proposed.state='preview' AND proposed.created>=? AND NOT EXISTS (
+export async function readCompletedConversationImports(config, projectId, sourceIds) {
+  if (!sourceIds.length) return []
+  const rows = await use(config, db => db.prepare(`
+    SELECT source_id AS sourceId, session_id AS sessionId, created AS importedAt,
+      json_type(record,'$.importedAt') IS NULL AS approximate
+    FROM snapshots WHERE project_id=? AND state='done'
+      AND source_id IN (SELECT value FROM json_each(?))
+    ORDER BY created DESC, rowid DESC
+  `).all(projectId, JSON.stringify(sourceIds)), false)
+  return rows ?? []
+}
+
+export async function approveConversation(config, id, continuation = null, { unavailableImports } = {}) {
+  return use(config, db => db.prepare(`UPDATE snapshots AS proposed SET state='approved',
+    record=json_set(record,'$.continuation',json($continuation))
+    WHERE proposed.id=$id AND proposed.state='preview' AND proposed.created >= $cutoff AND NOT EXISTS (
       SELECT 1 FROM snapshots AS active WHERE active.project_id=proposed.project_id AND active.source_id=proposed.source_id
-        AND active.target=proposed.target AND active.state='approved'
+        AND active.state='approved' AND (active.target=proposed.target OR $unavailable IS NOT NULL)
+    ) AND (
+      $unavailable IS NULL OR NOT EXISTS (
+        SELECT 1 FROM snapshots AS completed
+        WHERE completed.project_id=proposed.project_id AND completed.source_id=proposed.source_id AND completed.state='done'
+          AND completed.session_id NOT IN (SELECT value FROM json_each($unavailable))
+      )
     )`)
-    .run(id, Date.now() - lifetime).changes)
+    .run({ $continuation: JSON.stringify(continuation), $id: id, $cutoff: Date.now() - lifetime,
+      $unavailable: unavailableImports ? JSON.stringify(unavailableImports) : null }).changes)
 }
 
 export async function saveConversationSeed(config, id, seed) {
@@ -358,16 +379,85 @@ export async function saveConversationSeed(config, id, seed) {
 
 export async function finishConversation(config, id, nativeTimeline) {
   return use(config, db => {
-    if (!nativeTimeline) return db.prepare("UPDATE snapshots SET state='done', seed=NULL WHERE id=? AND state='approved'").run(id)
-    return db.prepare(`UPDATE snapshots SET state='done', seed=NULL, record=json_set(record,
-        '$.history', json_patch(json_extract(record,'$.history'), json(?)),
-        '$.sourceStats.importedMessages', ?)
-      WHERE id=? AND state='approved'`).run(JSON.stringify({ ...nativeTimeline, nativeTimeline: true }), nativeTimeline.nativeMessages, id)
+    // Older completed snapshots keep their preview timestamp in created.
+    const importedAt = Date.now()
+    if (!nativeTimeline) return db.prepare(`UPDATE snapshots SET state='done', seed=NULL,
+      created=$importedAt, record=json_set(record,'$.importedAt',$importedAt)
+      WHERE id=$id AND state='approved'`).run({ $id: id, $importedAt: importedAt })
+    return db.prepare(`UPDATE snapshots SET state='done', seed=NULL, created=$importedAt, record=json_set(record,
+        '$.importedAt', $importedAt, '$.history', json_patch(json_extract(record,'$.history'), json($timeline)),
+        '$.sourceStats.importedMessages', $messageCount)
+      WHERE id=$id AND state='approved'`).run({ $id: id, $importedAt: importedAt,
+      $timeline: JSON.stringify({ ...nativeTimeline, nativeTimeline: true }), $messageCount: nativeTimeline.nativeMessages })
   })
 }
 
 export async function discardConversation(config, id) {
   if (isSessionId(id)) await use(config, db => db.prepare("DELETE FROM snapshots WHERE id=? AND state='preview'").run(id))
+}
+
+export async function locateHistoryMessage(config, id, { turn, hash, offset }) {
+  return use(config, db => {
+    const rows = db.prepare(`SELECT seq,part,item FROM entries
+      WHERE snapshot_id=? AND turn=? AND kind='message' ORDER BY seq,part`).iterate(id, turn)
+    let seq
+    let part
+    let texts = []
+    const locate = () => {
+      if (!texts.length || keyFor(texts.join('')) !== hash || part === undefined) return
+      const before = part === 0 ? `${seq - 1}:999999999999999` : `${seq}:${part - 1}`
+      return { turn, cursor: `${id}:${turn}:${before}`, seq, offset: part }
+    }
+    for (const row of rows) {
+      if (row.seq !== seq) {
+        const found = locate()
+        if (found) return found
+        seq = row.seq
+        texts = []
+        part = undefined
+      }
+      const { text } = JSON.parse(row.item)
+      texts.push(text)
+      if (row.part <= offset && offset < row.part + text.length) part = row.part
+    }
+    return locate()
+  }, false)
+}
+
+export async function readContextExcerpts(config, projectId, excerpts) {
+  return use(config, db => {
+    const select = db.prepare(`SELECT e.turn,e.item,s.source_id AS sourceId,json_extract(s.record,'$.title') AS title
+      FROM entries e JOIN snapshots s ON s.id=e.snapshot_id
+      WHERE s.project_id=? AND s.id=? AND e.seq=? AND e.part=?
+        AND (s.state IN ('approved','done') OR (s.state='preview' AND s.created>=?))
+        AND e.kind IN ('message','tool_result','tool_call','summary')`)
+    return excerpts.map(excerpt => {
+      const row = select.get(projectId, excerpt.snapshotId, excerpt.seq, excerpt.offset, Date.now() - lifetime)
+      if (!row) return null
+      const item = JSON.parse(row.item)
+      if (!item.text?.trim()) return null
+      return { ...excerpt, sourceId: row.sourceId, title: row.title, turn: row.turn, kind: item.kind, role: item.role, text: item.text }
+    })
+  }, false)
+}
+
+export async function locateRelayExcerpt(config, id, { turn, kind, seq, offset, hash }) {
+  return use(config, db => {
+    const rows = db.prepare(`SELECT seq,part,item FROM entries WHERE snapshot_id=? AND turn=? AND kind=?
+      ORDER BY (seq=?) DESC,(part=?) DESC,seq,part`).iterate(id, turn, kind, seq, offset)
+    for (const row of rows) {
+      if (keyFor(JSON.parse(row.item).text) !== hash) continue
+      const before = row.part ? `${row.seq}:${row.part - 1}` : `${row.seq - 1}:999999999999999`
+      return { turn, cursor: `${id}:${turn}:${before}`, seq: row.seq, offset: row.part }
+    }
+    if (db.prepare('SELECT 1 FROM entries WHERE snapshot_id=? AND turn=? LIMIT 1').get(id, turn)) {
+      return { turn, changed: true }
+    }
+  }, false)
+}
+
+export function firstContinuationMessage(record) {
+  return record.continuation?.firstMessage ?? record.messages[0]?.text
 }
 
 function cursorPosition(cursor) {
@@ -413,7 +503,9 @@ export async function* readNativeTurns(config, record) {
   if (!db) return
   try {
     const positions = projectedPositions(db, record)
-    const context = new Map(positions.map((seq, index) => [seq, record.messages[index].text]))
+    const context = new Map(positions.map((seq, index) => [
+      seq, index === 0 ? firstContinuationMessage(record) : record.messages[index].text,
+    ]))
     const initialTime = db.prepare(`
       SELECT json_extract(item,'$.time') AS time FROM entries
       WHERE snapshot_id=? AND part=0 AND turn IS NOT NULL AND kind IN ('message','attachment')
@@ -493,7 +585,9 @@ export async function readProcessPlacements(config, record, events) {
   }, false)
 }
 
-export async function readHistoryPage(config, id, cursor, turn, { processOnly = false, after = 0, before = Number.MAX_SAFE_INTEGER } = {}) {
+export async function readHistoryPage(config, id, cursor, turn, {
+  processOnly = false, after = 0, before = Number.MAX_SAFE_INTEGER, maxBytes = pageBytes,
+} = {}) {
   if (!isSessionId(id)) return
   if (cursor && (typeof cursor !== 'string' || !cursor.startsWith(`${id}:`))) {
     throw Object.assign(new Error('历史页位置与会话不匹配。'), { status: 400 })
@@ -526,7 +620,7 @@ export async function readHistoryPage(config, id, cursor, turn, { processOnly = 
     const find = db.prepare('SELECT item,COUNT(*) AS count FROM entries WHERE snapshot_id=? AND call_id=? AND kind=? AND part=0')
     for (const row of rows) {
       const length = Buffer.byteLength(row.item)
-      if (items.length && (bytes + length > pageBytes || items.length >= 40)) {
+      if (items.length && (bytes + length > maxBytes || items.length >= 40)) {
         nextCursor = `${id}:${position.join(':')}`
         if (row.display_turn === position[0]) continuesTurn = row.display_turn
         break
