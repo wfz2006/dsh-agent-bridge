@@ -168,6 +168,7 @@ export function apply(ctx) {
         } catch (error) {
           if (!res.headersSent) json(res, error.status || 500, {
             error: error.status ? error.message : '无法读取本地资料。请检查 agent-bridge.json 和文件权限后刷新。',
+            ...(isSessionId(error.recoveryTicket) ? { recoveryTicket: error.recoveryTicket } : {}),
           })
         }
       },
@@ -187,7 +188,7 @@ export function apply(ctx) {
     }
     const input = await readBody(req)
     const conversationAction = ['list-conversations', 'search-conversations', 'conversation-import-status', 'preview-conversation',
-      'preview-conversation-context', 'import-conversation'].includes(input.action)
+      'preview-conversation-context', 'retarget-failed-conversation', 'import-conversation'].includes(input.action)
     const nativeSessionImport = (conversationAction || input.action === 'catalog') && Boolean(services())
     if (conversationAction && !nativeSessionImport) {
       json(res, 403, { error: '请在支持会话迁入的本机 DSH 主界面中使用。' })

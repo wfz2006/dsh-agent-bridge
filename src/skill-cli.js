@@ -4,7 +4,7 @@ import path from 'node:path'
 import { parseArgs } from 'node:util'
 import { authorizeProjectReference, listProjectAssets, readAsset, verifyAssetSource, verifySourceAuthorization } from './assets.js'
 import { loadConfig } from './config.js'
-import { canReadConversation, conversationId, conversationTitle, makePrompt, mergeProjects, pathKey, redact } from './handoff.js'
+import { canReadConversation, conversationId, conversationIds, conversationTitle, makePrompt, mergeProjects, pathKey, redact } from './handoff.js'
 import { dateMillis, readConversationHistory, scanProjects } from './projects.js'
 
 const usage = `Agent Bridge · DSH
@@ -137,15 +137,26 @@ async function run(args) {
     return json({ project: project.name, cwd, operation })
   }
   const conversations = new Map()
-  for (const archive of project.archives.filter(canReadConversation).sort((a, b) => dateMillis(b.date) - dateMillis(a.date))) {
+  const archives = project.archives.filter(canReadConversation).sort((a, b) => dateMillis(b.date) - dateMillis(a.date))
+  for (const archive of archives) {
     const id = conversationId(archive)
     if (!conversations.has(id)) conversations.set(id, archive)
   }
-  if (session && !conversations.has(session)) throw new Error('所选会话不在这个项目或来源中。')
+  let selectedArchive = conversations.get(session)
+  if (session && !selectedArchive) {
+    const matches = new Set()
+    for (const archive of archives) {
+      const ids = conversationIds(archive)
+      if (ids.includes(session)) matches.add(ids[0])
+    }
+    if (matches.size !== 1) throw new Error('所选会话不在这个项目或来源中。')
+    const [id] = matches
+    selectedArchive = conversations.get(id)
+  }
   if (action === 'history' || action === 'attachment') {
     const { readSkillHistory } = await import('./skill-history.js')
     return json(await readSkillHistory({
-      project, archive: conversations.get(session), config, turn, cursor, format, includeTrace, output, attachment,
+      project, archive: selectedArchive, config, turn, cursor, format, includeTrace, output, attachment,
     }))
   }
 
@@ -208,7 +219,7 @@ async function run(args) {
     }
   }))
   if (!noHistory) {
-    const selected = session ? [conversations.get(session)] : conversations.values()
+    const selected = session ? [selectedArchive] : conversations.values()
     for (const archive of selected) {
       const history = await readConversationHistory(archive, cwd, config, { includeTrace: false }).catch(error => {
         if (session) throw error
@@ -256,9 +267,13 @@ async function run(args) {
       }))
     }
   }
-  const markdown = makeExport({
+  let { markdown } = makeExport({
     title: redact(project.name), origin: '项目交接', preview, format, savePath: output ? path.resolve(output) : undefined,
-  }).markdown
+  })
+  if (format === 'share') {
+    const { findShareFindings, redactShareMarkdown } = await import('../web/share-redaction.js')
+    markdown = redactShareMarkdown(markdown, findShareFindings(markdown))
+  }
   if (!output) return markdown
   const { saveOutput } = await import('./skill-output.js')
   return json({ file: await saveOutput(output, [markdown]) })

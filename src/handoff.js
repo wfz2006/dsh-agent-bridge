@@ -99,7 +99,41 @@ export function canReadConversation(archive) {
 }
 
 export function conversationId(archive) {
+  if (archive.kind === 'codex' && archive.profile && archive.sourceCwd && typeof archive.id === 'string' && archive.id.trim()) {
+    return keyFor('codex-thread', pathKey(archive.profile), pathKey(archive.sourceCwd), archive.id)
+  }
   return keyFor(archive.kind, archive.file, archive.table, archive.id)
+}
+
+export function conversationIds(archive) {
+  const ids = new Set([conversationId(archive)])
+  if (!archive.profile || !archive.sourceCwd || archive.kind !== 'codex' || typeof archive.id !== 'string' || !archive.id.trim()) return [...ids]
+  const paths = new Set()
+  for (const file of [archive.file, ...(archive.previousFiles ?? [])]) {
+    const plain = file.replace(/\.zst$/i, '')
+    paths.add(file)
+    paths.add(plain)
+    paths.add(plain + '.zst')
+    const name = path.basename(plain)
+    // Codex moves dated rollouts to a flat archive and may compress them in place.
+    const date = /^rollout-(\d{4})-(\d\d)-(\d\d)T/i.exec(name)
+    const relatives = [name]
+    if (date) relatives.push(path.join(date[1], date[2], date[3], name))
+    for (const base of archive.rolloutRoots) {
+      const relative = path.relative(base, plain)
+      if (relative && !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative)) relatives.push(relative)
+    }
+    for (const base of archive.rolloutRoots) {
+      for (const relative of relatives) {
+        const candidate = path.join(base, relative)
+        paths.add(candidate)
+        paths.add(candidate + '.zst')
+      }
+    }
+  }
+  for (const file of paths) ids.add(keyFor('codex', file, archive.table, archive.id))
+  for (const alias of archive.savedIds ?? []) ids.add(alias)
+  return [...ids]
 }
 
 export function conversationTitle(value, bytes = 200) {

@@ -8,14 +8,14 @@ import { dateMillis, probeConversation, readProjectHistory, readSourceEvents, sc
 import {
   approveConversation, discardConversation, finishConversation, firstContinuationMessage, locateHistoryMessage, locateRelayExcerpt,
   readCompletedConversationImports, readContextExcerpts, readConversationSnapshot, readHistoryPage,
-  readPendingConversation, rebindConversation, stageConversation,
+  readPendingConversation, readRetainedRelaySnapshot, rebindConversation, setConversationAttempt, stageConversation, withApprovedImportLock,
 } from './conversation-store.js'
 import { searchConversations } from './conversation-search.js'
 import { createSourceMonitor } from './watch.js'
 import { makeExport } from './export.js'
 import { readConversationAttachment } from './history-attachment.js'
 import {
-  canReadConversation, conversationId, conversationTitle, keyFor, makePrompt, mergeProjects, pathKey, redact,
+  canReadConversation, conversationIds, conversationTitle, keyFor, makePrompt, mergeProjects, pathKey, redact,
 } from './handoff.js'
 import { countTrace, isSessionId, normalizeTrace } from './session-trace.js'
 import { isMarkdownFile, relativeMarkdownLinks } from '../web/markdown.js'
@@ -23,7 +23,7 @@ import { relayCategories } from '../web/relay-categories.js'
 import {
   ProjectArchiveError, readProjectSelection, readProjectState, writeProjectArchive,
   writeProjectContinuation, writeProjectPin, writeProjectSelection,
-  readProjectRelay, changeProjectRelay,
+  readProjectRelay, changeProjectRelay, saveCodexAliases,
 } from './project-archive.js'
 
 export { canReadConversation, conversationId, conversationTitle, makePrompt, mergeProjects, pathKey, redact } from './handoff.js'
@@ -124,6 +124,10 @@ async function conversationDirectory(cwd) {
   if (info?.isDirectory()) return { path: canonical, identity: `${info.dev}:${info.ino}` }
 }
 
+function hasUnwrittenAttempt(record, state) {
+  return record?.state === 'approved' && !record.seed && record.importAttempt === state
+}
+
 function sortProjects(a, b) {
   return Number(b.online) - Number(a.online)
     || (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')
@@ -183,6 +187,7 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
   const tickets = new Map()
   const openReferences = new Map()
   const conversationTickets = new Map()
+  const sourceIndexes = new WeakMap()
   const watched = new Map()
   const listeners = new Set()
   const monitor = createSourceMonitor({ onChange() {
@@ -575,19 +580,54 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     return { path: source.file, kind: 'file', name: item.name }
   }
 
-  async function readableConversations(project, config) {
+  function conversationSources(project) {
+    if (sourceIndexes.has(project)) return sourceIndexes.get(project)
     const archives = project.archives
       .filter(canReadConversation)
       .sort((a, b) => dateMillis(b.date) - dateMillis(a.date))
-    const unique = new Map()
+    const current = new Map()
+    const aliases = new Map()
     for (const archive of archives) {
-      const id = conversationId(archive)
-      if (!unique.has(id)) unique.set(id, archive)
+      const [id, ...oldIds] = conversationIds(archive)
+      if (!current.has(id)) current.set(id, { id, ids: [id], archive })
+      const source = current.get(id)
+      for (const alias of oldIds) {
+        if (!aliases.has(alias)) aliases.set(alias, source)
+        else if (aliases.get(alias) !== source) aliases.set(alias, null)
+      }
     }
-    const candidates = [...unique]
+    const byId = new Map(current)
+    for (const [alias, source] of aliases) {
+      if (!source || byId.has(alias)) continue
+      source.ids.push(alias)
+      byId.set(alias, source)
+    }
+    const index = { current: [...current.values()], byId }
+    sourceIndexes.set(project, index)
+    return index
+  }
+
+  function sourceFor(project, id) {
+    return (project && conversationSources(project).byId.get(id)) ?? { id, ids: [id] }
+  }
+
+  async function rememberLegacyLinks(config, projectId, links) {
+    const verified = links.filter(([source, alias]) =>
+      source.archive?.profile && source.id !== alias && !source.archive.savedIds?.includes(alias))
+    if (!verified.length) return
+    // A read-only installation can still use the currently verified filesystem links.
+    try { await saveCodexAliases(config, projectId, verified) } catch { return }
+    for (const [source, alias] of verified) {
+      const saved = source.archive.savedIds ??= []
+      if (!saved.includes(alias)) saved.push(alias)
+    }
+  }
+
+  async function readableConversations(project, config) {
+    const candidates = conversationSources(project).current
     const sessions = []
     for (let offset = 0; offset < candidates.length; offset += 8) {
-      const batch = await Promise.all(candidates.slice(offset, offset + 8).map(async ([id, archive]) => {
+      const batch = await Promise.all(candidates.slice(offset, offset + 8).map(async ({ id, archive }) => {
         const probe = await probeConversation(archive, { sourceCwd: project.cwd, config })
         if (probe.state === 'empty') return undefined
         return {
@@ -601,11 +641,16 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     return sessions
   }
 
-  async function loadImportStates(config, projectId, sourceIds) {
+  async function loadImportStates(config, projectId, sources) {
+    const owners = new Map()
+    for (const source of sources) for (const alias of source.ids) owners.set(alias, source)
     const grouped = new Map()
-    for (const entry of await readCompletedConversationImports(config, projectId, sourceIds)) {
-      if (!grouped.has(entry.sourceId)) grouped.set(entry.sourceId, [])
-      grouped.get(entry.sourceId).push(entry)
+    const entries = await readCompletedConversationImports(config, projectId, [...owners.keys()])
+    await rememberLegacyLinks(config, projectId, entries.map(entry => [owners.get(entry.sourceId), entry.sourceId]))
+    for (const entry of entries) {
+      const { id } = owners.get(entry.sourceId)
+      if (!grouped.has(id)) grouped.set(id, [])
+      grouped.get(id).push(entry)
     }
     return new Map(await Promise.all([...grouped].map(async ([sourceId, entries]) => {
       const [latest] = entries
@@ -625,16 +670,17 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     })))
   }
 
-  async function withImportStates(config, projectId, sessions) {
-    const states = await loadImportStates(config, projectId, [...new Set(sessions.map(session => session.id))])
+  async function withImportStates(config, project, sessions) {
+    const sources = [...new Set(sessions.map(session => session.id))].map(id => sourceFor(project, id))
+    const states = await loadImportStates(config, project.id, sources)
     return sessions.map(session => {
       const state = states.get(session.id)
       return state ? { ...session, lastImport: state.lastImport } : session
     })
   }
 
-  async function importStatus(config, projectId, sessionId) {
-    return (await loadImportStates(config, projectId, [sessionId])).get(sessionId)
+  async function importStatus(config, projectId, source) {
+    return (await loadImportStates(config, projectId, [source])).get(source.id)
   }
 
   async function listConversations(projectId, recent, cursor) {
@@ -647,20 +693,21 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     const sessions = await conversationLists.get(projectId)
     const ready = sessions.filter(session => !session.unavailable)
     const unavailable = sessions.filter(session => session.unavailable)
-    if (recent) return { sessions: await withImportStates(config, projectId, ready.slice(0, 3)), total: ready.length,
+    if (recent) return { sessions: await withImportStates(config, project, ready.slice(0, 3)), total: ready.length,
       ...(unavailable.length ? { unavailable: unavailable.slice(0, 20) } : {}) }
     const marker = keyFor(ready.map(({ id }) => id))
     const parsed = typeof cursor === 'string' && /^([0-9a-f]{24}):(\d{1,9})$/.exec(cursor)
     if (cursor && (!parsed || parsed[1] !== marker)) throw new RequestError('会话列表已更新，请从第一页重新打开。', 409)
     const offset = parsed ? Number(parsed[2]) : 0
     const end = offset + 100
-    return { sessions: await withImportStates(config, projectId, ready.slice(offset, end)),
+    return { sessions: await withImportStates(config, project, ready.slice(offset, end)),
       ...(end < ready.length ? { nextCursor: `${marker}:${end}` } : {}),
       ...(!offset && unavailable.length ? { unavailable: unavailable.slice(0, 100) } : {}) }
   }
 
-  async function previewConversation({ projectId, sessionId, targetCwd, snapshotId, searchHit, relayId, inspectSource, duplicate, signal }) {
+  async function previewConversation({ projectId, sessionId, targetCwd, snapshotId, searchHit, relayId, inspectSource, duplicate, signal }, recover = false) {
     if (!isCatalogId(sessionId)) throw new RequestError('会话标识无效。')
+    if (snapshotId !== undefined && !isSessionId(snapshotId)) throw new RequestError('会话预览凭据无效，请重新打开。', 409)
     if (searchHit && (!Number.isSafeInteger(searchHit.turn) || searchHit.turn < 1
       || !Number.isSafeInteger(searchHit.offset) || searchHit.offset < 0 || !isCatalogId(searchHit.hash))) {
       throw new RequestError('搜索结果位置无效。')
@@ -668,33 +715,58 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     const current = await scan()
     const project = requireProject(current, projectId)
     const { config } = current
+    const source = sourceFor(project, sessionId)
+    sessionId = source.id
     const relay = relayId && (await readProjectRelay(config, projectId)).find(item =>
-      item.id === relayId && item.source.id === sessionId)
+      item.id === relayId && source.ids.includes(item.source.id))
     if (relayId && !relay) throw new RequestError('接力条目已移除。', 404)
-    const archive = project.archives.find(item => canReadConversation(item) && conversationId(item) === sessionId)
-    const { lastImport } = await importStatus(config, projectId, sessionId) ?? {}
-    if (lastImport?.sessionId && duplicate !== true && inspectSource !== true && !searchHit && !relay && targetCwd === undefined) {
+    if (relay) await rememberLegacyLinks(config, projectId, [[source, relay.source.id]])
+    const archive = source.archive
+    const { lastImport } = await importStatus(config, projectId, source) ?? {}
+    if (lastImport?.sessionId && !snapshotId && duplicate !== true && inspectSource !== true && !searchHit && !relay && targetCwd === undefined) {
       return { openExisting: true, lastImport, title: conversationTitle(archive?.title, 80) }
     }
     const saved = snapshotId && await readConversationSnapshot(config, snapshotId)
-    const previous = saved?.state === 'preview' ? saved : undefined
-    if ((saved && (saved.projectId !== projectId || saved.sourceId !== sessionId))
+    if (recover && (targetCwd === undefined || !hasUnwrittenAttempt(saved, 'unwritten'))) {
+      throw new RequestError('这次迁入无法改选目录，请从原凭据重试。', 409)
+    }
+    const previous = saved?.state === 'preview' || hasUnwrittenAttempt(saved, 'review') || recover ? saved : undefined
+    const sameSource = saved && (source.ids.includes(saved.sourceId) || (!archive && saved.sourceIds?.includes(sessionId)))
+    if ((snapshotId && (!saved || saved.projectId !== projectId || !sameSource))
       || (targetCwd !== undefined && snapshotId && !previous)) {
       throw new RequestError('会话预览已变化，请重新打开。', 409)
     }
-    if (!archive && !previous) throw new RequestError('找不到这条会话，请刷新项目。', 404)
-    const target = await conversationDirectory(targetCwd ?? saved?.targetCwd ?? project.cwd)
+    // An offline alternate directory still has a pending approval. A supplied snapshot or
+    // explicit target must never select another receipt simply because it has the same source.
+    let pending = saved?.state === 'approved' && !previous ? saved : undefined
+    if (!snapshotId && targetCwd === undefined) {
+      pending = await readPendingConversation(config, projectId, source.ids, project.cwd)
+        ?? await readPendingConversation(config, projectId, source.ids)
+    }
+    const target = await conversationDirectory(targetCwd !== undefined ? targetCwd : pending?.targetCwd ?? saved?.targetCwd ?? project.cwd)
     if (targetCwd !== undefined && !target) throw new RequestError('目标目录不可访问，请选择本机工作目录。', 409)
-    const ready = target && await readPendingConversation(config, projectId, sessionId, target.path)
+    if (!snapshotId && targetCwd !== undefined) pending = await readPendingConversation(config, projectId, source.ids, target.path)
+    const retained = !archive && relay && !snapshotId && await readRetainedRelaySnapshot(config, projectId, relay.source)
+    if (!archive && !previous && !pending && !retained) throw new RequestError('找不到这条会话，请刷新项目。', 404)
     const metadata = {
-      id: randomUUID(), sessionId: randomUUID(), projectId, sourceId: sessionId,
-      sourceCwd: project.cwd, targetCwd: target?.path, targetIdentity: target?.identity,
+      id: randomUUID(), sessionId: randomUUID(), projectId, sourceId: !archive && previous ? previous.sourceId : sessionId,
+      sourceIds: [...new Set([...source.ids, ...(previous?.sourceIds ?? [])])],
+      sourceCwd: previous?.sourceCwd ?? project.cwd, targetCwd: target?.path, targetIdentity: target?.identity,
       title: previous?.title ?? conversationTitle(archive?.title, 80),
     }
-    const record = ready ?? (previous
-      ? (targetCwd === undefined ? previous : await rebindConversation(config, previous, metadata))
-      : await stageConversation(config, metadata, readSourceEvents(archive, { config, sourceCwd: project.cwd, signal }), redact,
-        item => readConversationAttachment(project, archive, item)))
+    let record = retained || pending || previous
+    if (previous && targetCwd !== undefined) {
+      if (previous.state === 'approved') {
+        record = await withApprovedImportLock(config, previous.id, async () => {
+          const rebound = await rebindConversation(config, previous, metadata, { approvedAttempt: previous.importAttempt })
+          if (!rebound) throw new RequestError('迁入凭据已变化，请重新打开预览。', 409)
+          return rebound
+        })
+      } else record = await rebindConversation(config, previous, metadata)
+    } else if (!record) {
+      record = await stageConversation(config, metadata, readSourceEvents(archive, { config, sourceCwd: project.cwd, signal }), redact,
+        item => readConversationAttachment(project, archive, item))
+    }
     if (!record) throw new RequestError('会话预览已变化，请重新打开。', 409)
     const messages = record.messages.map(({ role, text, time }) => ({ role, text, time }))
     if (messages.length) messages[0].text = firstContinuationMessage(record)
@@ -707,14 +779,18 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     const traceCounts = countTrace(trace)
     const { sourceStats, history } = record
     const title = record.title || conversationTitle(messages[0]?.text, 80) || '迁入的 Agent 会话'
-    const canImport = Boolean(target && messages.length && record.targetIdentity === target.identity)
+    const canImport = Boolean(!retained && target && record.targetCwd && pathKey(record.targetCwd) === pathKey(target.path)
+      && messages.length && record.targetIdentity === target.identity)
     const skillCandidates = skillHandoff
       && (!target || pathKey(target.path) === pathKey(project.cwd))
       ? await skillHandoff.conversationCandidates(project, record.usedSkills, (await detail(projectId)).skills)
       : []
     return {
       title, messages, ticket: canImport ? record.id : null, canImport, cwd: project.cwd,
-      sourceCwd: project.cwd, targetCwd: target?.path, history, resumePending: record.state === 'approved',
+      sourceCwd: record.sourceCwd ?? project.cwd, targetCwd: record.targetCwd, history,
+      resumePending: !retained && record.state === 'approved' && !hasUnwrittenAttempt(record, 'review'),
+      ...(!retained && hasUnwrittenAttempt(record, 'review') ? { continuationLocked: true } : {}),
+      ...(!retained && hasUnwrittenAttempt(record, 'unwritten') ? { recoveryTicket: record.id } : {}),
       truncated: record.truncated || traceTruncated, skillCandidates, trace, traceCounts, sourceStats,
       ...(historyLocation ? { historyLocation } : searchHit ? { searchHitStale: true } : {}),
       ...(record.continuation ? { continuation: record.continuation } : {}),
@@ -727,7 +803,11 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     const current = await scan()
     const { config } = current
     const project = requireProject(current, input.projectId)
-    if (action === 'project-relay') return { items: await readProjectRelay(config, project.id) }
+    if (action === 'project-relay') {
+      const items = await readProjectRelay(config, project.id)
+      await rememberLegacyLinks(config, project.id, items.map(item => [sourceFor(project, item.source.id), item.source.id]))
+      return { items }
+    }
     if (action === 'export-relay') {
       const items = await readProjectRelay(config, project.id)
       if (!items.length) throw new RequestError('请先添加接力条目。', 409)
@@ -759,14 +839,14 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
       throw new RequestError('来源摘录无效。')
     }
     const [excerpt] = await readContextExcerpts(config, project.id, [{ snapshotId, seq, offset }]) ?? []
-    const archive = excerpt && project.archives.find(item => conversationId(item) === excerpt.sourceId)
-    if (!archive || !excerpt.turn) throw new RequestError('来源摘录已过期或没有可定位的回合。', 409)
-    const source = { id: excerpt.sourceId, title: excerpt.title || '未命名对话', agent: archive.agent ?? archive.kind,
+    const origin = excerpt && sourceFor(project, excerpt.sourceId)
+    if (!origin?.archive || !excerpt.turn) throw new RequestError('来源摘录已过期或没有可定位的回合。', 409)
+    const source = { id: origin.id, title: excerpt.title || '未命名对话', agent: origin.archive.agent ?? origin.archive.kind,
       turn: excerpt.turn, kind: excerpt.kind, seq, offset, hash: keyFor(excerpt.text) }
-    const id = keyFor(source.id, source.turn, seq, offset, source.hash)
+    const [id, ...previousIds] = origin.ids.map(alias => keyFor(alias, source.turn, seq, offset, source.hash))
     return changeProjectRelay(config, project.id, id, previous => previous ?? {
       id, category: input.category, text: excerpt.text, source,
-    })
+    }, previousIds)
   }
 
   async function reviewContinuation(record, config, excerpts = []) {
@@ -797,6 +877,42 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
     return reviewContinuation(record, config, excerpts)
   }
 
+  async function writeApprovedConversation(config, ticket) {
+    return withApprovedImportLock(config, ticket, async () => {
+      const record = await readConversationSnapshot(config, ticket)
+      if (record?.state === 'done') return { sessionId: record.sessionId }
+      if (record?.state !== 'approved') throw new RequestError('迁入凭据已变化，请重新打开预览。', 409)
+      const previouslyUnwritten = !record.seed && ['ready', 'unwritten', 'review'].includes(record.importAttempt)
+      const target = await conversationDirectory(record.targetCwd)
+      record.config = config
+      record.title ||= conversationTitle(record.messages[0].text, 80) || '迁入的 Agent 会话'
+      record.trace = conversationTrace(record.trace, record.messages.length).trace
+      let result
+      try {
+        if (!target || pathKey(target.path) !== pathKey(record.targetCwd) || target.identity !== record.targetIdentity) {
+          throw Object.assign(new RequestError('目标目录已变化，请核对原迁入目录。', 409), { nativeSessionUnwritten: true })
+        }
+        // Persist uncertainty before dispatch: a crash, timeout or older receipt must
+        // never let a later pre-write failure authorize a second DSH session.
+        if (!await setConversationAttempt(config, ticket, 'unknown')) throw new RequestError('迁入凭据已变化，请重新打开预览。', 409)
+        result = await importConversation(record, target.path)
+        await finishConversation(config, ticket, record.nativeTimeline)
+      } catch (error) {
+        const unwritten = previouslyUnwritten && error.nativeSessionUnwritten === true
+        const message = unwritten ? 'DSH 尚未写入这条会话，可重试或改选目录。' : record.stored
+          ? '会话历史已写入，暂时无法加入工作区。可重试打开。' : '无法确认 DSH 会话的写入结果，请在原目录重试。'
+        const failure = error.status ? error : new RequestError(message, 503)
+        if (unwritten && await setConversationAttempt(config, ticket, 'unwritten')) failure.recoveryTicket = ticket
+        throw failure
+      }
+      try {
+        await writeProjectContinuation(config, record.projectId)
+        await synchronizeProjectState()
+      } catch { /* A saved session remains usable even if the recents index cannot be updated. */ }
+      return result
+    })
+  }
+
   async function commitConversation({ ticket, excerpts, contextKey, duplicate }) {
     if (!isSessionId(ticket)) throw new RequestError('会话预览已过期，请重新打开。', 409)
     const copy = duplicate === true
@@ -816,14 +932,17 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
         throw new RequestError('续聊内容已确定，请重新打开迁入预览。', 409)
       }
       if (record.state === 'done') return { sessionId: record.sessionId }
-      const getStatus = () => importStatus(config, record.projectId, record.sourceId)
+      const project = (snapshot ?? await scan()).projects.find(item => item.id === record.projectId)
+      const source = sourceFor(project, record.sourceId)
+      const sourceIds = [...new Set([...source.ids, ...(record.sourceIds ?? [])])]
+      const getStatus = () => importStatus(config, record.projectId, { ...source, ids: sourceIds })
       const prior = record.state === 'preview' && !copy ? await getStatus() : undefined
       if (prior?.lastImport.sessionId) return reuse(prior.lastImport)
-      const target = await conversationDirectory(record.targetCwd)
-      if (!target || pathKey(target.path) !== pathKey(record.targetCwd) || target.identity !== record.targetIdentity) {
-        throw new RequestError('目标目录已变化，请重新选择目录。', 409)
-      }
       if (record.state === 'preview') {
+        const target = await conversationDirectory(record.targetCwd)
+        if (!target || pathKey(target.path) !== pathKey(record.targetCwd) || target.identity !== record.targetIdentity) {
+          throw new RequestError('目标目录已变化，请重新选择目录。', 409)
+        }
         const continuation = excerpts !== undefined || contextKey !== undefined
           ? await reviewContinuation(record, config, excerpts) : null
         if (continuation && continuation.contextKey !== contextKey) {
@@ -831,30 +950,13 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
         }
         // Recheck receipts atomically with approval, including receipts completed after the host lookup.
         const unavailableImports = copy ? undefined : prior?.unavailableImports ?? []
-        if (!await approveConversation(config, ticket, continuation, { unavailableImports })) {
+        if (!await approveConversation(config, ticket, continuation, { unavailableImports, sourceIds })) {
           const completed = !copy && (await getStatus())?.lastImport
           if (completed?.sessionId) return reuse(completed)
           throw new RequestError('会话预览已过期或正在迁入，请重新打开。', 409)
         }
-        record.continuation = continuation
       }
-      record.config = config
-      record.title ||= conversationTitle(record.messages[0].text, 80) || '迁入的 Agent 会话'
-      record.trace = conversationTrace(record.trace, record.messages.length).trace
-      let result
-      try {
-        result = await importConversation(record, target.path)
-        await finishConversation(config, ticket, record.nativeTimeline)
-      } catch (error) {
-        if (error.status) throw error
-        const message = record.stored ? '会话历史已写入，暂时无法加入工作区。可重试打开。' : '无法将会话写入 DSH。请检查工作区和会话存储后重试。'
-        throw new RequestError(message, 503)
-      }
-      try {
-        await writeProjectContinuation(record.config, record.projectId)
-        await synchronizeProjectState()
-      } catch { /* A saved session remains usable even if the recents index cannot be updated. */ }
-      return result
+      return writeApprovedConversation(config, ticket)
     })().finally(() => conversationTickets.delete(ticket))
     conversationTickets.set(ticket, { pending, requestKey })
     return pending
@@ -956,21 +1058,25 @@ export function createCatalog(loadConfig, { importConversation, canOpenConversat
         return { ...result, revision }
       }
       if (['list-conversations', 'search-conversations', 'conversation-import-status',
-        'preview-conversation', 'preview-conversation-context', 'import-conversation'].includes(action)) {
+        'preview-conversation', 'preview-conversation-context', 'retarget-failed-conversation', 'import-conversation'].includes(action)) {
         if (!importConversation) throw new RequestError('当前 DSH 未提供会话迁入服务。', 409)
         if (action === 'list-conversations') return listConversations(input.projectId, input.recent === true, input.cursor)
         if (action === 'search-conversations') {
           const current = await scan()
-          const result = await searchConversations(requireProject(current, input.projectId), current.config, input)
-          return { ...result, matches: await withImportStates(current.config, input.projectId, result.matches) }
+          const project = requireProject(current, input.projectId)
+          const result = await searchConversations(project, current.config, input)
+          return { ...result, matches: await withImportStates(current.config, project, result.matches) }
         }
         if (action === 'conversation-import-status') {
           if (!isCatalogId(input.sessionId)) throw new RequestError('会话标识无效。')
           const current = await scan()
           const project = requireProject(current, input.projectId)
-          return { lastImport: (await importStatus(current.config, project.id, input.sessionId))?.lastImport ?? null }
+          return { lastImport: (await importStatus(current.config, project.id, sourceFor(project, input.sessionId)))?.lastImport ?? null }
         }
         if (action === 'preview-conversation') return previewConversation(input)
+        if (action === 'retarget-failed-conversation') return previewConversation({
+          projectId: input.projectId, sessionId: input.sessionId, snapshotId: input.ticket, targetCwd: input.targetCwd,
+        }, true)
         if (action === 'preview-conversation-context') return previewContinuation(input)
         return commitConversation(input)
       }

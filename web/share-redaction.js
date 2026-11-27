@@ -70,14 +70,18 @@ function validIpv6(value) {
     && (compressed.length === 2 ? parts.length < 8 : parts.length === 8)
 }
 
-const knownSecrets = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|\b(?:sk-[\w-]{12,}|gh[pousr]_\w{20,}|github_pat_\w{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|eyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]{5,})\b/gu
+const keyLabel = '[A-Z0-9 ]*PRIVATE KEY-----'
+export const privateKeyMarkers = new RegExp(`-----(BEGIN|END) ${keyLabel}`, 'gu')
+const privateKey = `-----BEGIN ${keyLabel}[\\s\\S]*?-----END ${keyLabel}`
+const tokens = /\b(?:sk-[\w-]{12,}|gh[pousr]_\w{20,}|github_pat_\w{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|eyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]{5,})\b/u
+const knownSecrets = new RegExp(`${privateKey}|${tokens.source}`, 'gu')
 const authValues = /\b(?:Bearer|Authorization["']?[ \t]*[:=][ \t]*["']?Basic)[ \t]+([\w+/=-]{8,}(?:\.[\w+/=-]+)*)/gidu
 const assignedValues = /\b(?:[a-z0-9]+[-_]){0,8}(?:api[-_]?key|secret[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|auth[-_]?token|client[-_]?secret|password|passwd|secret|token|cookie)["']?[ \t]*[:=][ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s<>"'`,;|&()\[\]{}]+))/gidu
 const urlCredentials = /:\/\/([^/\s:@<>"'`]+:[^/\s@<>"'`]+)@/gdu
 const masked = /^(?:\[已隐藏(?:凭据|私钥)?\]|\[REDACTED\]|〈[^〉]+已脱敏〉|\*+|<redacted>)$/iu
 
-export function findShareFindings(markdown) {
-  const candidates = []
+export function findShareFindings(markdown, privateKeyFragments = []) {
+  const candidates = privateKeyFragments.map(({ start, end }) => ({ kind: 'credential', start, end }))
   function add(kind, start, end) {
     if (end > start) candidates.push({ kind, start, end })
   }

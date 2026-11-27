@@ -144,6 +144,31 @@ export async function writeProjectContinuation(config, projectId) {
   })
 }
 
+export async function readCodexAliases(config) {
+  const projects = new Map()
+  await readArchive(config, db => {
+    if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='codex_source_aliases'").get()) return
+    for (const { project_id, source_id, alias } of db.prepare('SELECT project_id,source_id,alias FROM codex_source_aliases WHERE source_id IS NOT NULL').iterate()) {
+      if (!projects.has(project_id)) projects.set(project_id, new Map())
+      const sources = projects.get(project_id)
+      if (!sources.has(source_id)) sources.set(source_id, [])
+      sources.get(source_id).push(alias)
+    }
+  })
+  return projects
+}
+
+export async function saveCodexAliases(config, projectId, links) {
+  await writeArchive(config, true, db => {
+    db.exec(`CREATE TABLE IF NOT EXISTS codex_source_aliases (
+      project_id TEXT NOT NULL, alias TEXT NOT NULL, source_id TEXT, PRIMARY KEY (project_id,alias)
+    ) STRICT`)
+    const insert = db.prepare(`INSERT INTO codex_source_aliases VALUES (?,?,?) ON CONFLICT(project_id,alias)
+      DO UPDATE SET source_id=NULL WHERE source_id<>excluded.source_id`)
+    for (const [source, alias] of links) insert.run(projectId, alias, source.id)
+  })
+}
+
 export async function readProjectRelay(config, projectId) {
   return await readArchive(config, db => {
     if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE name='project_relay' AND type='table'").get()) return []
@@ -152,17 +177,19 @@ export async function readProjectRelay(config, projectId) {
   }) ?? []
 }
 
-export async function changeProjectRelay(config, projectId, id, change) {
+export async function changeProjectRelay(config, projectId, id, change, previousIds = []) {
   return writeArchive(config, true, db => {
     db.exec(`CREATE TABLE IF NOT EXISTS project_relay (
       project_id TEXT NOT NULL, id TEXT NOT NULL, item TEXT NOT NULL, PRIMARY KEY (project_id,id)
     ) STRICT`)
-    const row = db.prepare('SELECT item FROM project_relay WHERE project_id=? AND id=?').get(projectId, id)
+    const row = db.prepare(`SELECT id,item FROM project_relay WHERE project_id=? AND id IN (SELECT value FROM json_each(?))
+      ORDER BY (id=?) DESC,rowid LIMIT 1`).get(projectId, JSON.stringify([id, ...previousIds]), id)
+    const storedId = row?.id ?? id
     const item = change(row && JSON.parse(row.item))
     if (item) {
       db.prepare(`INSERT INTO project_relay VALUES (?,?,?) ON CONFLICT(project_id,id)
-        DO UPDATE SET item=excluded.item`).run(projectId, id, JSON.stringify(item))
-    } else db.prepare('DELETE FROM project_relay WHERE project_id=? AND id=?').run(projectId, id)
+        DO UPDATE SET item=excluded.item`).run(projectId, storedId, JSON.stringify(item))
+    } else db.prepare('DELETE FROM project_relay WHERE project_id=? AND id=?').run(projectId, storedId)
     return item ?? null
   })
 }

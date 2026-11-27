@@ -22,6 +22,7 @@ const core = [
   'src/skill-output.js',
   'src/skill-package.js',
   'web/markdown.js',
+  'web/share-redaction.js',
   'web/vendor/markdown-it.mjs',
   'web/vendor/markdown-it-LICENSE.txt',
 ]

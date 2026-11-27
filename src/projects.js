@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 import { sourceJson, sourceJsonl, sourceValueLimit } from './conversation-readers.js';
+import { conversationId, keyFor, pathKey as projectPathKey } from './handoff.js';
+import { readCodexAliases } from './project-archive.js';
 
 const maxMessages = 36;
 const maxMessageLength = 4_000;
@@ -16,6 +18,7 @@ const codexLocations = ['sessions', 'archived_sessions'];
 const jsonlFile = /\.jsonl$/i;
 const compressedCodexFile = /\.jsonl\.zst$/i;
 const hasZstd = typeof zlib.createZstdDecompress === 'function';
+const indexedCodexHeaders = new Map();
 const conversationLimits = { messages: 600, characters: 160_000, messageLength: 24_000 };
 const traceItemLimit = 600;
 const traceTextLimit = 8_000;
@@ -192,7 +195,35 @@ async function archivedProjects(file) {
   });
 }
 
-async function codexProjects(root) {
+async function indexedCodexMetadata(file, info) {
+  const stamp = [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':');
+  const cached = indexedCodexHeaders.get(file);
+  if (cached?.stamp === stamp) return cached.meta;
+  const input = compressedCodexFile.test(file) ? zstdChunks(file) : createReadStream(file, { highWaterMark: 8 * 1024 });
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of input) {
+    const newline = chunk.indexOf(10);
+    const line = newline < 0 ? chunk : chunk.subarray(0, newline);
+    bytes += line.length;
+    if (bytes > transcriptHeaderBytes) break;
+    chunks.push(line);
+    if (newline >= 0) break;
+  }
+  const row = bytes <= transcriptHeaderBytes && json(Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, ''));
+  const payload = row?.type === 'session_meta' && row.payload;
+  const meta = payload ? {
+    id: typeof payload.id === 'string' ? payload.id : undefined,
+    cwd: typeof payload.cwd === 'string' ? payload.cwd : undefined,
+  } : undefined;
+  // Keep only identity fields, never conversation text. Unchanged indexed rolls
+  // already require a stat for containment/type checking and need no second read.
+  if (!cached && indexedCodexHeaders.size >= 16_384) indexedCodexHeaders.delete(indexedCodexHeaders.keys().next().value);
+  indexedCodexHeaders.set(file, { stamp, meta });
+  return meta;
+}
+
+async function codexProjects(root, configured) {
   const entries = await directories(root);
   const states = entries.filter(entry => entry.isFile() && /^state_\d+\.sqlite$/.test(entry.name));
   states.sort((a, b) => Number(b.name.match(/\d+/)[0]) - Number(a.name.match(/\d+/)[0]));
@@ -216,11 +247,35 @@ async function codexProjects(root) {
   }
   const bases = await transcriptDirectories(root, codexLocations);
   if (!bases.length) throw indexError ?? missingStore();
+  const profile = codexLocations.includes(path.basename(root).toLowerCase()) ? path.dirname(root) : root;
+  const rolloutRoots = configured.some(dir => pathKey(dir) === pathKey(profile))
+    ? codexLocations.map(name => path.join(profile, name))
+    : configured.filter(dir => pathKey(path.dirname(dir)) === pathKey(profile) && codexLocations.includes(path.basename(dir).toLowerCase()));
+  const threadKey = (cwd, id) => typeof cwd === 'string' && typeof id === 'string' && id.trim()
+    ? JSON.stringify([pathKey(cwd), id]) : undefined;
+  const observed = new Map();
+  function remember(key, file) {
+    if (!key || typeof file !== 'string' || !path.isAbsolute(file)) return;
+    // Windows index rows sometimes store a namespaced path; realpath(), which
+    // supplied the old bridge IDs, returned the ordinary absolute path.
+    const clean = path.normalize(process.platform === 'win32'
+      ? file.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '') : file);
+    if (!(jsonlFile.test(clean) || compressedCodexFile.test(clean)) || !rolloutRoots.some(base => inside(base, clean))) return;
+    if (!observed.has(key)) observed.set(key, new Set());
+    observed.get(key).add(clean);
+  }
   const byFile = new Map();
   for (let offset = 0; offset < (indexed?.length ?? 0); offset += 32) {
     const batch = await Promise.all(indexed.slice(offset, offset + 32).map(async ({ id, cwd, rollout_path, date, title }) => {
-      const file = await resolveCodexTranscript(rollout_path, bases);
-      return file ? { cwd, agent: 'codex', archive: { kind: 'codex', file, root, id, date, title } } : undefined;
+      if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) return;
+      remember(threadKey(cwd, id), rollout_path);
+      const found = await resolveCodexTranscript(rollout_path, bases);
+      if (!found) return;
+      const { file, info } = found;
+      const meta = await indexedCodexMetadata(file, info).catch(() => undefined);
+      if ((meta?.id && id && meta.id !== id)
+        || (meta && (!meta.cwd || !path.isAbsolute(meta.cwd) || (pathKey(meta.cwd) !== pathKey(cwd) && !await sameDirectory(meta.cwd, cwd))))) return;
+      return { cwd, agent: 'codex', archive: { kind: 'codex', file, root, id: meta?.id || id, date, title } };
     }));
     for (const project of batch.filter(Boolean)) {
       const key = pathKey(project.archive.file);
@@ -229,15 +284,25 @@ async function codexProjects(root) {
   }
   // SQLite can lag an active or archived transcript. Keep its titles for
   // resolved files and discover any additional plain or compressed transcripts.
-  const byId = new Set([...byFile.values()].map(project => project.archive.id).filter(Boolean));
+  const byId = new Set([...byFile.values()].map(project => threadKey(project.cwd, project.archive.id)).filter(Boolean));
   const include = file => !byFile.has(pathKey(file))
     && (jsonlFile.test(file) || (hasZstd && compressedCodexFile.test(file)));
   const fallback = await scanJsonlProjects(root, 'codex', bases, 4, include);
   for (const project of fallback) {
     const { file, id } = project.archive;
-    if (id && byId.has(id)) continue;
-    if (id) byId.add(id);
+    const key = threadKey(project.cwd, id);
+    remember(key, file);
+    if (key && byId.has(key)) continue;
+    if (key) byId.add(key);
     byFile.set(pathKey(file), project);
+  }
+  for (const { cwd, archive } of byFile.values()) {
+    const key = threadKey(cwd, archive.id);
+    if (!key) continue;
+    archive.profile = profile;
+    archive.rolloutRoots = rolloutRoots;
+    const previousFiles = [...observed.get(key) ?? []].filter(file => file !== archive.file);
+    if (previousFiles.length) archive.previousFiles = previousFiles;
   }
   return [...byFile.values()];
 }
@@ -250,7 +315,8 @@ async function resolveCodexTranscript(file, bases) {
     const actual = await physicalPath(candidate);
     if (!actual || !bases.some(base => inside(base, actual))
       || !(jsonlFile.test(actual) || hasZstd && compressedCodexFile.test(actual))) continue;
-    if ((await stat(actual).catch(() => undefined))?.isFile()) return actual;
+    const info = await stat(actual, { bigint: true }).catch(() => undefined);
+    if (info?.isFile()) return { file: actual, info };
   }
 }
 
@@ -502,7 +568,7 @@ export async function scanProjects(config, { includeTranscripts = true } = {}) {
     let found = 0;
     for (const file of candidates) {
       try {
-        const rows = await load(file);
+        const rows = await load(file, candidates);
         for (const row of rows) projects.push(row);
         found += rows.length;
         succeeded++;
@@ -542,11 +608,20 @@ export async function scanProjects(config, { includeTranscripts = true } = {}) {
     const key = pathKey(project.cwd);
     if (!canonical.has(key)) canonical.set(key, await physicalPath(project.cwd) ?? path.normalize(project.cwd));
     project.cwd = canonical.get(key);
+    if (project.archive?.profile) project.archive.sourceCwd = project.cwd;
     const timestamp = dateMillis(project.archive?.date);
     if (timestamp > 0 && timestamp < 8_640_000_000_000_000) project.updatedAt = new Date(timestamp).toISOString();
     const identity = JSON.stringify([pathKey(project.cwd), project.agent, project.projectId, project.archive?.kind, project.archive?.file, project.archive?.id]);
     const previous = discovered.get(identity);
     if (!previous || compareDate(project.archive?.date, previous.archive?.date) > 0) discovered.set(identity, project);
+  }
+  const sourcesWithThreads = [...discovered.values()].filter(item => item.archive?.profile);
+  if (sourcesWithThreads.length && config.configFile) {
+    const aliases = await readCodexAliases(config).catch(() => new Map());
+    for (const { cwd, archive } of sourcesWithThreads) {
+      const known = aliases.get(keyFor(projectPathKey(cwd)))?.get(conversationId(archive));
+      if (known) archive.savedIds = known;
+    }
   }
   return { projects: [...discovered.values()], sources: sources.sort((a, b) => a.id.localeCompare(b.id)) };
 }
@@ -1214,7 +1289,7 @@ async function allowedJsonl(descriptor, config) {
   const bases = (await Promise.all(configuredRoots(config, descriptor.kind)
     .map(root => transcriptDirectories(root, locations)))).flat();
   let file;
-  if (codex) file = await resolveCodexTranscript(descriptor.file, bases);
+  if (codex) file = (await resolveCodexTranscript(descriptor.file, bases))?.file;
   else {
     for (const base of bases) {
       file = await scopedFile(descriptor.file, base);

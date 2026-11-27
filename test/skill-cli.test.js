@@ -76,6 +76,33 @@ test('the independently installed DSH skill selects the requested conversation a
   assert.match(exported, /Use the approved approach/)
   assert.doesNotMatch(exported, /file:\/\/|Selected chat|Latest chat/)
 
+  await t.test('handoff share masks sensitive spans on stdout and in saved Markdown', async () => {
+    const original = [
+      'Mail release-team@example.test.',
+      'Open "C:\\Users\\Fixture Person\\private\\board.md".',
+      'Use 10.20.30.40 with SESSION_TOKEN="test-session-value".',
+      'Keep [guide](https://example.org/docs/guide.md).',
+    ].join('\n')
+    const masked = [
+      'Mail 〈邮箱已脱敏〉.',
+      'Open "〈本机路径已脱敏〉".',
+      'Use 〈IP 已脱敏〉 with SESSION_TOKEN="〈凭据已脱敏〉".',
+      'Keep [guide](https://example.org/docs/guide.md).',
+    ].join('\n')
+    await appendFile(path.join(memory, 'progress.md'), original + '\n')
+    const args = ['handoff', '--no-history', '--asset', asset, '--format']
+    const { stdout: local } = await invoke([...args, 'local'])
+    assert.ok(local.includes('release-team@example.test'))
+    assert.ok(local.includes('C:\\Users\\Fixture Person\\private\\board.md'))
+    const saved = path.join(project, 'share-handoff.md')
+    await invoke([...args, 'share', '--output', saved])
+    const { stdout } = await invoke([...args, 'share'])
+    for (const document of [stdout, await readFile(saved, 'utf8')]) {
+      assert.doesNotMatch(document, /release-team@example\.test|Fixture Person|10\.20\.30\.40|test-session-value/)
+      assert.ok(document.includes(masked), 'surrounding Markdown and the four default replacement labels are preserved')
+    }
+  })
+
   const bad = spawnSync(process.execPath, [cli, 'handoff', '--project', other, '--agent', 'codex', '--session', session],
     { env, encoding: 'utf8' })
   assert.equal(bad.status, 1)
@@ -214,5 +241,44 @@ test('the independently installed DSH skill selects the requested conversation a
     assert.equal(second.nextCursor, null)
     await append([{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'New data' }] }])
     await assert.rejects(invoke([...args, '--cursor', first.nextCursor]), /分页位置已变化/)
+  })
+
+  await t.test('history share masks tool output across storage pages without cutting surrounding text', async () => {
+    const source = path.join(day, 'rollout-2026-11-19T11-00-00-old.jsonl')
+    const prefix = 'detail\n'.repeat(9142)
+    const ending = '\nRead "/home/fixture/private plan.md".\nSESSION_TOKEN=trace-fixture\nEnd of tool output.'
+    const original = prefix + 'trace-qa@example.test' + ending
+    const events = [
+      { type: 'function_call', name: 'read', call_id: 'trace-share', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'trace-share', output: original },
+    ]
+    await appendFile(source, events.map(payload => JSON.stringify({ type: 'response_item', payload })).join('\n') + '\n')
+    const args = ['history', '--session', session, '--include-trace', '--format']
+    const local = path.join(project, 'trace-local.md')
+    await invoke([...args, 'local', '--output', local])
+    assert.ok((await readFile(local, 'utf8')).includes(original), 'local export retains the complete trace')
+    const file = path.join(project, 'trace-share.md')
+    await invoke([...args, 'share', '--output', file])
+    const document = await readFile(file, 'utf8')
+    assert.ok(!document.includes('trace-qa@example.test'), 'share export leaked the email split between storage parts')
+    assert.ok(document.includes(prefix + '〈邮箱已脱敏〉\nRead "〈本机路径已脱敏〉".\nSESSION_TOKEN=〈凭据已脱敏〉\nEnd of tool output.'))
+  })
+
+  await t.test('history share masks a private key spread over records and keeps text after an unmatched opening', async () => {
+    const source = path.join(day, 'rollout-2026-11-19T11-00-00-old.jsonl')
+    const messages = [
+      'Before key\n-----BEGIN RSA PRIVATE KEY-----\nfixture-key-prefix',
+      'fixture-key-suffix\n-----END RSA PRIVATE KEY-----\nAfter key',
+      'Unclosed example\n-----BEGIN PRIVATE KEY-----\nKeep this paragraph for review.',
+    ]
+    await appendFile(source, messages.map(text => JSON.stringify({ type: 'response_item', payload: {
+      type: 'message', role: 'assistant', content: [{ type: 'output_text', text }],
+    } })).join('\n') + '\n')
+    const file = path.join(project, 'share-key.md')
+    await invoke(['history', '--session', session, '--format', 'share', '--output', file])
+    const document = await readFile(file, 'utf8')
+    assert.ok(!document.includes('fixture-key-prefix') && !document.includes('fixture-key-suffix'), 'share export leaked a split private key')
+    assert.ok(document.includes('Before key\n〈凭据已脱敏〉\nAfter key'))
+    assert.ok(document.includes(messages[2]))
   })
 })

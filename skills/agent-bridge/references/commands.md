@@ -15,12 +15,12 @@
 - `history --session '<会话 ID>'` 查看一页来源记录，包括文本、可读取的工具过程、附件元数据和缺失项。
 - `history --session '<会话 ID>' --turn 3` 只查看第 3 轮。结果里出现 `nextCursor` 时，用相同的项目、来源、会话和回合参数再加 `--cursor '<当前位置>'`。源档案变化时从该会话第一页重新查看。
 - `attachment --session '<会话 ID>' --attachment '<附件 ID>' --output '附件路径'` 保存可读取的附件。用历史页返回的 `attachmentId`。已存在的输出文件会保留。只有原始记录内嵌的数据或来源范围内仍可读取的文件能保存。
-- `history --session '<会话 ID>' --output '会话.md' --format local` 保存完整可读取历史。加 `--include-trace` 包含工具调用和结果。`--format share` 生成分享版。需要分享时，检查正文和工具输出中是否还有用户不想公开的内容。
+- `history --session '<会话 ID>' --output '会话.md' --format local` 保存完整可读取历史。加 `--include-trace` 包含工具调用和结果。`--format share` 自动替换正文及工具记录中识别到的本机路径、邮箱、IP 和凭据。分享前打开文件，检查是否还有用户不想公开的内容。
 
 ## 生成接续稿
 
 - `handoff --session '<会话 ID>' --asset '<资料 ID>'` 合并已选会话与资料。需要多份资料时重复 `--asset`。省略会话 ID 会选最新可读会话，只交接资料时加 `--no-history`。
-- `handoff --output '交接.md' --format local` 保存本机 Markdown，可用 `--format share` 保存分享版。省略输出文件时，默认返回接续草稿供当前对话使用。
+- `handoff --output '交接.md' --format local` 保存本机 Markdown。`handoff --format share` 在终端显示自动脱敏的分享版，可加 `--output '分享.md'` 保存。两个选项都省略时，返回供当前对话使用的接续草稿。
 - 原工作区离线时可以从档案交接。开始实际开发前，请在 DSH 打开用户指定的新工作目录。
 
 ## DSH 原生迁入和 Skill 启用

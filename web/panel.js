@@ -395,7 +395,12 @@ async function api(action, values = {}, { keepalive = false, signal } = {}) {
     keepalive, signal,
   })
   const data = await response.json().catch(() => null)
-  if (!response.ok || !data) throw new Error(data?.error || '无法连接 DSH 插件。')
+  if (!response.ok || !data) {
+    const error = new Error(data?.error || '无法连接 DSH 插件。')
+    error.status = response.status
+    if (typeof data?.recoveryTicket === 'string') error.recoveryTicket = data.recoveryTicket
+    throw error
+  }
   return data
 }
 
@@ -2187,10 +2192,11 @@ function chooseHistoryCopy() {
   if (!historyImport.hidden && !historyImport.disabled) historyImport.focus()
 }
 
-async function previewSourceConversation(session, { targetCwd, searchHit, relayId, duplicate = false } = {}) {
+async function previewSourceConversation(session, { targetCwd, searchHit, relayId, duplicate = false, refreshTicket, recoveryTicket } = {}) {
   const epoch = dialogEpoch
   const revision = ++historyPreview
-  if (targetCwd) {
+  const updating = Boolean(targetCwd || refreshTicket)
+  if (updating) {
     setDialogBusy(true)
   } else {
     releaseHistoryPreview()
@@ -2218,17 +2224,20 @@ async function previewSourceConversation(session, { targetCwd, searchHit, relayI
   status('', false, 'dialog-status')
   const active = () => dialog.open && dialogEpoch === epoch && revision === historyPreview
   try {
-    const previousSnapshot = targetCwd ? historySnapshotId
-      : [...heldHistorySnapshots].find(([, sourceId]) => sourceId === session.id)?.[0]
-    const result = await api('preview-conversation', {
-      projectId: historyProject.id, sessionId: session.id,
-      ...(previousSnapshot ? { snapshotId: previousSnapshot } : {}),
-      ...(targetCwd ? { targetCwd } : {}),
-      ...(searchHit ? { searchHit } : {}),
-      ...(relayId ? { relayId } : {}),
-      ...(relayPicking ? { inspectSource: true } : {}),
-      ...(duplicate ? { duplicate: true } : {}),
-    })
+    const previousSnapshot = refreshTicket ?? (targetCwd ? historySnapshotId
+      : [...heldHistorySnapshots].find(([, sourceId]) => sourceId === session.id)?.[0])
+    const identifiers = { projectId: historyProject.id, sessionId: session.id }
+    const result = recoveryTicket
+      ? await api('retarget-failed-conversation', { ...identifiers, ticket: recoveryTicket, targetCwd })
+      : await api('preview-conversation', {
+        ...identifiers,
+        ...(previousSnapshot ? { snapshotId: previousSnapshot } : {}),
+        ...(targetCwd ? { targetCwd } : {}),
+        ...(searchHit ? { searchHit } : {}),
+        ...(relayId ? { relayId } : {}),
+        ...(relayPicking || refreshTicket ? { inspectSource: true } : {}),
+        ...(duplicate ? { duplicate: true } : {}),
+      })
     const snapshotId = result.history?.snapshotId
     if (!active()) {
       if (snapshotId && !result.resumePending && !heldHistorySnapshots.has(snapshotId)) discardHistorySnapshot(snapshotId)
@@ -2242,6 +2251,7 @@ async function previewSourceConversation(session, { targetCwd, searchHit, relayI
       for (const item of moved) {
         historyExcerpts.set(excerptKey(item), item)
       }
+      heldHistorySnapshots.delete(previousSnapshot)
       heldHistorySnapshots.set(snapshotId, session.id)
     }
     if (snapshotId !== historySnapshotId) releaseHistoryPreview()
@@ -2266,7 +2276,9 @@ async function previewSourceConversation(session, { targetCwd, searchHit, relayI
     if (result.targetCwd && result.targetCwd !== original) {
       target.append(text('span', '迁入目录'), text('code', result.targetCwd, 'preview-source'))
     }
-    const directory = result.history && !result.resumePending ? text('details', '', 'source-archive') : undefined
+    const canRetarget = Boolean(result.recoveryTicket)
+    const lockedContext = result.resumePending || result.continuationLocked
+    const directory = result.history && (!result.resumePending || canRetarget) ? text('details', '', 'source-archive') : undefined
     if (directory) {
       const form = text('form', '', 'history-target-form')
       const input = document.createElement('input')
@@ -2283,7 +2295,10 @@ async function previewSourceConversation(session, { targetCwd, searchHit, relayI
       for (const project of catalog.filter(project => project.online)) {
         suggested.append(new Option(project.name, project.cwd))
       }
-      const verify = text('button', '核对目录', 'secondary')
+      const verifyDirectory = path => previewSourceConversation(session, {
+        targetCwd: path, duplicate: historyCopy, recoveryTicket: result.recoveryTicket,
+      })
+      const verify = text('button', canRetarget ? '放弃旧目录并核对新目录' : '核对目录', 'secondary')
       verify.type = 'submit'
       const browse = archiveButton('浏览本机目录', async () => {
         if (dialogBusy) return
@@ -2293,7 +2308,7 @@ async function previewSourceConversation(session, { targetCwd, searchHit, relayI
           const { path } = await requestParent('pick-history-directory')
           if (path && form.isConnected) {
             input.value = path
-            await previewSourceConversation(session, { targetCwd: path, duplicate: historyCopy })
+            if (!canRetarget) await verifyDirectory(path)
           }
         } catch (error) {
           status(error.message, true, 'dialog-status')
@@ -2305,18 +2320,22 @@ async function previewSourceConversation(session, { targetCwd, searchHit, relayI
       form.addEventListener('submit', event => {
         event.preventDefault()
         if (!dialogBusy && input.value.trim()) {
-          void previewSourceConversation(session, { targetCwd: input.value.trim(), duplicate: historyCopy })
+          void verifyDirectory(input.value.trim())
         }
       })
-      directory.open = !result.canImport
-      directory.append(text('summary', '选择迁入目录'), form)
+      directory.open = !result.canImport || canRetarget
+      directory.append(text('summary', canRetarget ? '重新选择迁入目录' : '选择迁入目录'))
+      if (canRetarget) {
+        directory.append(text('p', 'DSH 尚未写入这条会话。选择目录后，已核对的摘录会保留，确认预览后再迁入。', 'preview-context'))
+      }
+      directory.append(form)
     }
     const skillChoices = renderSkillChoices(result.skillCandidates, { history: true })
     const stats = renderSourceStats(result.sourceStats, result.traceCounts, { preview: true })
     const summary = text('p', [
       result.truncated && !result.history ? '源记录或读取范围有限，部分历史未带入' : '',
-      result.canImport ? '' : '原工作目录不可访问，可以先预览或核对新的迁入目录',
-      result.resumePending ? '上次迁入尚未完成，可在同一会话继续。' : '',
+      !result.canImport && !result.resumePending ? '原工作目录不可访问，可以先预览或核对新的迁入目录' : '',
+      result.resumePending && !canRetarget ? '上次迁入尚未完成，请使用原迁入目录重试。' : '',
       result.searchHitStale ? '来源已更新，请返回重新搜索。' : '',
       result.relayLocationChanged ? '原摘录已有变化，请核对来源回合。' : '',
     ].filter(Boolean).join(' · '), 'preview-context')
@@ -2343,20 +2362,20 @@ async function previewSourceConversation(session, { targetCwd, searchHit, relayI
     }
     context.append(text('summary', 'Agent 将收到的续聊上下文'), note, list, messageRows)
     historyContextView = { section: context, note, description, list, first,
-      baseText: result.messages[0]?.text, locked: result.resumePending }
+      baseText: result.messages[0]?.text, locked: lockedContext }
     dialogText.dataset.format = 'history'
     dialogText.replaceChildren(title, source, importTime, ...(target.textContent ? [target] : []), ...(directory ? [directory] : []),
       stats, ...(summary.textContent ? [summary] : []), ...(result.history ? [sourceArchive(result.history, {
-        snapshotId, ticket: result.ticket, location: result.historyLocation, selectExcerpts: !result.resumePending && !!first,
+        snapshotId, ticket: result.ticket, location: result.historyLocation, selectExcerpts: !lockedContext && !!first,
       })] : []), ...(skillChoices ? [skillChoices] : []), context)
     renderContextSelection()
     syncHistoryActions()
-    if (first && historyExcerpts.size && !result.resumePending) void reviewHistoryContext()
+    if (first && historyExcerpts.size && !lockedContext) void reviewHistoryContext()
   } catch (error) {
-    if (active() && targetCwd) status(error.message, true, 'dialog-status')
+    if (active() && updating) status(error.message, true, 'dialog-status')
     else if (active()) dialogText.textContent = error.message
   } finally {
-    if (active() && targetCwd) setDialogBusy(false)
+    if (active() && updating) setDialogBusy(false)
   }
 }
 
@@ -2646,6 +2665,11 @@ async function completeHandoff(purpose, confirmedSkillIds) {
       if (historyProject && current?.id === historyProject.id) void loadRecentConversations(historyProject)
     } catch (error) {
       if (importedSessionId) syncHistoryActions()
+      else if (historySource && (error.recoveryTicket || error.status === 503)) {
+        await previewSourceConversation(historySource, {
+          refreshTicket: error.recoveryTicket ?? historySnapshotId, duplicate: historyCopy,
+        })
+      }
       status(error.message, true, 'dialog-status')
     } finally {
       setDialogBusy(false)

@@ -66,10 +66,11 @@ export function nativeSessionEvents(messages, title, now = Date.now()) {
   return events
 }
 
-async function storeSeed(services, record, cwd) {
+async function storeSeed(services, record, cwd, markHostWrite) {
   const { sessions, persistence } = services
   let seed = record.seed
   if (!seed) {
+    if (record.history?.attachments && (services.attachments?.saveImage || services.attachments?.saveFile)) markHostWrite()
     const { events, nativeTimeline } = record.id && record.config && record.history
       ? await nativeTranscriptEvents(record, services.attachments)
       : { events: nativeSessionEvents(record.messages, record.title) }
@@ -81,6 +82,8 @@ async function storeSeed(services, record, cwd) {
     if (record.id && record.config) seed = await saveConversationSeed(record.config, record.id, seed)
   }
   const { header, events } = seed
+  // A failed lookup or create can hide a partial log. From here on, retry the same ID.
+  markHostWrite()
   const existing = await persistence.stat?.(record.sessionId)
   const handle = existing ? await persistence.open(record.sessionId, 'write') : await persistence.create(header)
   try {
@@ -103,8 +106,20 @@ async function storeSeed(services, record, cwd) {
 }
 
 export async function saveNativeSession(services, record, cwd) {
+  let unwritten = !record.stored && !record.traceStored
+  try {
+    return await writeNativeSession(services, record, cwd, () => { unwritten = false })
+  } catch (error) {
+    if (!unwritten) throw error
+    throw Object.assign(new Error(error.message, { cause: error }), { status: error.status, nativeSessionUnwritten: true })
+  }
+}
+
+async function writeNativeSession(services, record, cwd, markHostWrite) {
   const { workspaces, projectionCache } = services
   const workspace = await workspaces.create(cwd)
+  const attached = workspace.sessionIds.includes(record.sessionId)
+  if (attached) markHostWrite()
   const normalize = value => {
     const normalized = path.normalize(value)
     return process.platform === 'win32' ? normalized.toLowerCase() : normalized
@@ -112,7 +127,7 @@ export async function saveNativeSession(services, record, cwd) {
   if (normalize(workspace.path) !== normalize(cwd)) {
     throw Object.assign(new Error('原工作目录已变化，请刷新项目。'), { status: 409 })
   }
-  if (!record.stored && !workspace.sessionIds.includes(record.sessionId)) record.stored = await storeSeed(services, record, cwd)
+  if (!attached && !record.stored) record.stored = await storeSeed(services, record, cwd, markHostWrite)
   record.nativeTimeline = record.stored?.nativeTimeline ?? record.seed?.nativeTimeline
   // Save the reviewed source snapshot before attaching the new DSH session.
   const hasTrace = Array.isArray(record.trace) && record.trace.length > 0

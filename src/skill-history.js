@@ -7,6 +7,7 @@ import { conversationId, conversationTitle, redact } from './handoff.js'
 import { readConversationAttachment } from './history-attachment.js'
 import { readSourceEvents } from './projects.js'
 import { saveOutput } from './skill-output.js'
+import { findShareFindings, privateKeyMarkers, redactShareMarkdown, shareReplacements } from '../web/share-redaction.js'
 
 async function sourceVersion(archive) {
   const files = [archive.file, archive.file + '-wal']
@@ -17,6 +18,57 @@ async function sourceVersion(archive) {
     return info && [info.ino, info.size, info.mtimeNs].join(':')
   }))
   return createHash('sha256').update(JSON.stringify(versions)).digest('hex').slice(0, 20)
+}
+
+async function lastPrivateKeyEnd(readRecords) {
+  let last = 0
+  let index = 0
+  for await (const text of readRecords()) {
+    index++
+    for (const marker of text.matchAll(privateKeyMarkers)) {
+      if (marker[1] === 'END') {
+        last = index
+        break
+      }
+    }
+  }
+  return last
+}
+
+async function* shareHistoryMarkdown(readRecords) {
+  // Records already join all stored parts and end at paragraph boundaries.
+  // Only a PEM block can match across records. Look ahead in the immutable
+  // snapshot once, on demand, so an unmatched BEGIN never swallows later text.
+  let insideKey = false
+  let lastEnd
+  let index = 0
+  for await (const text of readRecords()) {
+    index++
+    if (!text) continue
+    const continued = insideKey
+    let start = continued ? 0 : undefined
+    let end
+    for (const marker of text.matchAll(privateKeyMarkers)) {
+      if (marker[1] === 'BEGIN') start ??= marker.index
+      else {
+        if (continued) end ??= marker.index + marker[0].length
+        start = undefined
+      }
+    }
+    if (continued && end === undefined) continue
+    const fragments = continued ? [{ start: 0, end }] : []
+    insideKey = false
+    if (start !== undefined) {
+      lastEnd ??= await lastPrivateKeyEnd(readRecords)
+      if (index < lastEnd) {
+        fragments.push({ start, end: text.length })
+        insideKey = true
+      }
+    }
+    const safe = redactShareMarkdown(text, findShareFindings(text, fragments))
+    // The first fragment's placeholder was emitted with its opening record.
+    yield continued ? safe.slice(shareReplacements.credential.length) : safe
+  }
 }
 
 export async function readSkillHistory({ project, archive, config, turn, cursor, format, includeTrace, output, attachment }) {
@@ -59,7 +111,9 @@ export async function readSkillHistory({ project, archive, config, turn, cursor,
           position = page.nextCursor
         } while (position)
       }
-      return { file: await saveOutput(output, sourceHistoryMarkdown(record, pages(), { format, includeTrace })), history: record.history }
+      const readRecords = () => sourceHistoryMarkdown(record, pages(), { format, includeTrace })
+      const markdown = format === 'share' ? shareHistoryMarkdown(readRecords) : readRecords()
+      return { file: await saveOutput(output, markdown), history: record.history }
     }
     const page = await pageAt(cursor && `${id}:${cursor.slice(cursorPrefix.length)}`)
     return {

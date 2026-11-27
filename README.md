@@ -6,15 +6,13 @@
 
 把本机其他 Agent 的对话、项目记忆和 Skills 带进 DeepSeek Harness，在熟悉的工作目录继续。
 
-[下载 v0.10.0 Desktop 插件](https://github.com/wfz2006/dsh-agent-bridge/releases/download/v0.10.0/dsh-agent-bridge.tgz) · [从源码构建](#从源码构建) · [使用指南](#使用) · [图文介绍](https://wfz2006.github.io/dsh-agent-bridge/)
+[下载 v0.11.0 Desktop 插件](https://github.com/wfz2006/dsh-agent-bridge/releases/download/v0.11.0/dsh-agent-bridge.tgz) · [独立 Skill](#dsh-原生-skill) · [使用指南](#使用) · [图文介绍](https://wfz2006.github.io/dsh-agent-bridge/)
 
 <img src="docs/screenshots/v0.10.0/workspace.png" width="900" alt="Agent Bridge v0.10.0 项目工作台">
 
 </div>
 
-## 主分支功能
-
-以下功能可通过 [从源码构建](#从源码构建) 体验。GitHub Release 和 npm 的安装步骤对应已发布的 v0.10.0。
+## 主要功能
 
 - **搜索正文与定位回合**。在项目内跨会话查找原文、文件名和报错，点击命中结果即可跳到来源回合。
 - **预览并接续会话**。勾选早期决定或工具结果，迁入前查看带给 Agent 的续聊上下文。已迁入的对话显示上次迁入时间，可打开现有 DSH 会话或另开副本。
@@ -26,14 +24,14 @@
 
 ## 安装
 
-### 已发布版本 v0.10.0
+### 安装 v0.11.0
 
-**DSH Desktop**。从 [v0.10.0 Release](https://github.com/wfz2006/dsh-agent-bridge/releases/tag/v0.10.0) 下载 `dsh-agent-bridge.tgz`，通过 **插件 → 安装插件** 选择该文件。完全退出并重新打开 DSH，在侧栏选择 **Agent 工作接续**。
+在 **DSH Desktop** 的 **插件 → 安装插件** 中选择 `dsh-agent-bridge.tgz`。完全退出并重新打开 DSH，在侧栏选择 **Agent 工作接续**。 [下载 v0.11.0 插件](https://github.com/wfz2006/dsh-agent-bridge/releases/download/v0.11.0/dsh-agent-bridge.tgz)
 
 **DSH Web**。在已安装 DSH CLI 的环境运行以下命令。
 
 ```sh
-dsh plugin --profile web add @wwwfz/dsh-agent-bridge@0.10.0
+dsh plugin --profile web add @wwwfz/dsh-agent-bridge@0.11.0
 dsh web
 ```
 
@@ -61,15 +59,13 @@ Agent Bridge Skill 可在 DSH 会话内按项目和来源查找旧对话，选�
 | 「检查项目记忆和那个 Skill 的脚本，把选中的资料导出」 | 查看资料、核对 Skill 文件，导出本机版或分享版 Markdown |
 | 「把这个项目置顶」 | 置顶、取消置顶、归档和恢复，和插件使用同一份项目状态 |
 
-Skill 可与插件在同一 DSH 配置中使用。侧栏工作台、原生会话迁入、来源记录界面、项目接力单与交互式脱敏审阅由插件提供。 [Skill 完整用法](skills/agent-bridge/references/commands.md)
+独立 Skill 的 `handoff --format share` 和 `history --format share` 默认脱敏正文和随文导出的工具结果。需要逐项决定保留哪些内容时，可在插件侧栏打开「审阅分享版」。Skill 和插件可同时使用。 [Skill 完整用法](skills/agent-bridge/references/commands.md)
 
-将技能 ZIP 的内容解压到项目的 `.dsh/skills/agent-bridge/`，或 DSH 用户目录的 `skills/agent-bridge/`，确保 `SKILL.md` 和 `scripts/` 位于同一级。打开该项目的 DSH 会话，选择 **agent-bridge**，例如「看看这个项目在 Codex 里上次做到哪里，生成接续草稿」。
+将独立 Skill 0.3.1 的 ZIP 解压到项目的 `.dsh/skills/agent-bridge/`，或 DSH 用户目录的 `skills/agent-bridge/`，确保 `SKILL.md` 和 `scripts/` 位于同一级。打开该项目的 DSH 会话，选择 **agent-bridge**，例如「看看这个项目在 Codex 里上次做到哪里，生成接续草稿」。 [下载独立 Skill](https://github.com/wfz2006/dsh-agent-bridge/releases/download/v0.11.0/agent-bridge-skill-0.3.1.zip)
 
 维护者可以在仓库用 `npm run build:skill -- .local/skill-release` 生成 `.local/skill-release/agent-bridge/`。打包市场 ZIP 时，把生成目录的 `SKILL.md`、`scripts/`、`references/` 和第三方声明放在 ZIP 根目录。
 
 ## 使用
-
-以下按主分支的界面说明。
 
 ### 迁入旧对话
 
@@ -78,7 +74,9 @@ Skill 可与插件在同一 DSH 配置中使用。侧栏工作台、原生会话
 3. 在完整历史中勾选「带入续聊」，可跨对话收集早期约束和关键结果。打开「Agent 将收到的续聊上下文」，核对近期问答和勾选内容。
 4. 选择 **迁入并继续**。原目录离线时可选择新的本机目录。迁入后在 DSH 会话头部打开 **来源记录**，按回合查看正文、过程和附件。
 
-已迁入的对话会显示上次迁入时间，默认打开最近一份仍可用的 DSH 会话。选择「另开副本」可先预览，再创建独立会话。早期版本保存的时间以「约」标出。
+已迁入的对话会显示上次迁入时间，默认打开最近一份仍可用的 DSH 会话。同一 Codex 配置和项目内，带原生会话 ID 的日志从活动目录移入归档后，仍可打开原 DSH 会话，接力单也可跳回原回合。选择「另开副本」可先预览，再创建独立会话。早期版本保存的时间以「约」标出。
+
+若迁入失败，插件确认 DSH 尚未开始写入时，会提供「重新选择迁入目录」。选好目录后可再次核对原先的摘录，再确认迁入。若 DSH 已开始写入，重试会继续使用原来的会话。
 
 ### 用项目资料开新对话
 
@@ -98,7 +96,7 @@ Skill 可与插件在同一 DSH 配置中使用。侧栏工作台、原生会话
 
 可读取的本机来源包括 Codex、Claude Code、OpenCode、Qoder、WorkBuddy、Gemini CLI、Qwen Code 和 VS Code Copilot。Antigravity 与 TRAE 的部分工作区记录及配置的 AgentsView 档案也可发现。
 
-不同来源保存的信息不同。预览会标出可读取的内容和缺失项，加密或服务端记忆可先导出为 Markdown。主分支功能已在 Windows DSH Desktop 的隔离环境验证，其他平台的路径规则有自动测试覆盖。
+不同来源保存的信息不同。预览会标出可读取的内容和缺失项，加密或服务端记忆可先导出为 Markdown。插件在 Windows DSH Desktop 的隔离环境中验证，其他平台的路径规则有自动测试覆盖。
 
 ## 在项目里存放共享记忆
 

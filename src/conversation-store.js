@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, open } from 'node:fs/promises'
+import { mkdir, open, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { keyFor } from './handoff.js'
@@ -11,8 +11,12 @@ const partLength = 8_000
 const maxAttachmentBytes = 32 * 1024 * 1024
 const lifetime = 10 * 60_000
 
+function historyDirectory(config) {
+  return path.join(path.dirname(traceDirectory(config)), 'agent-bridge-history')
+}
+
 async function database(config, create = true) {
-  const directory = path.join(path.dirname(traceDirectory(config)), 'agent-bridge-history')
+  const directory = historyDirectory(config)
   const file = path.join(directory, 'history.sqlite')
   if (create) {
     await mkdir(directory, { recursive: true, mode: 0o700 })
@@ -299,34 +303,84 @@ export async function readConversationSnapshot(config, id) {
     .get(id, Date.now() - lifetime)), false)
 }
 
-export async function readPendingConversation(config, projectId, sourceId, target) {
-  return use(config, db => readRecord(db.prepare("SELECT record,state,seed FROM snapshots WHERE project_id=? AND source_id=? AND target=? AND state='approved' ORDER BY created DESC LIMIT 1")
-    .get(projectId, sourceId, target)), false)
+export async function readPendingConversation(config, projectId, sourceIds, target) {
+  return use(config, db => {
+    // Older versions allowed pending copies at multiple targets. The caller must
+    // identify one of those targets before a particular receipt can be resumed.
+    const rows = db.prepare(`SELECT record,state,seed FROM snapshots WHERE project_id=?
+      AND source_id IN (SELECT value FROM json_each(?)) AND (? IS NULL OR target=?) AND state='approved' LIMIT 2`)
+      .all(projectId, JSON.stringify(Array.isArray(sourceIds) ? sourceIds : [sourceIds]), target ?? null, target ?? null)
+    return rows.length === 1 ? readRecord(rows[0]) : undefined
+  }, false)
 }
 
-export async function rebindConversation(config, previous, metadata) {
+// Separate SQLite lock files let unrelated imports run concurrently. The OS releases each
+// lock on process exit, including a crash partway through a DSH write. Only a successful
+// callback may retire the ticket (completed, or replaced with a freshly reviewed target).
+export async function withApprovedImportLock(config, id, action) {
+  if (!isSessionId(id)) throw new Error('Invalid import receipt')
+  const file = path.join(historyDirectory(config), id + '.lock')
+  const lock = new DatabaseSync(file)
+  let retired = false
+  try {
+    try { lock.exec('BEGIN EXCLUSIVE') } catch (error) {
+      if (error.errcode !== 5) throw error
+      throw Object.assign(new Error('这条会话正在迁入，请等待当前操作结束。'), { status: 409 })
+    }
+    const result = await action()
+    retired = true
+    return result
+  } finally {
+    lock.close()
+    if (retired) await unlink(file).catch(() => {})
+  }
+}
+
+export async function setConversationAttempt(config, id, attempt) {
+  return use(config, db => db.prepare(`UPDATE snapshots SET record=json_set(record,'$.importAttempt',?)
+    WHERE id=? AND state='approved' AND (?!='unwritten' OR seed IS NULL)`).run(attempt, id, attempt).changes)
+}
+
+export async function rebindConversation(config, previous, metadata, { approvedAttempt } = {}) {
   const record = { ...previous, ...metadata,
     history: { ...previous.history, snapshotId: metadata.id } }
   delete record.state
   delete record.seed
+  if (approvedAttempt) {
+    // Keep the reviewed archive and excerpt text durable through a close/reload. A new
+    // ticket binds the new target and requires a separate user request to write to DSH.
+    record.importAttempt = 'review'
+    if (record.continuation) {
+      const { firstMessage } = record.continuation
+      const items = record.continuation.items.map(item => item.snapshotId === previous.id ? { ...item, snapshotId: record.id } : item)
+      const refs = items.map(({ snapshotId, seq, offset }) => ({ snapshotId, seq, offset }))
+      record.continuation = { firstMessage, items, contextKey: keyFor(record.id, refs, firstMessage) }
+    }
+  }
   return use(config, db => {
     db.exec('BEGIN IMMEDIATE')
     try {
-      const valid = db.prepare("SELECT 1 FROM snapshots WHERE id=? AND state='preview' AND created>=?")
-        .get(previous.id, Date.now() - lifetime)
+      const valid = approvedAttempt
+        ? db.prepare(`SELECT 1 FROM snapshots WHERE id=? AND state='approved' AND seed IS NULL AND json_extract(record,'$.importAttempt')=?
+          AND json_extract(record,'$.importAttempt') IN ('unwritten','review') AND NOT EXISTS (
+            SELECT 1 FROM snapshots AS other WHERE other.project_id=? AND other.id!=? AND other.state='approved'
+              AND other.source_id IN (SELECT value FROM json_each(?)))`)
+          .get(previous.id, approvedAttempt, record.projectId, previous.id, JSON.stringify(record.sourceIds ?? [record.sourceId]))
+        : db.prepare("SELECT 1 FROM snapshots WHERE id=? AND state='preview' AND created>=?").get(previous.id, Date.now() - lifetime)
       if (!valid) {
         db.exec('ROLLBACK')
         return undefined
       }
-      db.prepare("INSERT INTO snapshots(id,session_id,state,created,project_id,source_id,target,record) VALUES (?,?,'preview',?,?,?,?,?)")
-        .run(record.id, record.sessionId, Date.now(), record.projectId, record.sourceId, record.targetCwd, JSON.stringify(record))
+      const state = approvedAttempt ? 'approved' : 'preview'
+      db.prepare('INSERT INTO snapshots(id,session_id,state,created,project_id,source_id,target,record) VALUES (?,?,?,?,?,?,?,?)')
+        .run(record.id, record.sessionId, state, Date.now(), record.projectId, record.sourceId, record.targetCwd, JSON.stringify(record))
       db.prepare('INSERT INTO entries SELECT ?,seq,part,turn,call_id,kind,item FROM entries WHERE snapshot_id=?')
         .run(record.id, previous.id)
       db.prepare('INSERT INTO attachments SELECT ?,hash,type,bytes FROM attachments WHERE snapshot_id=?')
         .run(record.id, previous.id)
       db.prepare('DELETE FROM snapshots WHERE id=?').run(previous.id)
       db.exec('COMMIT')
-      return record
+      return { ...record, state }
     } catch (error) {
       db.exec('ROLLBACK')
       throw error
@@ -351,20 +405,22 @@ export async function readCompletedConversationImports(config, projectId, source
   return rows ?? []
 }
 
-export async function approveConversation(config, id, continuation = null, { unavailableImports } = {}) {
+export async function approveConversation(config, id, continuation = null, { unavailableImports, sourceIds = [] } = {}) {
   return use(config, db => db.prepare(`UPDATE snapshots AS proposed SET state='approved',
-    record=json_set(record,'$.continuation',json($continuation))
+    record=json_set(record,'$.continuation',json($continuation),'$.importAttempt','ready')
     WHERE proposed.id=$id AND proposed.state='preview' AND proposed.created >= $cutoff AND NOT EXISTS (
-      SELECT 1 FROM snapshots AS active WHERE active.project_id=proposed.project_id AND active.source_id=proposed.source_id
-        AND active.state='approved' AND (active.target=proposed.target OR $unavailable IS NOT NULL)
+      SELECT 1 FROM snapshots AS active WHERE active.project_id=proposed.project_id
+        AND (active.source_id=proposed.source_id OR active.source_id IN (SELECT value FROM json_each($aliases)))
+        AND active.state='approved'
     ) AND (
       $unavailable IS NULL OR NOT EXISTS (
         SELECT 1 FROM snapshots AS completed
-        WHERE completed.project_id=proposed.project_id AND completed.source_id=proposed.source_id AND completed.state='done'
+        WHERE completed.project_id=proposed.project_id AND completed.state='done'
+          AND (completed.source_id=proposed.source_id OR completed.source_id IN (SELECT value FROM json_each($aliases)))
           AND completed.session_id NOT IN (SELECT value FROM json_each($unavailable))
       )
     )`)
-    .run({ $continuation: JSON.stringify(continuation), $id: id, $cutoff: Date.now() - lifetime,
+    .run({ $continuation: JSON.stringify(continuation), $id: id, $cutoff: Date.now() - lifetime, $aliases: JSON.stringify(sourceIds),
       $unavailable: unavailableImports ? JSON.stringify(unavailableImports) : null }).changes)
 }
 
@@ -438,6 +494,20 @@ export async function readContextExcerpts(config, projectId, excerpts) {
       if (!item.text?.trim()) return null
       return { ...excerpt, sourceId: row.sourceId, title: row.title, turn: row.turn, kind: item.kind, role: item.role, text: item.text }
     })
+  }, false)
+}
+
+export async function readRetainedRelaySnapshot(config, projectId, source) {
+  return use(config, db => {
+    const candidates = db.prepare(`SELECT s.id,e.item FROM snapshots s JOIN entries e ON e.snapshot_id=s.id
+      WHERE s.project_id=? AND s.source_id=? AND e.turn=? AND e.kind=? AND e.seq=? AND e.part=?
+        AND (s.state IN ('approved','done') OR (s.state='preview' AND s.created>=?))
+      ORDER BY s.created DESC,s.rowid DESC`).iterate(projectId, source.id, source.turn, source.kind, source.seq, source.offset, Date.now() - lifetime)
+    for (const row of candidates) {
+      if (keyFor(JSON.parse(row.item).text) === source.hash) {
+        return readRecord(db.prepare('SELECT record,state FROM snapshots WHERE id=?').get(row.id))
+      }
+    }
   }, false)
 }
 
